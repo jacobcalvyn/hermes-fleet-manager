@@ -1,0 +1,8 @@
+event: response.future_capability
+data: {"type":"response.future_capability","version":99,"payload":{"state":"working"}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"Still compatible"}
+
+event: response.completed
+data: {"type":"response.completed"}

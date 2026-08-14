@@ -1,0 +1,2 @@
+event: response.reasoning.delta
+data: {"type":"response.reasoning.delta","delta":"working"}

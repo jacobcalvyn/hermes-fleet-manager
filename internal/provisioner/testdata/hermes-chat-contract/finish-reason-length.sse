@@ -1,0 +1,5 @@
+data: {"choices":[{"delta":{"content":"Partial answer"}}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"length"}],"hermes":{"status":"incomplete"}}
+
+data: [DONE]

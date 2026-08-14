@@ -1,0 +1,20 @@
+event: response.reasoning.delta
+data: {"type":"response.reasoning.delta","delta":"planning"}
+
+event: tool.started
+data: {"type":"tool.started","tool":{"name":"browser","call_id":"call-42"},"api_key":"conformance-secret"}
+
+event: tool.progress
+data: {"type":"tool.progress","tool":{"name":"browser","call_id":"call-42","status":"running"}}
+
+event: artifact.created
+data: {"type":"artifact.created","artifact":{"id":"artifact-42","name":"/tmp/report.pdf","media_type":"application/pdf","url":"https://example.test/report.pdf"},"token":"conformance-secret"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"Report "}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"ready"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"Report ready"}]}]}}

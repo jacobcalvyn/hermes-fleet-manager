@@ -1,0 +1,17 @@
+event: run.started
+data: {"user_message":{"role":"user","content":"run the report"},"session_id":"fleet-session-contract","run_id":"run-contract","seq":1}
+
+event: message.started
+data: {"message":{"id":"msg-contract","role":"assistant"},"session_id":"fleet-session-contract","run_id":"run-contract","seq":2}
+
+event: tool.started
+data: {"message_id":"msg-contract","tool_name":"terminal","preview":"python + 3 commands","args":{"command":"from hermes_tools import write_file\nimport urllib.request,csv,io,json,re,time\nwrite_file('/root/report.html', '<html></html>')\nprint('all commands retained')"},"session_id":"fleet-session-contract","run_id":"run-contract","seq":3}
+
+event: tool.completed
+data: {"message_id":"msg-contract","tool_name":"terminal","preview":"python + 3 commands","args":{"command":"from hermes_tools import write_file\nimport urllib.request,csv,io,json,re,time\nwrite_file('/root/report.html', '<html></html>')\nprint('all commands retained')"},"session_id":"fleet-session-contract","run_id":"run-contract","seq":4}
+
+event: assistant.delta
+data: {"message_id":"msg-contract","delta":"Session answer","session_id":"fleet-session-contract","run_id":"run-contract","seq":5}
+
+event: assistant.completed
+data: {"message_id":"msg-contract","content":"Session answer","completed":true,"partial":false,"interrupted":false,"session_id":"fleet-session-contract","run_id":"run-contract","seq":6}

@@ -1,0 +1,138 @@
+name: hermes-fleet-manager
+
+services:
+  control-plane:
+    build:
+      context: .
+      args:
+        FLEET_BUILD_ID: ${FLEET_BUILD_ID:-development}
+        FLEET_VULN_CHECK_NONCE: ${FLEET_VULN_CHECK_NONCE:-manual}
+    image: ${FLEET_MANAGER_IMAGE:-local/hermes-fleet-manager:0.12.1}
+    container_name: hermes-fleet-control-plane
+    restart: unless-stopped
+    pids_limit: ${FLEET_CONTROL_PLANE_PIDS_LIMIT:-512}
+    mem_limit: ${FLEET_CONTROL_PLANE_MEMORY_LIMIT:-1g}
+    logging:
+      driver: json-file
+      options:
+        max-size: "${FLEET_DOCKER_LOG_MAX_SIZE:-25m}"
+        max-file: "${FLEET_DOCKER_LOG_MAX_FILES:-4}"
+    labels:
+      io.hermes-fleet.release-catalog-fingerprint: ${FLEET_HERMES_RELEASE_CATALOG_FINGERPRINT:-unavailable}
+    environment:
+      FLEET_ADDRESS: :9180
+      FLEET_CONTROL_PLANE_URL: ${FLEET_CONTROL_PLANE_URL:-http://127.0.0.1:9180}
+      FLEET_DATABASE_PATH: /var/lib/hermes-fleet/fleet.db
+      FLEET_BACKUP_RETENTION: ${FLEET_BACKUP_RETENTION:-20}
+      FLEET_RECOVERY_RETENTION: ${FLEET_RECOVERY_RETENTION:-20}
+      FLEET_RECOVERY_MAX_BYTES: ${FLEET_RECOVERY_MAX_BYTES:-53687091200}
+      FLEET_RECOVERY_ISOLATED: ${FLEET_RECOVERY_ISOLATED:-false}
+      FLEET_CHAT_ARTIFACT_SESSION_MAX_BYTES: ${FLEET_CHAT_ARTIFACT_SESSION_MAX_BYTES:-268435456}
+      FLEET_CHAT_ARTIFACT_INSTANCE_MAX_BYTES: ${FLEET_CHAT_ARTIFACT_INSTANCE_MAX_BYTES:-1073741824}
+      FLEET_CHAT_ARTIFACT_TOTAL_MAX_BYTES: ${FLEET_CHAT_ARTIFACT_TOTAL_MAX_BYTES:-2147483648}
+      FLEET_CHAT_ARTIFACT_RETENTION_HOURS: ${FLEET_CHAT_ARTIFACT_RETENTION_HOURS:-720}
+      FLEET_MIN_FREE_BYTES: ${FLEET_MIN_FREE_BYTES:-1073741824}
+      FLEET_MIN_FREE_PERCENT: ${FLEET_MIN_FREE_PERCENT:-5}
+      FLEET_MIN_FREE_INODES: ${FLEET_MIN_FREE_INODES:-1000}
+      FLEET_WEB_DIR: /app/web
+      FLEET_ADMIN_TOKEN: ${FLEET_ADMIN_TOKEN:?FLEET_ADMIN_TOKEN is required}
+      FLEET_ENROLLMENT_TOKEN: ${FLEET_ENROLLMENT_TOKEN:?FLEET_ENROLLMENT_TOKEN is required}
+      FLEET_SECRET_ENCRYPTION_KEY: ${FLEET_SECRET_ENCRYPTION_KEY:?FLEET_SECRET_ENCRYPTION_KEY is required}
+      FLEET_RECOVERY_ENCRYPTION_KEY: ${FLEET_RECOVERY_ENCRYPTION_KEY:?FLEET_RECOVERY_ENCRYPTION_KEY is required}
+      FLEET_HERMES_RELEASE_CATALOG_PATH: /etc/hermes-fleet/hermes-releases.json
+    ports:
+      - "127.0.0.1:9180:9180"
+    volumes:
+      - fleet-data:/var/lib/hermes-fleet
+      - cloudflare-admin-runtime:/var/lib/hermes-fleet-cloudflare/admin
+      - cloudflare-instances-runtime:/var/lib/hermes-fleet-cloudflare/instances
+      - ./.state/cloudflared-credentials:/etc/hermes-fleet-cloudflare-credentials:ro
+      - ./.state/hermes-releases.json:/etc/hermes-fleet/hermes-releases.json:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9180/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  cloudflare-admin:
+    build:
+      context: .
+      dockerfile: Dockerfile.cloudflare-connector
+      args:
+        FLEET_VULN_CHECK_NONCE: ${FLEET_VULN_CHECK_NONCE:-manual}
+    image: local/hermes-fleet-cloudflare-connector:0.12.1
+    container_name: hermes-fleet-cloudflare-admin
+    restart: unless-stopped
+    pids_limit: ${FLEET_CONNECTOR_PIDS_LIMIT:-64}
+    mem_limit: ${FLEET_CONNECTOR_MEMORY_LIMIT:-256m}
+    logging:
+      driver: json-file
+      options:
+        max-size: "${FLEET_DOCKER_LOG_MAX_SIZE:-25m}"
+        max-file: "${FLEET_DOCKER_LOG_MAX_FILES:-4}"
+    volumes:
+      - cloudflare-admin-runtime:/run/hermes-fleet-cloudflare:ro
+      - ./.state/cloudflared-credentials:/etc/hermes-fleet-cloudflare-credentials:ro
+    # Missing connector-token and legacy local-config files keep this optional connector disabled and healthy.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/hermes-fleet-cloudflare-connector", "healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  cloudflare-instances:
+    image: local/hermes-fleet-cloudflare-connector:0.12.1
+    container_name: hermes-fleet-cloudflare-instances
+    restart: unless-stopped
+    pids_limit: ${FLEET_CONNECTOR_PIDS_LIMIT:-64}
+    mem_limit: ${FLEET_CONNECTOR_MEMORY_LIMIT:-256m}
+    logging:
+      driver: json-file
+      options:
+        max-size: "${FLEET_DOCKER_LOG_MAX_SIZE:-25m}"
+        max-file: "${FLEET_DOCKER_LOG_MAX_FILES:-4}"
+    volumes:
+      - cloudflare-instances-runtime:/run/hermes-fleet-cloudflare:ro
+      - ./.state/cloudflared-credentials:/etc/hermes-fleet-cloudflare-credentials:ro
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/hermes-fleet-cloudflare-connector", "healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    networks:
+      - default
+      - fleet-edge
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  fleet-data:
+    name: hermes-fleet-manager-data
+  cloudflare-admin-runtime:
+    name: hermes-fleet-cloudflare-admin-runtime
+  cloudflare-instances-runtime:
+    name: hermes-fleet-cloudflare-instances-runtime
+
+networks:
+  fleet-edge:
+    name: hermes-fleet-edge
+    external: true

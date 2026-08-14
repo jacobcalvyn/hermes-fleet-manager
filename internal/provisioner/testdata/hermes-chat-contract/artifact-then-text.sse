@@ -1,0 +1,8 @@
+event: artifact.created
+data: {"type":"artifact.created","artifact":{"id":"artifact-1","media_type":"text/plain","name":"report.txt"}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"Report created"}
+
+event: response.completed
+data: {"type":"response.completed"}

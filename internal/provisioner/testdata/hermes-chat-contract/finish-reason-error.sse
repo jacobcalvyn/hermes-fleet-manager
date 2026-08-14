@@ -1,0 +1,5 @@
+data: {"choices":[{"delta":{"content":"Partial answer"}}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"error"}],"error":"upstream failed","hermes":{"status":"error"}}
+
+data: [DONE]

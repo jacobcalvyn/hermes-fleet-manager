@@ -1,0 +1,9 @@
+event: tool.started
+data: {"type":"tool.started","tool":{"name":"browser","call_id":"call-1"}}
+
+event: tool.result
+data: {"type":"tool.result","tool":{"call_id":"call-1","status":"completed"}}
+
+data: {"choices":[{"delta":{"content":"Tool completed"}}]}
+
+data: [DONE]

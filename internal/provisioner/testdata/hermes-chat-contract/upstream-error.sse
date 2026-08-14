@@ -1,0 +1,2 @@
+event: error
+data: {"type":"error","error":{"message":"upstream unavailable","token":"conformance-secret"}}

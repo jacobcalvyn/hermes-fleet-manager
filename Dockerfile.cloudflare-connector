@@ -1,0 +1,22 @@
+FROM cloudflare/cloudflared:2026.7.3 AS cloudflared
+
+FROM golang:1.26.6-bookworm AS build
+ARG GOVULNCHECK_VERSION=v1.6.0
+ARG FLEET_VULN_CHECK_NONCE=manual
+WORKDIR /src
+COPY go.mod go.sum* ./
+RUN GOBIN=/usr/local/bin go install golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}
+COPY cmd/cloudflare-connector/ ./cmd/cloudflare-connector/
+RUN test -n "${FLEET_VULN_CHECK_NONCE}" && govulncheck ./cmd/cloudflare-connector
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/hermes-fleet-cloudflare-connector ./cmd/cloudflare-connector
+RUN govulncheck -mode=binary /out/hermes-fleet-cloudflare-connector
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 connector
+COPY --from=cloudflared /usr/local/bin/cloudflared /usr/local/bin/cloudflared
+COPY --from=build /out/hermes-fleet-cloudflare-connector /usr/local/bin/hermes-fleet-cloudflare-connector
+USER connector
+ENTRYPOINT ["hermes-fleet-cloudflare-connector"]

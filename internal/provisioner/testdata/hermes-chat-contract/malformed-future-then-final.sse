@@ -1,0 +1,11 @@
+event: response.future_transport
+data: {not-json conformance-secret}
+
+event: response.future_capability
+data: {"type":"response.future_capability","payload":{"token":"conformance-secret","state":"working"}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"Recovered"}
+
+event: response.completed
+data: {"type":"response.completed"}
