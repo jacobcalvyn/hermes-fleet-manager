@@ -1359,6 +1359,7 @@ func TestRuntimeMutationsRequestAnImmediateObservation(t *testing.T) {
 		"instance.messaging.configure",
 		"instance.mcp.configure",
 		"instance.recovery.restore",
+		domain.JobRepairHermesProfiles,
 	} {
 		if !jobNeedsImmediateObservation(jobType) {
 			t.Errorf("jobNeedsImmediateObservation(%q) = false", jobType)

@@ -32,6 +32,154 @@ func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, 
 	return function(request)
 }
 
+func TestHermesProfileAuthenticationUsesEphemeralCookieSession(t *testing.T) {
+	requests := 0
+	p := &Provisioner{httpClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requests++
+		if got := request.Header.Get("X-Hermes-Session-Token"); got != "" {
+			t.Fatalf("session token header=%q, want empty", got)
+		}
+		switch request.URL.Path {
+		case "/api/auth/providers":
+			if request.Method != http.MethodGet {
+				t.Fatalf("provider request method=%s", request.Method)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"providers":[{"name":"basic","supports_password":true}]}`)),
+				Header:     make(http.Header),
+			}, nil
+		case "/auth/password-login":
+			if request.Method != http.MethodPost {
+				t.Fatalf("login request method=%s", request.Method)
+			}
+			var payload map[string]string
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload["provider"] != "basic" || payload["username"] != "fleet-admin" || payload["password"] != "dashboard-secret" {
+				t.Fatalf("login payload=%v", payload)
+			}
+			header := make(http.Header)
+			header.Add("Set-Cookie", "hermes_session=authenticated; Path=/; HttpOnly; SameSite=Lax")
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"ok":true}`)), Header: header}, nil
+		case "/api/profiles":
+			cookie, err := request.Cookie("hermes_session")
+			if err != nil || cookie.Value != "authenticated" {
+				t.Fatalf("authenticated cookie=%v, err=%v", cookie, err)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"profiles":[]}`)),
+				Header:     make(http.Header),
+			}, nil
+		default:
+			t.Fatalf("unexpected request=%s %s", request.Method, request.URL.Path)
+			return nil, nil
+		}
+	})}}
+	session, err := p.authenticateHermesProfileSession(context.Background(), 9119, "fleet-admin", "dashboard-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.hermesProfileRequest(context.Background(), 9119, session, http.MethodGet, "/api/profiles", nil); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 3 {
+		t.Fatalf("requests=%d, want 3", requests)
+	}
+}
+
+func TestHermesProfileAuthenticationRejectsLoginWithoutCookie(t *testing.T) {
+	p := &Provisioner{httpClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		body := `{"providers":[{"name":"basic","supports_password":true}]}`
+		if request.URL.Path == "/auth/password-login" {
+			body = `{"ok":true}`
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}}
+	_, err := p.authenticateHermesProfileSession(context.Background(), 9119, "fleet-admin", "dashboard-secret")
+	if err == nil || !strings.Contains(err.Error(), "did not establish a session") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestHermesPasswordProviderAcceptsWrappedAndListDocuments(t *testing.T) {
+	for name, body := range map[string]string{
+		"wrapped": `{"providers":[{"name":"basic"}]}`,
+		"list":    `[{"id":"local","type":"basic"}]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			provider, err := hermesPasswordProvider([]byte(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if provider == "" {
+				t.Fatal("password provider is empty")
+			}
+		})
+	}
+}
+
+func TestEnsureDashboardSessionTokenFilePreservesExistingToken(t *testing.T) {
+	envPath := filepath.Join(t.TempDir(), ".env")
+	if err := os.WriteFile(envPath, []byte("API_SERVER_KEY=key\nHERMES_DASHBOARD_SESSION_TOKEN=existing\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := ensureDashboardSessionTokenFile(context.Background(), envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Fatal("existing session token was unexpectedly replaced")
+	}
+	encoded, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encoded) != "API_SERVER_KEY=key\nHERMES_DASHBOARD_SESSION_TOKEN=existing\n" {
+		t.Fatalf("environment=%q", encoded)
+	}
+}
+
+func TestEnsureDashboardSessionTokenFileCreatesMissingToken(t *testing.T) {
+	envPath := filepath.Join(t.TempDir(), ".env")
+	if err := os.WriteFile(envPath, []byte("API_SERVER_KEY=key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := ensureDashboardSessionTokenFile(context.Background(), envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("missing session token was not created")
+	}
+	token, err := readManagedEnvValue(envPath, dashboardSessionTokenEnvironmentKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(token) < 32 {
+		t.Fatalf("session token length=%d", len(token))
+	}
+}
+
+func TestRotateDashboardSessionTokenFileReplacesExistingToken(t *testing.T) {
+	envPath := filepath.Join(t.TempDir(), ".env")
+	if err := os.WriteFile(envPath, []byte("API_SERVER_KEY=key\nHERMES_DASHBOARD_SESSION_TOKEN=existing\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := rotateDashboardSessionTokenFile(context.Background(), envPath); err != nil {
+		t.Fatal(err)
+	}
+	token, err := readManagedEnvValue(envPath, dashboardSessionTokenEnvironmentKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token == "existing" || len(token) < 32 {
+		t.Fatalf("rotated session token was not replaced: length=%d", len(token))
+	}
+}
+
 func TestRenderComposeUsesIsolatedResources(t *testing.T) {
 	payload := domain.ProvisionPayload{
 		InstanceID: "00000000-0000-4000-8000-000000000001",
@@ -57,6 +205,7 @@ func TestRenderComposeUsesIsolatedResources(t *testing.T) {
 		`max-file: "${HERMES_FLEET_LOG_MAX_FILES:-4}"`,
 		"name: hermes-fleet-edge",
 		"external: true",
+		"HERMES_DASHBOARD_SESSION_TOKEN: ${HERMES_DASHBOARD_SESSION_TOKEN:-}",
 		`curl -fsS -u \"$${HERMES_DASHBOARD_BASIC_AUTH_USERNAME}:$${HERMES_DASHBOARD_BASIC_AUTH_PASSWORD}\" http://127.0.0.1:9119/chat`,
 	} {
 		if !strings.Contains(manifest, expected) {
@@ -2599,7 +2748,7 @@ func TestHermesChatProtocolConformance(t *testing.T) {
 	}
 }
 
-func TestExecuteChatStreamFailsAfterUpstreamStopsMakingProgress(t *testing.T) {
+func TestExecuteChatStreamFailsAfterConnectionStopsReceivingBytes(t *testing.T) {
 	root := t.TempDir()
 	managedPath := filepath.Join(root, "fleet-chat-idle-00000000")
 	if err := os.MkdirAll(managedPath, 0o700); err != nil {
@@ -2615,7 +2764,8 @@ func TestExecuteChatStreamFailsAfterUpstreamStopsMakingProgress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.chatIdleTimeout = 20 * time.Millisecond
+	p.chatConnectionIdleTimeout = 20 * time.Millisecond
+	p.chatSemanticIdleTimeout = time.Second
 	requestCount := 0
 	p.httpClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		requestCount++
@@ -2655,8 +2805,105 @@ func TestExecuteChatStreamFailsAfterUpstreamStopsMakingProgress(t *testing.T) {
 	result := p.ExecuteChatStream(context.Background(), domain.Job{
 		Type: "instance.chat.send", Payload: payload, InputSecret: []byte("hello"),
 	}, func(context.Context, domain.ChatStreamEvent) error { return nil })
-	if result.Success || !strings.Contains(result.Error, "no progress for 20ms") {
+	if result.Success || !strings.Contains(result.Error, "connection stalled") || !strings.Contains(result.Error, "20ms") {
 		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestExecuteChatStreamHeartbeatDoesNotMaskSemanticStall(t *testing.T) {
+	root := t.TempDir()
+	managedPath := filepath.Join(root, "fleet-chat-semantic-idle-00000000")
+	if err := os.MkdirAll(managedPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(managedPath, "compose.yaml"), []byte("services: {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(managedPath, ".env"), []byte("API_SERVER_KEY=semantic-idle-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p, err := New(root, "docker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.chatConnectionIdleTimeout = 100 * time.Millisecond
+	p.chatSemanticIdleTimeout = 25 * time.Millisecond
+	requestCount := 0
+	p.httpClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requestCount++
+		if requestCount == 1 {
+			return &http.Response{
+				StatusCode: http.StatusCreated,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"object":"hermes.session"}`)),
+				Request:    request,
+			}, nil
+		}
+		if requestCount == 2 {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body: io.NopCloser(strings.NewReader(
+					`{"object":"hermes.session.model_lock","session_id":"fleet-session-01","runtime":{"provider":"openai-codex","model":"gpt-5.6-sol","model_lock":"accepted"}}`,
+				)),
+				Request: request,
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: io.NopCloser(&periodicHeartbeatReader{
+				ctx: request.Context(), interval: 5 * time.Millisecond,
+			}),
+			Request: request,
+		}, nil
+	})}
+	payload, err := json.Marshal(domain.ChatSendPayload{
+		InstanceID: "instance-01", SessionID: "session-01", MessageID: "message-01",
+		ManagedPath: managedPath, APIPort: 18650,
+		Provider: "openai-codex", Model: "gpt-5.6-sol", Reasoning: "medium", ServiceTier: "normal",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := p.ExecuteChatStream(context.Background(), domain.Job{
+		Type: "instance.chat.send", Payload: payload, InputSecret: []byte("hello"),
+	}, func(context.Context, domain.ChatStreamEvent) error { return nil })
+	if result.Success || !strings.Contains(result.Error, "tool stalled") || !strings.Contains(result.Error, "25ms") {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestChatSemanticProgressTrackerOnlyAcceptsToolAndOutputProgress(t *testing.T) {
+	activity := func(eventName, data string) domain.ChatStreamEvent {
+		content, err := json.Marshal(domain.ChatEventPayload{Kind: "activity", Event: eventName, Data: data})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return domain.ChatStreamEvent{Type: domain.ChatEventActivity, Content: string(content)}
+	}
+	tracker := chatSemanticProgressTracker{}
+	tests := []struct {
+		name  string
+		event domain.ChatStreamEvent
+		want  bool
+	}{
+		{name: "connection lifecycle", event: activity("run.started", `{"type":"run.started"}`)},
+		{name: "reasoning", event: activity("reasoning.delta", `{"type":"reasoning.delta","text":"still thinking"}`), want: true},
+		{name: "duplicate reasoning", event: activity("reasoning.delta", `{"type":"reasoning.delta","text":"still thinking"}`)},
+		{name: "tool identity without tool event name", event: activity("mcp_call", `{"type":"mcp_call","tool_name":"browser_exec","call_id":"call-mcp-1"}`), want: true},
+		{name: "tool started", event: activity("tool.started", `{"type":"tool.started","tool":"browser_exec","call_id":"call-1"}`), want: true},
+		{name: "duplicate tool event", event: activity("tool.started", `{"type":"tool.started","tool":"browser_exec","call_id":"call-1"}`)},
+		{name: "tool progress", event: activity("tool.progress", `{"type":"tool.progress","tool":"browser_exec","call_id":"call-1","step":2}`), want: true},
+		{name: "assistant output", event: domain.ChatStreamEvent{Type: domain.ChatEventDelta, Content: "answer"}, want: true},
+		{name: "artifact output", event: domain.ChatStreamEvent{Type: domain.ChatEventArtifact, Content: `{"kind":"artifact"}`}, want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := tracker.Observe(test.event); got != test.want {
+				t.Fatalf("Observe()=%v, want %v for event %+v", got, test.want, test.event)
+			}
+		})
 	}
 }
 
@@ -2667,6 +2914,22 @@ type contextBlockingReader struct {
 func (r *contextBlockingReader) Read([]byte) (int, error) {
 	<-r.ctx.Done()
 	return 0, r.ctx.Err()
+}
+
+type periodicHeartbeatReader struct {
+	ctx      context.Context
+	interval time.Duration
+}
+
+func (r *periodicHeartbeatReader) Read(target []byte) (int, error) {
+	timer := time.NewTimer(r.interval)
+	defer timer.Stop()
+	select {
+	case <-r.ctx.Done():
+		return 0, r.ctx.Err()
+	case <-timer.C:
+		return copy(target, []byte("event: heartbeat\ndata: {}\n\n")), nil
+	}
 }
 
 type oneByteReader struct {

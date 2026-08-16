@@ -609,6 +609,11 @@ CREATE TABLE IF NOT EXISTS chat_events (
 );
 CREATE INDEX IF NOT EXISTS idx_chat_events_session_cursor
   ON chat_events(session_id, id);
+CREATE TABLE IF NOT EXISTS hermes_profile_inventories (
+  instance_id TEXT PRIMARY KEY REFERENCES instances(id) ON DELETE CASCADE,
+  profiles BLOB NOT NULL DEFAULT '[]',
+  observed_at DATETIME NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_fleet_health_incidents_occurred
   ON fleet_health_incidents(occurred_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_instance_observations_host ON instance_observations(host_id, received_at DESC);
@@ -1618,11 +1623,31 @@ WHERE instance_id=? AND workflow_id=? AND status='READY'`,
 }
 
 func (s *Store) QueueInspection(ctx context.Context, operation domain.Operation, job domain.Job) error {
+	return s.queueInspection(ctx, operation, job, "")
+}
+
+func (s *Store) QueueRunningInspection(ctx context.Context, operation domain.Operation, job domain.Job) error {
+	return s.queueInspection(ctx, operation, job, domain.InstanceRunning)
+}
+
+func (s *Store) queueInspection(ctx context.Context, operation domain.Operation, job domain.Job, requiredStatus string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	if requiredStatus != "" {
+		var instanceStatus string
+		if err := tx.QueryRowContext(ctx, `SELECT status FROM instances WHERE id=?`, job.InstanceID).Scan(&instanceStatus); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if instanceStatus != requiredStatus {
+			return ErrStateChanged
+		}
+	}
 	active, err := activeInstanceJobs(ctx, tx, job.InstanceID)
 	if err != nil {
 		return err
@@ -3367,6 +3392,9 @@ WHERE j.id=? AND j.host_id=? AND j.lease_token=?
 		// original lease token and do not replay it.
 		return nil
 	}
+	if !domain.IsHermesProfileJob(jobType) && result.HermesProfiles != nil {
+		return invalidJobResult("Hermes profile result does not match the active job")
+	}
 	jobStatus, operationStatus, instanceStatus := domain.JobSucceeded, domain.OperationSucceeded, statusAfterSuccess(jobType)
 	errText := ""
 	if !result.Success {
@@ -3405,7 +3433,33 @@ WHERE j.id=? AND j.host_id=? AND j.lease_token=?
 	var restorePayload *domain.RecoveryRestorePayload
 	var upgradePayload *domain.HermesUpgradePayload
 	var updatePayload *domain.HermesUpdatePayload
+	var hermesProfileInventory *domain.HermesProfileInventory
 	switch jobType {
+	case domain.JobInspectHermesProfiles, domain.JobCreateHermesProfile, domain.JobRepairHermesProfiles,
+		domain.JobActivateHermesProfile, domain.JobDeleteHermesProfile:
+		instanceStatus = ""
+		if result.ProjectName != "" || result.DataVolume != "" || result.ManagedPath != "" || result.ImageID != "" ||
+			result.InstanceStatus != "" || result.Credentials != nil || result.ChatMessage != "" ||
+			result.ChatCiphertext != "" || len(result.ChatArtifacts) != 0 || reveal != nil {
+			return invalidJobResult("Hermes profile result returned unrelated metadata")
+		}
+		var payload domain.HermesProfileInspectPayload
+		if err := json.Unmarshal(jobPayload, &payload); err != nil || payload.InstanceID != instanceID ||
+			payload.Name == "" || payload.ProjectName == "" || payload.ManagedPath == "" ||
+			payload.DashboardPort < 1 || payload.DashboardPort > 65535 {
+			return errors.New("Hermes profile job payload is invalid")
+		}
+		if result.Success {
+			if result.HermesProfiles == nil || result.HermesProfiles.InstanceID != payload.InstanceID ||
+				!result.HermesProfiles.ObservedAt.IsZero() || domain.ValidateHermesProfileInventory(result.HermesProfiles) != nil {
+				return invalidJobResult("successful Hermes profile result is incomplete or mismatched")
+			}
+			copy := *result.HermesProfiles
+			copy.ObservedAt = now
+			hermesProfileInventory = &copy
+		} else if result.HermesProfiles != nil {
+			return invalidJobResult("failed Hermes profile result returned an inventory")
+		}
 	case "instance.chat.send":
 		if result.ProjectName != "" || result.DataVolume != "" || result.ManagedPath != "" || result.ImageID != "" ||
 			result.InstanceStatus != "" || result.Credentials != nil {
@@ -3630,7 +3684,8 @@ WHERE j.id=? AND j.host_id=? AND j.lease_token=?
 			return invalidJobResult("runtime metadata result does not match the active job")
 		}
 	}
-	if jobType == "instance.credentials.inspect" || jobType == "instance.auth.codex" || jobType == "instance.chat.send" {
+	if jobType == "instance.credentials.inspect" || jobType == "instance.auth.codex" || jobType == "instance.chat.send" ||
+		domain.IsHermesProfileJob(jobType) {
 		instanceStatus = ""
 		if jobType == "instance.credentials.inspect" && reveal != nil && !result.Success {
 			return invalidJobResult("failed credential inspection cannot contain a reveal")
@@ -3658,6 +3713,23 @@ WHERE id=? AND host_id=? AND status=? AND lease_token=? AND lease_expires_at>?`,
 	if count, _ := jobUpdate.RowsAffected(); count != 1 {
 		return ErrLeaseLost
 	}
+	if hermesProfileInventory != nil {
+		encodedProfiles, err := json.Marshal(hermesProfileInventory.Profiles)
+		if err != nil {
+			return fmt.Errorf("encode Hermes profile inventory: %w", err)
+		}
+		inventoryUpdate, err := tx.ExecContext(ctx, `
+	INSERT INTO hermes_profile_inventories (instance_id, profiles, observed_at)
+	SELECT id, ?, ? FROM instances WHERE id=?
+	ON CONFLICT(instance_id) DO UPDATE SET profiles=excluded.profiles, observed_at=excluded.observed_at`,
+			encodedProfiles, hermesProfileInventory.ObservedAt, hermesProfileInventory.InstanceID)
+		if err != nil {
+			return fmt.Errorf("record Hermes profile inventory: %w", err)
+		}
+		if count, _ := inventoryUpdate.RowsAffected(); count != 1 {
+			return ErrStateChanged
+		}
+	}
 	metadata := make(map[string]any)
 	if len(storedOperationMetadata) > 0 {
 		_ = json.Unmarshal(storedOperationMetadata, &metadata)
@@ -3672,6 +3744,9 @@ WHERE id=? AND host_id=? AND status=? AND lease_token=? AND lease_expires_at>?`,
 	if result.RecoverySHA256 != "" {
 		metadata["backup_sha256"] = result.RecoverySHA256
 	}
+	if hermesProfileInventory != nil {
+		metadata["profile_count"] = len(hermesProfileInventory.Profiles)
+	}
 	encodedMetadata, err := json.Marshal(metadata)
 	if err != nil {
 		return fmt.Errorf("encode operation result metadata: %w", err)
@@ -3679,7 +3754,8 @@ WHERE id=? AND host_id=? AND status=? AND lease_token=? AND lease_expires_at>?`,
 	if _, err := tx.ExecContext(ctx, `UPDATE operations SET status=?, error=?, metadata=?, updated_at=? WHERE id=?`, operationStatus, errText, encodedMetadata, now, operationID); err != nil {
 		return err
 	}
-	if jobType != "instance.credentials.inspect" && jobType != "instance.auth.codex" && jobType != "instance.chat.send" {
+	if jobType != "instance.credentials.inspect" && jobType != "instance.auth.codex" &&
+		jobType != "instance.chat.send" && !domain.IsHermesProfileJob(jobType) {
 		if _, err := tx.ExecContext(ctx, `
 UPDATE instances SET status=COALESCE(NULLIF(?, ''), status), project_name=COALESCE(NULLIF(?, ''), project_name),
   data_volume=COALESCE(NULLIF(?, ''), data_volume), managed_path=COALESCE(NULLIF(?, ''), managed_path),

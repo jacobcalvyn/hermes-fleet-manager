@@ -98,6 +98,59 @@ func TestDeleteMissingChatSessionReturnsNotFound(t *testing.T) {
 	}
 }
 
+func TestCreateHermesProfileRejectsReservedNameBeforeQueueing(t *testing.T) {
+	environment := newAPITestEnvironment(t)
+	response := environment.request(t, http.MethodPost, "/api/v1/instances/missing-instance/profiles", map[string]string{
+		"name": "root", "clone_from": "default",
+	}, environment.adminToken, nil)
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("status=%d body=%s, want %d", response.StatusCode, body, http.StatusBadRequest)
+	}
+}
+
+func TestHermesProfileLifecycleValidatesTargetBeforeQueueing(t *testing.T) {
+	environment := newAPITestEnvironment(t)
+	tests := []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{name: "activate invalid profile", method: http.MethodPost, path: "/api/v1/instances/missing-instance/profiles/INVALID/active"},
+		{name: "delete invalid profile", method: http.MethodDelete, path: "/api/v1/instances/missing-instance/profiles/INVALID"},
+		{name: "delete default profile", method: http.MethodDelete, path: "/api/v1/instances/missing-instance/profiles/default"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := environment.request(t, test.method, test.path, nil, environment.adminToken, nil)
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusBadRequest {
+				body, _ := io.ReadAll(response.Body)
+				t.Fatalf("status=%d body=%s, want %d", response.StatusCode, body, http.StatusBadRequest)
+			}
+		})
+	}
+}
+
+func TestHermesProfileLifecycleRoutesReachInstanceAdmission(t *testing.T) {
+	environment := newAPITestEnvironment(t)
+	for _, test := range []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodPost, path: "/api/v1/instances/missing-instance/profiles/research/active"},
+		{method: http.MethodDelete, path: "/api/v1/instances/missing-instance/profiles/research"},
+	} {
+		response := environment.request(t, test.method, test.path, nil, environment.adminToken, nil)
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusNotFound {
+			body, _ := io.ReadAll(response.Body)
+			t.Fatalf("%s %s status=%d body=%s, want %d", test.method, test.path, response.StatusCode, body, http.StatusNotFound)
+		}
+	}
+}
+
 func TestLivenessAndReadinessEndpointsAreDistinct(t *testing.T) {
 	environment := newAPITestEnvironment(t)
 	for _, test := range []struct {
@@ -651,7 +704,7 @@ func TestCodexConfigurationRequiresAuthenticationAndPersistsOnlyAfterHostSuccess
 	var session domain.ChatSession
 	decodeResponse(t, response, &session)
 	response.Body.Close()
-	defaultTitleSuffix := strings.TrimPrefix(session.Title, "New Chat ")
+	defaultTitleSuffix := strings.TrimPrefix(session.Title, "Chat ")
 	defaultTitleNumber, titleErr := strconv.Atoi(defaultTitleSuffix)
 	if titleErr != nil || defaultTitleNumber < 100 || defaultTitleNumber > 999 || len(defaultTitleSuffix) != 3 {
 		t.Fatalf("new chat default title=%q", session.Title)

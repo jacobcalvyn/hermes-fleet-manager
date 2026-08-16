@@ -778,7 +778,7 @@ func jobNeedsImmediateObservation(jobType string) bool {
 	switch jobType {
 	case "instance.start", "instance.stop", "instance.restart", "instance.reconcile",
 		"instance.hermes.update", "instance.runtime.configure", "instance.messaging.configure", "instance.mcp.configure",
-		"instance.recovery.restore":
+		"instance.recovery.restore", domain.JobRepairHermesProfiles:
 		return true
 	default:
 		return false

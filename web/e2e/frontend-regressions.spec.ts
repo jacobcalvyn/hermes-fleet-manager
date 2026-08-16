@@ -179,7 +179,7 @@ test('Chat renders an optimistic message before queue admission and keeps transp
     id: 'chat-session-optimistic',
     instance_id: instance.id,
     instance_name: instance.name,
-    title: 'Chat with fleet-codex-sync',
+	title: 'New Chat 560',
 	model: 'model-alpha',
 	reasoning: 'medium',
 	service_tier: 'normal',
@@ -218,6 +218,7 @@ test('Chat renders an optimistic message before queue admission and keeps transp
 	}
   let queued = false
   let deleted = false
+	const sessionDisplayTitle = 'Chat 560'
 	let sessionPatch: Record<string, string> | undefined
   await page.route(/\/api\/v1\/chats$/, async (route) => route.fulfill({ json: deleted ? [] : [
 		session,
@@ -367,20 +368,22 @@ test('Chat renders an optimistic message before queue admission and keeps transp
 
   await openFleet(page, { hosts: [host], instances: [instance], operations: [] })
   await page.getByRole('button', { name: 'Chat', exact: true }).click()
-  await expect(page.getByRole('heading', { name: session.title })).toBeVisible()
+  await expect(page.getByRole('heading', { name: sessionDisplayTitle })).toBeVisible()
 	const metadata = page.locator('.chat-thread-metadata')
 	await expect(metadata.locator('dt').first()).toHaveText('ID')
 	await expect(metadata.locator('dt[title="Instance"] img')).toHaveAttribute('src', '/hermes-logo.png')
 	await expect(metadata.locator('dt[title="Model"] svg')).toBeVisible()
 	await expect(metadata.locator('dt[title="Reasoning"] svg')).toBeVisible()
 	await expect(metadata.locator('dt[title="Service tier"] svg')).toBeVisible()
-	await expect(metadata.locator('dd')).toHaveText([session.id, instance.name, 'model-alpha', 'medium', 'normal'])
+	const sessionIDDisplay = `${session.id.slice(0, Math.ceil(session.id.length / 2))}…`
+	await expect(metadata.locator('dd')).toHaveText([sessionIDDisplay, instance.name, 'model-alpha', 'medium', 'normal'])
+	await expect(metadata.locator('.chat-session-id dd')).toHaveAttribute('title', session.id)
 	await page.getByRole('button', { name: 'Show chats sidebar' }).click()
 	await page.getByRole('button', { name: `Open outputs for ${instance.name}` }).click()
 	await expect(page.getByRole('heading', { name: 'Outputs', level: 1 })).toBeVisible()
 	await expect(page.getByLabel('Filter outputs by instance')).toHaveValue(instance.id)
 	await page.getByRole('button', { name: 'Open chat' }).click()
-	await expect(page.getByRole('heading', { name: session.title })).toBeVisible()
+	await expect(page.getByRole('heading', { name: sessionDisplayTitle })).toBeVisible()
 	await expect(page.getByRole('button', { name: 'Hide chats sidebar' })).toBeVisible()
 	await page.getByRole('button', { name: 'Edit session configuration' }).click()
 	await page.getByLabel('Session model').selectOption('model-beta')
@@ -388,7 +391,7 @@ test('Chat renders an optimistic message before queue admission and keeps transp
 	await page.getByLabel('Session service tier').selectOption('priority')
 	await page.getByRole('button', { name: 'Save session configuration' }).click()
 	await expect.poll(() => sessionPatch).toEqual({ model: 'model-beta', reasoning: 'high', service_tier: 'priority' })
-	await expect(page.locator('.chat-thread-metadata dd')).toHaveText([session.id, instance.name, 'model-beta', 'high', 'priority'])
+	await expect(page.locator('.chat-thread-metadata dd')).toHaveText([sessionIDDisplay, instance.name, 'model-beta', 'high', 'priority'])
   await expect(page.getByText('Target:', { exact: false })).toHaveCount(0)
   await expect(page.getByText('Session context', { exact: false })).toHaveCount(0)
   const markdownBubble = page.locator('.chat-bubble.chat-assistant').filter({ hasText: 'Fleet ready' })
@@ -487,9 +490,9 @@ test('Chat renders an optimistic message before queue admission and keeps transp
   expect({ consoleErrors, failedResponses }).toEqual({ consoleErrors: [], failedResponses: [] })
   if (qaScreenshotPath) await page.screenshot({ path: qaScreenshotPath, fullPage: false })
 
-  await page.getByRole('button', { name: `Delete ${session.title}` }).click()
-  await page.getByRole('group', { name: `Confirm deletion of ${session.title}` }).getByRole('button', { name: /^(Delete|Stop & delete)$/ }).click()
-  await expect(page.getByRole('button', { name: session.title })).toHaveCount(0)
+  await page.getByRole('button', { name: `Delete ${sessionDisplayTitle}` }).click()
+  await page.getByRole('group', { name: `Confirm deletion of ${sessionDisplayTitle}` }).getByRole('button', { name: /^(Delete|Stop & delete)$/ }).click()
+  await expect(page.getByRole('button', { name: sessionDisplayTitle })).toHaveCount(0)
   await expect(page.getByText('Create a session and choose its target instance.')).toBeVisible()
 })
 
@@ -1345,10 +1348,16 @@ test('Codex recommendation fills an untouched form but never overwrites a dirty 
   await page.getByRole('button', { name: 'fleet-codex-sync' }).click()
   await page.getByRole('button', { name: 'Codex', exact: true }).click()
   const model = page.getByLabel('Model')
+  const reasoning = page.getByLabel('Reasoning')
+  const serviceTier = page.getByLabel('Service tier')
   await expect(model).toHaveValue('')
+  await expect(reasoning).toHaveValue('medium')
+  await expect(serviceTier).toHaveValue('normal')
 
   await page.getByTitle('Refresh instance status').click()
   await expect(model).toHaveValue('model-alpha')
+  await expect(reasoning).toHaveValue('medium')
+  await expect(serviceTier).toHaveValue('normal')
 
   await model.selectOption('model-beta')
   await page.getByTitle('Refresh instance status').click()

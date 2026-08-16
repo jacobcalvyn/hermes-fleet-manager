@@ -86,7 +86,7 @@ func chatMessagePreview(content string) string {
 func defaultChatSessionTitle(sessionID string) string {
 	digest := sha256.Sum256([]byte(sessionID))
 	number := 100 + (int(digest[0])<<8|int(digest[1]))%900
-	return fmt.Sprintf("New Chat %03d", number)
+	return fmt.Sprintf("Chat %03d", number)
 }
 
 func (s *Server) createChatSession(w http.ResponseWriter, r *http.Request) {

@@ -11,27 +11,29 @@ RUN npm run build
 
 FROM ${GO_BUILD_IMAGE} AS go-build
 
-ARG FLEET_BUILD_ID=development
 ARG GOVULNCHECK_VERSION=v1.6.0
-ARG FLEET_VULN_CHECK_NONCE=manual
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY}
 WORKDIR /src
 COPY go.mod go.sum* ./
-RUN go mod download
-RUN GOBIN=/usr/local/bin go install golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+RUN --mount=type=cache,target=/go/pkg/mod GOBIN=/usr/local/bin go install golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}
+ARG FLEET_BUILD_ID=development
+ARG FLEET_VULN_CHECK_NONCE=manual
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
 COPY runtime/ ./runtime/
-RUN test -n "${FLEET_VULN_CHECK_NONCE}" && govulncheck ./...
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
+RUN --mount=type=cache,target=/go/pkg/mod test -n "${FLEET_VULN_CHECK_NONCE}" && govulncheck ./...
+RUN --mount=type=cache,target=/go/pkg/mod CGO_ENABLED=0 GOOS=linux go build -trimpath \
     -ldflags="-s -w -X github.com/jacobcalvyn/hermes-fleet-manager/internal/api.BuildID=${FLEET_BUILD_ID}" \
     -o /out/hermes-fleet-control-plane ./cmd/control-plane
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
+RUN --mount=type=cache,target=/go/pkg/mod CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
     -o /out/hermes-fleet-agent ./cmd/host-agent
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
+RUN --mount=type=cache,target=/go/pkg/mod CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
     -o /out/fleet-upgrade-guard ./cmd/fleet-upgrade-guard
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
+RUN --mount=type=cache,target=/go/pkg/mod CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
     -o /out/hermes-release-catalog ./cmd/hermes-release-catalog
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
+RUN --mount=type=cache,target=/go/pkg/mod CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
     -o /out/fleet-recovery-import ./cmd/fleet-recovery-import
 RUN govulncheck -mode=binary /out/hermes-fleet-control-plane \
     && govulncheck -mode=binary /out/hermes-fleet-agent \

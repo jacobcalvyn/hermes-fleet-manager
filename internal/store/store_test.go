@@ -838,6 +838,100 @@ func TestQueueInspectionRejectsBusyHostWithoutPersistingOperation(t *testing.T) 
 	}
 }
 
+func TestQueueRunningInspectionRejectsStoppedInstanceAtomically(t *testing.T) {
+	ctx, dataStore, host, instance := newFleetFixture(t, "running-inspection")
+	provisionJob, err := dataStore.ClaimJob(ctx, host.ID, time.Minute)
+	if err != nil || provisionJob == nil {
+		t.Fatalf("ClaimJob() job=%v error=%v", provisionJob, err)
+	}
+	if err := dataStore.AcknowledgeJob(ctx, host.ID, provisionJob.ID, provisionJob.LeaseToken, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := dataStore.CompleteJob(ctx, host.ID, provisionJob.ID, provisionJob.LeaseToken, successfulProvisionResult(instance), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dataStore.db.ExecContext(ctx, `UPDATE instances SET status=? WHERE id=?`, domain.InstanceStopped, instance.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	operation := domain.Operation{
+		ID: "operation-stopped-profile", InstanceID: instance.ID, Type: "REFRESH_HERMES_PROFILES",
+		Status: domain.OperationPending, Summary: "Refresh profiles", CreatedAt: now, UpdatedAt: now,
+	}
+	payload, _ := json.Marshal(domain.HermesProfileInspectPayload{InstanceID: instance.ID, Name: instance.Name})
+	job := domain.Job{
+		ID: "job-stopped-profile", OperationID: operation.ID, HostID: host.ID, InstanceID: instance.ID,
+		Type: domain.JobInspectHermesProfiles, Status: domain.JobPending, Payload: payload, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := dataStore.QueueRunningInspection(ctx, operation, job); !errors.Is(err, ErrStateChanged) {
+		t.Fatalf("QueueRunningInspection() error=%v, want ErrStateChanged", err)
+	}
+	if _, err := dataStore.GetOperation(ctx, operation.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("stopped-instance profile operation was persisted: %v", err)
+	}
+}
+
+func TestProfileCompletionPersistsInventoryAfterInstanceStops(t *testing.T) {
+	ctx, dataStore, host, instance := newFleetFixture(t, "profile-completion-stop")
+	provisionJob, err := dataStore.ClaimJob(ctx, host.ID, time.Minute)
+	if err != nil || provisionJob == nil {
+		t.Fatalf("ClaimJob() job=%v error=%v", provisionJob, err)
+	}
+	if err := dataStore.AcknowledgeJob(ctx, host.ID, provisionJob.ID, provisionJob.LeaseToken, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := dataStore.CompleteJob(ctx, host.ID, provisionJob.ID, provisionJob.LeaseToken, successfulProvisionResult(instance), nil); err != nil {
+		t.Fatal(err)
+	}
+	storedInstance, err := dataStore.GetInstance(ctx, instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	operation := domain.Operation{
+		ID: "operation-profile-refresh-after-stop", InstanceID: instance.ID, Type: "REFRESH_HERMES_PROFILES",
+		Status: domain.OperationPending, Summary: "Refresh profiles", CreatedAt: now, UpdatedAt: now,
+	}
+	payload, _ := json.Marshal(domain.HermesProfileInspectPayload{
+		InstanceID: instance.ID, Name: instance.Name, ProjectName: storedInstance.ProjectName,
+		ManagedPath: storedInstance.ManagedPath, DashboardPort: storedInstance.DashboardPort,
+	})
+	job := domain.Job{
+		ID: "job-profile-refresh-after-stop", OperationID: operation.ID, HostID: host.ID, InstanceID: instance.ID,
+		Type: domain.JobInspectHermesProfiles, Status: domain.JobPending, Payload: payload, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := dataStore.QueueRunningInspection(ctx, operation, job); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := dataStore.ClaimJob(ctx, host.ID, time.Minute)
+	if err != nil || claimed == nil {
+		t.Fatalf("ClaimJob() profile job=%v error=%v", claimed, err)
+	}
+	if err := dataStore.AcknowledgeJob(ctx, host.ID, claimed.ID, claimed.LeaseToken, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dataStore.db.ExecContext(ctx, `UPDATE instances SET status=? WHERE id=?`, domain.InstanceStopped, instance.ID); err != nil {
+		t.Fatal(err)
+	}
+	result := domain.JobResult{Success: true, HermesProfiles: &domain.HermesProfileInventory{
+		InstanceID: instance.ID, Profiles: []domain.HermesProfile{{Name: "default", Default: true}},
+	}}
+	if err := dataStore.CompleteJob(ctx, host.ID, claimed.ID, claimed.LeaseToken, result, nil); err != nil {
+		t.Fatalf("CompleteJob() after stop: %v", err)
+	}
+	inventory, err := dataStore.HermesProfileInventory(ctx, instance.ID)
+	if err != nil || len(inventory.Profiles) != 1 || inventory.Profiles[0].Name != "default" {
+		t.Fatalf("inventory=%+v error=%v", inventory, err)
+	}
+	var jobStatus string
+	if err := dataStore.db.QueryRowContext(ctx, `SELECT status FROM jobs WHERE id=?`, claimed.ID).Scan(&jobStatus); err != nil {
+		t.Fatal(err)
+	}
+	if jobStatus != domain.JobSucceeded {
+		t.Fatalf("job status=%q, want %q", jobStatus, domain.JobSucceeded)
+	}
+}
+
 func TestClaimJobAllowsDifferentInstancesButSerializesEachInstance(t *testing.T) {
 	ctx, dataStore, host, first := newFleetFixture(t, "parallel-claims")
 	second := testInstance("instance-parallel-02", "fleet-parallel-02", host.ID, 18650, 19130, time.Now().UTC().Add(time.Second))

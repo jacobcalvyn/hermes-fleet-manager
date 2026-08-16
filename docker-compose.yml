@@ -7,6 +7,7 @@ services:
       args:
         FLEET_BUILD_ID: ${FLEET_BUILD_ID:-development}
         FLEET_VULN_CHECK_NONCE: ${FLEET_VULN_CHECK_NONCE:-manual}
+        GOPROXY: ${FLEET_BUILD_GOPROXY:-https://proxy.golang.org,direct}
     image: ${FLEET_MANAGER_IMAGE:-local/hermes-fleet-manager:0.12.1}
     container_name: hermes-fleet-control-plane
     restart: unless-stopped

@@ -56,25 +56,27 @@ var (
 )
 
 const (
-	codexDeviceURL                 = "https://auth.openai.com/codex/device"
-	provisionDashboardReadyTimeout = 150 * time.Second
-	dashboardReadinessPollInterval = 2 * time.Second
-	hermesChatIdleTimeout          = 90 * time.Second
+	codexDeviceURL                  = "https://auth.openai.com/codex/device"
+	provisionDashboardReadyTimeout  = 150 * time.Second
+	dashboardReadinessPollInterval  = 2 * time.Second
+	hermesChatConnectionIdleTimeout = 90 * time.Second
+	hermesChatSemanticIdleTimeout   = 2 * time.Minute
 )
 
 type Provisioner struct {
-	root            string
-	dockerPath      string
-	dockerRun       func(context.Context, ...string) (string, error)
-	dockerInputRun  func(context.Context, io.Reader, ...string) (string, error)
-	authRun         func(context.Context, []string, func(string) error) error
-	httpClient      *http.Client
-	chatIdleTimeout time.Duration
-	portCheck       func(int) error
-	recoveryBlocks  map[string]string
-	diskAvailable   func(string) (uint64, error)
-	volumeSize      func(context.Context, string, string, int64) (int64, error)
-	imageBuildMu    sync.Mutex
+	root                      string
+	dockerPath                string
+	dockerRun                 func(context.Context, ...string) (string, error)
+	dockerInputRun            func(context.Context, io.Reader, ...string) (string, error)
+	authRun                   func(context.Context, []string, func(string) error) error
+	httpClient                *http.Client
+	chatConnectionIdleTimeout time.Duration
+	chatSemanticIdleTimeout   time.Duration
+	portCheck                 func(int) error
+	recoveryBlocks            map[string]string
+	diskAvailable             func(string) (uint64, error)
+	volumeSize                func(context.Context, string, string, int64) (int64, error)
+	imageBuildMu              sync.Mutex
 }
 
 type observedContainer struct {
@@ -169,8 +171,11 @@ func New(root, dockerPath string) (*Provisioner, error) {
 	}
 	return &Provisioner{
 		root: absoluteRoot, dockerPath: dockerPath,
-		httpClient: &http.Client{Timeout: 5 * time.Second}, chatIdleTimeout: hermesChatIdleTimeout, portCheck: checkPort,
-		recoveryBlocks: recoveryBlocks,
+		httpClient:                &http.Client{Timeout: 5 * time.Second},
+		chatConnectionIdleTimeout: hermesChatConnectionIdleTimeout,
+		chatSemanticIdleTimeout:   hermesChatSemanticIdleTimeout,
+		portCheck:                 checkPort,
+		recoveryBlocks:            recoveryBlocks,
 	}, nil
 }
 
@@ -294,6 +299,36 @@ func (p *Provisioner) ExecuteWithProgress(ctx context.Context, job domain.Job, r
 			return failure("invalid credential inspection payload", err)
 		}
 		return p.inspectCredentials(payload)
+	case domain.JobInspectHermesProfiles:
+		var payload domain.HermesProfileInspectPayload
+		if err := json.Unmarshal(job.Payload, &payload); err != nil {
+			return failure("invalid Hermes profile inspection payload", err)
+		}
+		return p.inspectHermesProfiles(ctx, payload)
+	case domain.JobCreateHermesProfile:
+		var payload domain.HermesProfileCreatePayload
+		if err := json.Unmarshal(job.Payload, &payload); err != nil {
+			return failure("invalid Hermes profile creation payload", err)
+		}
+		return p.createHermesProfile(ctx, payload)
+	case domain.JobRepairHermesProfiles:
+		var payload domain.HermesProfileInspectPayload
+		if err := json.Unmarshal(job.Payload, &payload); err != nil {
+			return failure("invalid Hermes profile repair payload", err)
+		}
+		return p.repairHermesProfileAccess(ctx, payload)
+	case domain.JobActivateHermesProfile:
+		var payload domain.HermesProfileMutationPayload
+		if err := json.Unmarshal(job.Payload, &payload); err != nil {
+			return failure("invalid Hermes profile activation payload", err)
+		}
+		return p.activateHermesProfile(ctx, payload)
+	case domain.JobDeleteHermesProfile:
+		var payload domain.HermesProfileMutationPayload
+		if err := json.Unmarshal(job.Payload, &payload); err != nil {
+			return failure("invalid Hermes profile deletion payload", err)
+		}
+		return p.deleteHermesProfile(ctx, payload)
 	case "instance.recovery.create":
 		var payload domain.RecoveryPointPayload
 		if err := json.Unmarshal(job.Payload, &payload); err != nil {
@@ -458,12 +493,12 @@ func (p *Provisioner) sendChatMessageStream(
 	defer clearSensitiveBytes(requestBody)
 	streamCtx, cancelStream := context.WithCancel(ctx)
 	defer cancelStream()
-	idleTimeout := p.chatIdleTimeout
-	if idleTimeout <= 0 {
-		idleTimeout = hermesChatIdleTimeout
+	connectionIdleTimeout := p.chatConnectionIdleTimeout
+	if connectionIdleTimeout <= 0 {
+		connectionIdleTimeout = hermesChatConnectionIdleTimeout
 	}
-	idleGuard := newChatIdleGuard(idleTimeout, cancelStream)
-	defer idleGuard.Stop()
+	connectionGuard := newChatIdleGuard(connectionIdleTimeout, cancelStream)
+	defer connectionGuard.Stop()
 	request, err := http.NewRequestWithContext(streamCtx, http.MethodPost,
 		hermesSessionChatURL(payload.APIPort, hermesSessionID, true), bytes.NewReader(requestBody))
 	if err != nil {
@@ -474,8 +509,8 @@ func (p *Provisioner) sendChatMessageStream(
 	request.Header.Set("Accept", "text/event-stream")
 	response, err := client.Do(request)
 	if err != nil {
-		if idleGuard.Expired() {
-			return domain.JobResult{Success: false, Error: fmt.Sprintf("Hermes chat produced no progress for %s", idleTimeout)}
+		if connectionGuard.Expired() {
+			return domain.JobResult{Success: false, Error: fmt.Sprintf("Hermes chat connection stalled: no stream data received for %s", connectionIdleTimeout)}
 		}
 		if ctx.Err() != nil {
 			return domain.JobResult{Success: false, Error: "Hermes chat was canceled after the job lease ended"}
@@ -483,7 +518,7 @@ func (p *Provisioner) sendChatMessageStream(
 		return domain.JobResult{Success: false, Error: "Hermes chat request failed: " + err.Error()}
 	}
 	defer response.Body.Close()
-	idleGuard.Touch()
+	connectionGuard.Touch()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, maximumHermesChatResponseBytes+1))
 		if readErr != nil {
@@ -500,11 +535,27 @@ func (p *Provisioner) sendChatMessageStream(
 	if err := report(ctx, domain.ChatStreamEvent{Sequence: sequence, Type: domain.ChatEventStarted}); err != nil {
 		return domain.JobResult{Success: false, Error: "chat stream start could not be recorded: " + err.Error()}
 	}
+	semanticIdleTimeout := p.chatSemanticIdleTimeout
+	if semanticIdleTimeout <= 0 {
+		semanticIdleTimeout = hermesChatSemanticIdleTimeout
+	}
+	semanticGuard := newChatIdleGuard(semanticIdleTimeout, cancelStream)
+	defer semanticGuard.Stop()
+	semanticProgress := chatSemanticProgressTracker{}
+	semanticReport := func(reportCtx context.Context, event domain.ChatStreamEvent) error {
+		if semanticProgress.Observe(event) {
+			semanticGuard.Touch()
+		}
+		return report(reportCtx, event)
+	}
 	content, sequence, err := consumeHermesChatStream(streamCtx,
-		&chatProgressReader{reader: response.Body, progress: idleGuard.Touch}, sequence, report)
+		&chatProgressReader{reader: response.Body, progress: connectionGuard.Touch}, sequence, semanticReport)
 	if err != nil {
-		if idleGuard.Expired() {
-			return domain.JobResult{Success: false, Error: fmt.Sprintf("Hermes chat produced no progress for %s", idleTimeout)}
+		if semanticGuard.Expired() {
+			return domain.JobResult{Success: false, Error: fmt.Sprintf("tool stalled: Hermes produced no tool or output progress for %s", semanticIdleTimeout)}
+		}
+		if connectionGuard.Expired() {
+			return domain.JobResult{Success: false, Error: fmt.Sprintf("Hermes chat connection stalled: no stream data received for %s", connectionIdleTimeout)}
 		}
 		return domain.JobResult{Success: false, Error: err.Error()}
 	}
@@ -1017,6 +1068,78 @@ func (r *chatProgressReader) Read(target []byte) (int, error) {
 		r.progress()
 	}
 	return n, err
+}
+
+type chatSemanticProgressTracker struct {
+	lastActivityEvent string
+}
+
+func (t *chatSemanticProgressTracker) Observe(event domain.ChatStreamEvent) bool {
+	switch event.Type {
+	case domain.ChatEventDelta, domain.ChatEventArtifact:
+		return true
+	case domain.ChatEventActivity:
+		if !isHermesSemanticProgressEvent(event.Content) || event.Content == t.lastActivityEvent {
+			return false
+		}
+		t.lastActivityEvent = event.Content
+		return true
+	default:
+		return false
+	}
+}
+
+func isHermesSemanticProgressEvent(content string) bool {
+	var payload domain.ChatEventPayload
+	if json.Unmarshal([]byte(content), &payload) != nil || payload.Kind != "activity" {
+		return false
+	}
+	if strings.TrimSpace(payload.Tool) != "" || strings.TrimSpace(payload.CallID) != "" {
+		return true
+	}
+	eventNames := []string{payload.Event}
+	var envelope map[string]any
+	if json.Unmarshal([]byte(payload.Data), &envelope) == nil {
+		eventNames = append(eventNames, stringValue(envelope["type"]))
+		if hermesToolIdentity(envelope) {
+			return true
+		}
+		if item := objectValue(envelope["item"]); len(item) > 0 {
+			eventNames = append(eventNames, stringValue(item["type"]))
+			if hermesToolIdentity(item) {
+				return true
+			}
+		}
+	}
+	for _, eventName := range eventNames {
+		normalized := strings.ToLower(strings.TrimSpace(eventName))
+		if normalized == "tool" || strings.Contains(normalized, "tool.") ||
+			strings.Contains(normalized, "tool_") || strings.Contains(normalized, "tool-") ||
+			strings.Contains(normalized, "function_call") || strings.Contains(normalized, "function.call") ||
+			strings.Contains(normalized, "reasoning") || strings.Contains(normalized, "thinking") ||
+			strings.Contains(normalized, "analysis") {
+			return true
+		}
+	}
+	return false
+}
+
+func hermesToolIdentity(envelope map[string]any) bool {
+	for _, key := range []string{"tool_name", "call_id", "callId", "tool_call_id", "toolCallId"} {
+		if strings.TrimSpace(stringValue(envelope[key])) != "" {
+			return true
+		}
+	}
+	if rawTool, ok := envelope["tool"].(string); ok && strings.TrimSpace(rawTool) != "" {
+		return true
+	}
+	for _, key := range []string{"tool", "function"} {
+		value := objectValue(envelope[key])
+		if strings.TrimSpace(stringValue(value["name"])) != "" || strings.TrimSpace(stringValue(value["call_id"])) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 type chatIdleGuard struct {
@@ -5584,7 +5707,11 @@ func (p *Provisioner) provision(ctx context.Context, payload domain.ProvisionPay
 		if err != nil {
 			return failureWithMetadata("generate dashboard secret", err)
 		}
-		env := renderEnv(payload, apiKey, dashboardPassword, dashboardSecret)
+		dashboardSessionToken, err := randomSecret(32)
+		if err != nil {
+			return failureWithMetadata("generate dashboard session token", err)
+		}
+		env := renderEnv(payload, apiKey, dashboardPassword, dashboardSecret, dashboardSessionToken)
 		compose := renderCompose(payload, projectName, dataVolume)
 		if err := writeExclusiveContext(ctx, envPath, []byte(env), 0o600); err != nil {
 			return failureWithMetadata("write instance secrets", err)
@@ -5721,6 +5848,9 @@ func (p *Provisioner) repairRuntime(ctx context.Context, payload domain.RuntimeR
 	managedPath, err := p.safeManagedPath(action.ManagedPath)
 	if err != nil {
 		return failure("unsafe managed path", err)
+	}
+	if _, err := ensureDashboardSessionTokenFile(ctx, filepath.Join(managedPath, ".env")); err != nil {
+		return failure("managed dashboard session token could not be prepared", err)
 	}
 	if failed := p.prepareRuntimeLifecycle(ctx, managedPath, action); failed != nil {
 		return *failed
@@ -6155,12 +6285,68 @@ func fileExists(path string) bool {
 	return err == nil && !info.IsDir()
 }
 
-func renderEnv(payload domain.ProvisionPayload, apiKey, dashboardPassword, dashboardSecret string) string {
+const dashboardSessionTokenEnvironmentKey = "HERMES_DASHBOARD_SESSION_TOKEN"
+
+func ensureDashboardSessionTokenFile(ctx context.Context, envPath string) (bool, error) {
+	original, err := os.ReadFile(envPath)
+	if err != nil {
+		return false, err
+	}
+	defer clearSensitiveBytes(original)
+	for _, line := range strings.Split(string(original), "\n") {
+		key, value, found := strings.Cut(line, "=")
+		if found && strings.TrimSpace(key) == dashboardSessionTokenEnvironmentKey && trimEnvValue(value) != "" {
+			return false, nil
+		}
+	}
+	token, err := randomSecret(32)
+	if err != nil {
+		return false, err
+	}
+	updated, err := updateEnvContentWithKeys(
+		original,
+		map[string]string{dashboardSessionTokenEnvironmentKey: token},
+		[]string{dashboardSessionTokenEnvironmentKey},
+	)
+	if err != nil {
+		return false, err
+	}
+	defer clearSensitiveBytes(updated)
+	if err := writeAtomicReplaceContext(ctx, envPath, updated, 0o600); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func rotateDashboardSessionTokenFile(ctx context.Context, envPath string) error {
+	original, err := os.ReadFile(envPath)
+	if err != nil {
+		return err
+	}
+	defer clearSensitiveBytes(original)
+	token, err := randomSecret(32)
+	if err != nil {
+		return err
+	}
+	updated, err := updateEnvContentWithKeys(
+		original,
+		map[string]string{dashboardSessionTokenEnvironmentKey: token},
+		[]string{dashboardSessionTokenEnvironmentKey},
+	)
+	if err != nil {
+		return err
+	}
+	defer clearSensitiveBytes(updated)
+	return writeAtomicReplaceContext(ctx, envPath, updated, 0o600)
+}
+
+func renderEnv(payload domain.ProvisionPayload, apiKey, dashboardPassword, dashboardSecret, dashboardSessionToken string) string {
 	values := [][2]string{
 		{"API_SERVER_KEY", apiKey},
 		{"HERMES_DASHBOARD_BASIC_AUTH_USERNAME", "admin"},
 		{"HERMES_DASHBOARD_BASIC_AUTH_PASSWORD", dashboardPassword},
 		{"HERMES_DASHBOARD_BASIC_AUTH_SECRET", dashboardSecret},
+		{dashboardSessionTokenEnvironmentKey, dashboardSessionToken},
 		{"HERMES_INFERENCE_PROVIDER", payload.Provider},
 		{"HERMES_INFERENCE_MODEL", payload.Model},
 		{"HERMES_REASONING_EFFORT", payload.Reasoning},
@@ -6274,6 +6460,7 @@ services:
       HERMES_DASHBOARD_BASIC_AUTH_USERNAME: ${HERMES_DASHBOARD_BASIC_AUTH_USERNAME}
       HERMES_DASHBOARD_BASIC_AUTH_PASSWORD: ${HERMES_DASHBOARD_BASIC_AUTH_PASSWORD}
       HERMES_DASHBOARD_BASIC_AUTH_SECRET: ${HERMES_DASHBOARD_BASIC_AUTH_SECRET}
+      HERMES_DASHBOARD_SESSION_TOKEN: ${HERMES_DASHBOARD_SESSION_TOKEN:-}
     ports:
       - "127.0.0.1:%d:9119"
     volumes:

@@ -23,8 +23,8 @@ import {
   LogOut,
   Menu,
   MessageCircle,
-	PanelLeftClose,
-	PanelLeftOpen,
+  PanelLeftClose,
+  PanelLeftOpen,
   Plug,
   Play,
   Plus,
@@ -41,7 +41,7 @@ import type { LucideIcon } from 'lucide-react'
 import { ApiError, apiDownloadToFile, apiRequest, getOperations, getOperationsPage, getOverview, streamChatEvents, streamFleetEvents } from './api'
 import type { OptimisticChatMessage } from './FleetAssistantThread'
 import OutputsView from './OutputsView'
-import type { Backup, ChatEvent, ChatSession, ChatThread, CodexAuthSession, CredentialReveal, Credentials, FleetStateEvent, HermesReleaseCatalog, HermesUpdate, Host, Instance, MCPConfiguration, MCPDiscoveredTool, MCPDiscoveryResult, MCPServerConfiguration, MessagingConfiguration, ObservationCheck, Operation, Overview, RecoveryPoint, RemoteAccessConfiguration, RemoteAccessMode, RemoteAccessPublishedRoute, RuntimeHealth, SystemInfo } from './types'
+import type { Backup, ChatEvent, ChatSession, ChatThread, CodexAuthSession, CredentialReveal, Credentials, FleetStateEvent, HermesProfileInventory, HermesReleaseCatalog, HermesUpdate, Host, Instance, MCPConfiguration, MCPDiscoveredTool, MCPDiscoveryResult, MCPServerConfiguration, MessagingConfiguration, ObservationCheck, Operation, Overview, RecoveryPoint, RemoteAccessConfiguration, RemoteAccessMode, RemoteAccessPublishedRoute, RuntimeHealth, SystemInfo } from './types'
 
 const FleetAssistantThread = lazy(() => import('./FleetAssistantThread'))
 
@@ -51,7 +51,7 @@ type NavigationSection = {
 	label: string
 	items: Array<{ id: View; label: string; icon: LucideIcon }>
 }
-type InstanceTab = 'overview' | 'access' | 'configuration' | 'messaging' | 'mcp' | 'recovery' | 'diagnostics' | 'operations'
+type InstanceTab = 'overview' | 'access' | 'configuration' | 'profiles' | 'messaging' | 'mcp' | 'recovery' | 'diagnostics' | 'operations'
 type SystemSection = 'general' | 'runtime-health' | 'remote-access' | 'backups'
 type ControlPlaneStatus = 'CHECKING' | 'ONLINE' | 'OFFLINE'
 type HermesUpdateFlow = {
@@ -102,11 +102,13 @@ const focusableSelector = [
 	'[tabindex]:not([tabindex="-1"])',
 ].join(', ')
 
+const hermesReservedProfileNames = new Set(['hermes', 'root', 'sudo', 'test', 'tmp'])
+
 function codexFormFromInstance(instance: Instance): CodexFormState {
 	return {
 		model: instance.codex_configured ? instance.model : instance.observation?.recommended_model ?? '',
-		reasoning: instance.codex_configured ? instance.reasoning : '',
-		service_tier: instance.codex_configured ? instance.service_tier : '',
+		reasoning: instance.codex_configured ? instance.reasoning : 'medium',
+		service_tier: instance.codex_configured ? instance.service_tier : 'normal',
 	}
 }
 
@@ -301,19 +303,74 @@ function persistentHermesUpdateFlow(operation?: Operation): HermesUpdateFlow {
 	return { status: 'running', kind, step: progress.step, targetVersion, detail: progress.detail, resumeAfterUpdate }
 }
 
+const chatSidebarCollapsedStorageKey = 'fleet-chat-sidebar-collapsed'
+const navigationStorageKey = 'fleet-navigation-state'
+const instanceTabStoragePrefix = 'fleet-instance-tab:'
+const selectedChatSessionStorageKey = 'fleet-selected-chat-session'
+
+const validViews: View[] = ['fleet', 'hosts', 'chat', 'outputs', 'alerts', 'operations', 'system']
+const validInstanceTabs: InstanceTab[] = ['overview', 'access', 'configuration', 'profiles', 'messaging', 'mcp', 'recovery', 'diagnostics', 'operations']
+
+type StoredNavigation = {
+  view: View
+  selectedInstanceID: string
+}
+
+function readStoredNavigation(): StoredNavigation | null {
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(navigationStorageKey) ?? 'null') as Partial<StoredNavigation> | null
+    if (!stored || !validViews.includes(stored.view as View)) return null
+    return {
+      view: stored.view as View,
+      selectedInstanceID: typeof stored.selectedInstanceID === 'string' ? stored.selectedInstanceID : '',
+    }
+  } catch {
+    return null
+  }
+}
+
+function readStoredInstanceTab(instanceID: string): InstanceTab {
+  try {
+    const stored = window.localStorage.getItem(`${instanceTabStoragePrefix}${instanceID}`) as InstanceTab | null
+    if (stored && validInstanceTabs.includes(stored)) return stored
+  } catch {
+    // Fall through to the default tab when browser storage is unavailable.
+  }
+  return 'overview'
+}
+
+function readStoredChatSession(): string {
+	try {
+		return window.localStorage.getItem(selectedChatSessionStorageKey) ?? ''
+	} catch {
+		return ''
+	}
+}
+
+function readStoredChatSidebarCollapsed(): boolean | null {
+  try {
+    const stored = window.localStorage.getItem(chatSidebarCollapsedStorageKey)
+    if (stored === 'true') return true
+    if (stored === 'false') return false
+  } catch {
+    // Fall through to the existing first-load behavior when storage is unavailable.
+  }
+  return null
+}
+
 export default function App() {
   const [token, setToken] = useState(() => sessionStorage.getItem('fleet-admin-token') ?? '')
   const [overview, setOverview] = useState<Overview>(emptyOverview)
-  const [view, setView] = useState<View>(() => window.location.hash.startsWith('#system/') ? 'system' : 'chat')
+  const [view, setView] = useState<View>(() => window.location.hash.startsWith('#system/') ? 'system' : readStoredNavigation()?.view ?? 'chat')
   const [loading, setLoading] = useState(Boolean(token))
   const [error, setError] = useState('')
   const [createOpen, setCreateOpen] = useState(false)
   const [mobileNav, setMobileNav] = useState(false)
   const [mobileNavigationLayout, setMobileNavigationLayout] = useState(() => window.matchMedia('(max-width: 720px)').matches)
-  const [selectedInstanceID, setSelectedInstanceID] = useState('')
+  const [selectedInstanceID, setSelectedInstanceID] = useState(() => window.location.hash.startsWith('#system/') ? '' : readStoredNavigation()?.selectedInstanceID ?? '')
 	const [requestedChatSessionID, setRequestedChatSessionID] = useState('')
 	const [requestedOutputInstanceID, setRequestedOutputInstanceID] = useState('')
-	const [chatSidebarCollapsed, setChatSidebarCollapsed] = useState<boolean | null>(null)
+	const [chatSidebarCollapsed, setChatSidebarCollapsedState] = useState<boolean | null>(readStoredChatSidebarCollapsed)
   const [refreshSignal, setRefreshSignal] = useState(0)
   const [controlPlaneStatus, setControlPlaneStatus] = useState<ControlPlaneStatus>(token ? 'CHECKING' : 'OFFLINE')
   const [alertHealth, setAlertHealth] = useState<RuntimeHealth | null>(null)
@@ -332,9 +389,25 @@ export default function App() {
   const operationHistoryExpanded = useRef(false)
   const mobileNavigationRef = useRef<HTMLElement | null>(null)
   const mobileNavigationTriggerRef = useRef<HTMLButtonElement | null>(null)
-  const mobileNavigationCloseRef = useRef<HTMLButtonElement | null>(null)
+	const mobileNavigationCloseRef = useRef<HTMLButtonElement | null>(null)
+	const setChatSidebarCollapsed = useCallback((collapsed: boolean) => {
+		setChatSidebarCollapsedState(collapsed)
+		try {
+			window.localStorage.setItem(chatSidebarCollapsedStorageKey, String(collapsed))
+		} catch {
+			// The in-memory preference still works when browser storage is unavailable.
+		}
+	}, [])
   const restoreMobileNavigationFocus = useRef(true)
 	const stateStreamRef = useRef({ streamID: '', revision: 0 })
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(navigationStorageKey, JSON.stringify({ view, selectedInstanceID }))
+    } catch {
+      // Navigation still works in memory when browser storage is unavailable.
+    }
+  }, [selectedInstanceID, view])
 
   const runRefresh = useCallback(async (showLoading = false) => {
     if (!token) return
@@ -657,7 +730,9 @@ export default function App() {
     {
       id: 'primary',
       label: '',
-      items: [{ id: 'chat', label: 'Chat', icon: MessageCircle }],
+      items: [
+		{ id: 'chat', label: 'Chat', icon: MessageCircle },
+	  ],
     },
     {
       id: 'fleet',
@@ -807,7 +882,7 @@ function ChatView({ token, instances, refreshSignal, onOperation, initialSession
 	const availableInstances = instances.filter((instance) => instance.status === 'RUNNING' && instance.managed_path)
 	const [sessions, setSessions] = useState<ChatSession[]>([])
 	const [seenAssistantMessages, setSeenAssistantMessages] = useState<Record<string, string>>({})
-	const [selectedID, setSelectedID] = useState('')
+	const [selectedID, setSelectedID] = useState(readStoredChatSession)
 	const sidebarCollapsed = sidebarCollapsedState ?? false
 	const [thread, setThread] = useState<ChatThread | null>(null)
 	const [optimisticMessage, setOptimisticMessage] = useState<OptimisticChatMessage | null>(null)
@@ -832,6 +907,15 @@ function ChatView({ token, instances, refreshSignal, onOperation, initialSession
 	const seenSessionsInitialized = useRef(false)
 	const sidebarContentID = useId()
 
+	useEffect(() => {
+		try {
+			if (selectedID) window.localStorage.setItem(selectedChatSessionStorageKey, selectedID)
+			else window.localStorage.removeItem(selectedChatSessionStorageKey)
+		} catch {
+			// Keep the selected chat in memory when browser storage is unavailable.
+		}
+	}, [selectedID])
+
 	const copySessionID = async () => {
 		if (!thread) return
 		try {
@@ -844,7 +928,8 @@ function ChatView({ token, instances, refreshSignal, onOperation, initialSession
 	}
 
 	const loadSessions = useCallback(async (preserveSelection = true) => {
-		const items = await apiRequest<ChatSession[]>(token, '/api/v1/chats', { cache: 'no-store' })
+		const receivedItems = await apiRequest<ChatSession[]>(token, '/api/v1/chats', { cache: 'no-store' })
+		const items = (receivedItems ?? []).map(normalizeChatSessionTitle)
 		const ordered = [...(items ?? [])].sort((left, right) =>
 			new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime() || right.id.localeCompare(left.id))
 		setSessions(ordered)
@@ -865,7 +950,8 @@ function ChatView({ token, instances, refreshSignal, onOperation, initialSession
 			setLiveResponse(null)
 			return null
 		}
-		const value = await apiRequest<ChatThread>(token, `/api/v1/chats/${sessionID}`, { cache: 'no-store' })
+		const receivedValue = await apiRequest<ChatThread>(token, `/api/v1/chats/${sessionID}`, { cache: 'no-store' })
+		const value = { ...receivedValue, session: normalizeChatSessionTitle(receivedValue.session) }
 		const cursor = chatCursor.current
 		if (sequence === threadLoadSequence.current &&
 			(cursor.sessionID !== sessionID || value.last_cursor >= cursor.delivered)) {
@@ -1167,12 +1253,12 @@ function ChatView({ token, instances, refreshSignal, onOperation, initialSession
 					{loading ? <LoaderCircle size={15} className="spin chat-sidebar-rail-loading" /> : sessions.map((session) => {
 						const unread = selectedID !== session.id && session.last_message_role === 'assistant' && Boolean(session.last_message_id) && seenAssistantMessages[session.id] !== session.last_message_id
 						const messageTime = session.last_message_at || session.updated_at
-						const displayedTime = chatTimestamp(messageTime)
+						const displayedTime = chatRailTimestamp(messageTime)
 						const identityCode = chatIdentityCode(session)
-						return <button key={session.id} className={`chat-sidebar-rail-button chat-sidebar-rail-session${selectedID === session.id ? ' chat-sidebar-rail-active' : ''}`} type="button" onClick={() => selectSession(session)} aria-label={`${session.title}, chat ${identityCode}, ${displayedTime}${session.response_in_progress ? ', working' : ''}${unread ? ', new response' : ''}`} title={`${session.title} · ${identityCode} · ${fullChatTimestamp(messageTime)}`}>
+						return <button key={session.id} className={`chat-sidebar-rail-button chat-sidebar-rail-session${selectedID === session.id ? ' chat-sidebar-rail-active' : ''}`} type="button" onClick={() => selectSession(session)} aria-label={`${session.title}, chat ${identityCode}, ${displayedTime.label}${session.response_in_progress ? ', working' : ''}${unread ? ', new response' : ''}`} title={`${session.title} · ${identityCode} · ${fullChatTimestamp(messageTime)}`}>
 							<MessageCircle size={16} />
 							<span className="chat-sidebar-rail-code" aria-hidden="true">{identityCode}</span>
-							<time className="chat-sidebar-rail-time" dateTime={messageTime}>{displayedTime}</time>
+							<time className="chat-sidebar-rail-time" dateTime={messageTime}>{displayedTime.date && <span className="chat-sidebar-rail-date">{displayedTime.date}</span>}<span className="chat-sidebar-rail-clock">{displayedTime.time}</span></time>
 							{session.response_in_progress && <LoaderCircle size={10} className="spin chat-sidebar-rail-status" aria-hidden="true" />}
 							{unread && !session.response_in_progress && <span className="chat-sidebar-rail-unread" aria-hidden="true" />}
 						</button>
@@ -1186,7 +1272,8 @@ function ChatView({ token, instances, refreshSignal, onOperation, initialSession
 				const messageTime = session.last_message_at || session.updated_at
 				const confirmingDelete = deleteConfirmationID === session.id
 				const deleting = deletingID === session.id
-				return <div key={session.id} className={`chat-session-item${selectedID === session.id ? ' chat-session-active' : ''}${unread ? ' chat-session-unread' : ''}${confirmingDelete ? ' chat-session-confirming-delete' : ''}`}><button className="chat-session-select" onClick={() => selectSession(session)}><span className="chat-session-title"><strong>{session.title}</strong><time dateTime={messageTime} title={fullChatTimestamp(messageTime)}>{chatTimestamp(messageTime)}</time></span><span className="chat-session-summary"><span className="chat-session-preview">{session.last_message_preview || 'No messages yet'}</span><span className="chat-session-signals">{session.response_in_progress && <LoaderCircle size={12} className="spin" aria-label={`${session.title} is working`} />}{unread && <span className="chat-session-new" aria-label="New response">New</span>}</span></span>{session.last_error && !session.response_in_progress && <small>Needs attention</small>}</button>{confirmingDelete ? <div className="chat-session-delete-actions" role="group" aria-label={`Confirm deletion of ${session.title}`}><button className="chat-session-delete-confirm" onClick={() => void deleteSession(session)} disabled={Boolean(deletingID)} autoFocus>{deleting ? <LoaderCircle size={13} className="spin" aria-label="Deleting chat" /> : session.response_in_progress ? 'Stop & delete' : 'Delete'}</button><button className="chat-session-delete-cancel" onClick={() => setDeleteConfirmationID('')} disabled={Boolean(deletingID)} aria-label={`Cancel deletion of ${session.title}`} title="Cancel"><X size={14} /></button></div> : <button className="chat-session-delete" onClick={() => setDeleteConfirmationID(session.id)} disabled={Boolean(deletingID)} aria-label={`Delete ${session.title}`} title="Delete chat"><Trash2 size={14} /></button>}</div>
+				const sessionAttentionLabel = session.last_error?.toLowerCase().startsWith('tool stalled:') ? 'Tool stalled' : 'Needs attention'
+				return <div key={session.id} className={`chat-session-item${selectedID === session.id ? ' chat-session-active' : ''}${unread ? ' chat-session-unread' : ''}${confirmingDelete ? ' chat-session-confirming-delete' : ''}`}><button className="chat-session-select" onClick={() => selectSession(session)}><span className="chat-session-title"><strong>{session.title}</strong><time dateTime={messageTime} title={fullChatTimestamp(messageTime)}>{chatTimestamp(messageTime)}</time></span><span className="chat-session-summary"><span className="chat-session-preview">{session.last_message_preview || 'No messages yet'}</span><span className="chat-session-signals">{session.response_in_progress && <LoaderCircle size={12} className="spin" aria-label={`${session.title} is working`} />}{unread && <span className="chat-session-new" aria-label="New response">New</span>}</span></span>{session.last_error && !session.response_in_progress && <small>{sessionAttentionLabel}</small>}</button>{confirmingDelete ? <div className="chat-session-delete-actions" role="group" aria-label={`Confirm deletion of ${session.title}`}><button className="chat-session-delete-confirm" onClick={() => void deleteSession(session)} disabled={Boolean(deletingID)} autoFocus>{deleting ? <LoaderCircle size={13} className="spin" aria-label="Deleting chat" /> : session.response_in_progress ? 'Stop & delete' : 'Delete'}</button><button className="chat-session-delete-cancel" onClick={() => setDeleteConfirmationID('')} disabled={Boolean(deletingID)} aria-label={`Cancel deletion of ${session.title}`} title="Cancel"><X size={14} /></button></div> : <button className="chat-session-delete" onClick={() => setDeleteConfirmationID(session.id)} disabled={Boolean(deletingID)} aria-label={`Delete ${session.title}`} title="Delete chat"><Trash2 size={14} /></button>}</div>
 			})}</div>
 			</div>
 		</aside>
@@ -1196,7 +1283,7 @@ function ChatView({ token, instances, refreshSignal, onOperation, initialSession
 					<div className={`chat-thread-heading${editingSessionConfiguration ? ' chat-thread-heading-editing' : ''}`}><div className="chat-thread-identity"><h2>{thread.session.title}</h2>{editingSessionConfiguration ? <form className="chat-session-configuration-form" onSubmit={(event) => void saveSessionConfiguration(event)}><label>Model<select aria-label="Session model" value={sessionConfiguration.model} onChange={(event) => setSessionConfiguration((current) => ({ ...current, model: event.target.value }))} disabled={savingSessionConfiguration || responseInProgress} required>{sessionModelOptions.map((model) => <option key={model} value={model}>{model}</option>)}</select></label><label>Reasoning<select aria-label="Session reasoning" value={sessionConfiguration.reasoning} onChange={(event) => setSessionConfiguration((current) => ({ ...current, reasoning: event.target.value }))} disabled={savingSessionConfiguration || responseInProgress} required><option value="none">None</option><option value="minimal">Minimal</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Xhigh</option></select></label><label>Service tier<select aria-label="Session service tier" value={sessionConfiguration.service_tier} onChange={(event) => setSessionConfiguration((current) => ({ ...current, service_tier: event.target.value }))} disabled={savingSessionConfiguration || responseInProgress} required><option value="normal">Normal</option><option value="priority">Priority</option></select></label><div className="chat-session-configuration-actions"><button type="button" className="icon-button" onClick={() => {
 					setSessionConfiguration({ model: thread.session.model, reasoning: thread.session.reasoning, service_tier: thread.session.service_tier })
 					setEditingSessionConfiguration(false)
-				}} disabled={savingSessionConfiguration} aria-label="Cancel session configuration"><X size={15} /></button><button type="submit" className="icon-button chat-session-configuration-save" disabled={!sessionConfigurationChanged || savingSessionConfiguration || responseInProgress} aria-label="Save session configuration">{savingSessionConfiguration ? <LoaderCircle size={15} className="spin" /> : <Check size={15} />}</button></div></form> : <dl className="chat-thread-metadata" aria-label="Hermes session configuration"><div className="chat-session-id"><dt>ID</dt><dd title={thread.session.id}>{thread.session.id.slice(0, Math.ceil(thread.session.id.length / 2))}…</dd><button type="button" className="chat-session-id-copy" onClick={() => void copySessionID()} aria-label={copiedSessionID === thread.session.id ? 'Session ID copied' : 'Copy full session ID'} title={copiedSessionID === thread.session.id ? 'Copied' : 'Copy full session ID'}>{copiedSessionID === thread.session.id ? <Check size={11} /> : <Copy size={11} />}</button><span className="sr-only" aria-live="polite">{copiedSessionID === thread.session.id ? 'Session ID copied' : ''}</span></div><div><dt className="chat-thread-metadata-icon" title="Instance"><img src="/hermes-logo.png" alt="" /><span className="sr-only">Instance</span></dt><dd>{thread.session.instance_name}</dd></div><div><dt className="chat-thread-metadata-icon" title="Model"><Bot size={12} aria-hidden="true" /><span className="sr-only">Model</span></dt><dd>{thread.session.model || 'Not configured'}</dd></div><div><dt className="chat-thread-metadata-icon" title="Reasoning"><Brain size={12} aria-hidden="true" /><span className="sr-only">Reasoning</span></dt><dd>{thread.session.reasoning || 'Not configured'}</dd></div><div><dt className="chat-thread-metadata-icon" title="Service tier"><Zap size={12} aria-hidden="true" /><span className="sr-only">Service tier</span></dt><dd>{thread.session.service_tier || 'Not configured'}</dd></div></dl>}</div><div className="chat-heading-status">{streamState === 'RECONNECTING' && <span className="chat-live-state chat-live-reconnecting">Reconnecting</span>}{thread.session.last_error && !responseInProgress ? <Status value="FAILED" label="Needs attention" /> : null}{!editingSessionConfiguration && <button className="icon-button chat-output-shortcut" onClick={() => onOpenOutputs(thread.session.instance_id)} aria-label={`Open outputs for ${thread.session.instance_name}`} title={`Open outputs for ${thread.session.instance_name}`}><FileOutput size={15} /></button>}{!editingSessionConfiguration && <button className="icon-button chat-session-configuration-edit" onClick={() => {
+				}} disabled={savingSessionConfiguration} aria-label="Cancel session configuration"><X size={15} /></button><button type="submit" className="icon-button chat-session-configuration-save" disabled={!sessionConfigurationChanged || savingSessionConfiguration || responseInProgress} aria-label="Save session configuration">{savingSessionConfiguration ? <LoaderCircle size={15} className="spin" /> : <Check size={15} />}</button></div></form> : <dl className="chat-thread-metadata" aria-label="Hermes session configuration"><div className="chat-session-id"><dt>ID</dt><dd title={thread.session.id}>{thread.session.id.slice(0, Math.ceil(thread.session.id.length / 2))}…</dd><button type="button" className="chat-session-id-copy" onClick={() => void copySessionID()} aria-label={copiedSessionID === thread.session.id ? 'Session ID copied' : 'Copy full session ID'} title={copiedSessionID === thread.session.id ? 'Copied' : 'Copy full session ID'}>{copiedSessionID === thread.session.id ? <Check size={11} /> : <Copy size={11} />}</button><span className="sr-only" aria-live="polite">{copiedSessionID === thread.session.id ? 'Session ID copied' : ''}</span></div><div><dt className="chat-thread-metadata-icon" title="Instance"><img src="/hermes-logo.png" alt="" /><span className="sr-only">Instance</span></dt><dd>{thread.session.instance_name}</dd></div><div><dt className="chat-thread-metadata-icon" title="Model"><Bot size={12} aria-hidden="true" /><span className="sr-only">Model</span></dt><dd>{thread.session.model || 'Not configured'}</dd></div><div><dt className="chat-thread-metadata-icon" title="Reasoning"><Brain size={12} aria-hidden="true" /><span className="sr-only">Reasoning</span></dt><dd>{thread.session.reasoning || 'Not configured'}</dd></div><div><dt className="chat-thread-metadata-icon" title="Service tier"><Zap size={12} aria-hidden="true" /><span className="sr-only">Service tier</span></dt><dd>{thread.session.service_tier || 'Not configured'}</dd></div></dl>}</div><div className="chat-heading-status">{streamState === 'RECONNECTING' && <span className="chat-live-state chat-live-reconnecting">Reconnecting</span>}{thread.session.last_error && !responseInProgress ? <Status value="FAILED" label={thread.session.last_error.toLowerCase().startsWith('tool stalled:') ? 'Tool stalled' : 'Needs attention'} /> : null}{!editingSessionConfiguration && <button className="icon-button chat-output-shortcut" onClick={() => onOpenOutputs(thread.session.instance_id)} aria-label={`Open outputs for ${thread.session.instance_name}`} title={`Open outputs for ${thread.session.instance_name}`}><FileOutput size={15} /></button>}{!editingSessionConfiguration && <button className="icon-button chat-session-configuration-edit" onClick={() => {
 					setSessionConfiguration({ model: thread.session.model, reasoning: thread.session.reasoning, service_tier: thread.session.service_tier })
 					setEditingSessionConfiguration(true)
 				}} disabled={responseInProgress} aria-label="Edit session configuration" title={responseInProgress ? 'Wait for the active Hermes response' : 'Edit session configuration'}><Settings size={15} /></button>}</div></div>
@@ -1431,7 +1518,7 @@ function InstanceProfile({
   const credentialPoll = useRef<AbortController | null>(null)
   const [error, setError] = useState('')
   const [codexAuthOpen, setCodexAuthOpen] = useState(false)
-  const [selectedTab, setSelectedTab] = useState<InstanceTab>('overview')
+  const [selectedTab, setSelectedTab] = useState<InstanceTab>(() => readStoredInstanceTab(instance.id))
   const [showPassedDiagnostics, setShowPassedDiagnostics] = useState(false)
   const [refreshingObservation, setRefreshingObservation] = useState(false)
 	const [fixingImage, setFixingImage] = useState(false)
@@ -1454,6 +1541,14 @@ function InstanceProfile({
 	const [remoteAccessError, setRemoteAccessError] = useState('')
 	const [publicationOperation, setPublicationOperation] = useState<Operation | null>(null)
 	const [publicationBusy, setPublicationBusy] = useState(false)
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(`${instanceTabStoragePrefix}${instance.id}`, selectedTab)
+    } catch {
+      // Keep the selected tab in memory when browser storage is unavailable.
+    }
+  }, [instance.id, selectedTab])
 	const publicationController = useRef<AbortController | null>(null)
 	const [activeAction, setActiveAction] = useState('')
 	const recoveryLoadController = useRef<AbortController | null>(null)
@@ -1592,6 +1687,7 @@ function InstanceProfile({
 		{ id: 'overview', label: 'Overview' },
 		{ id: 'access', label: 'Access' },
 		{ id: 'configuration', label: 'Codex' },
+		{ id: 'profiles', label: 'Profiles' },
 		{ id: 'messaging', label: 'Messaging' },
 		{ id: 'mcp', label: 'MCP' },
 		{ id: 'recovery', label: 'Backups' },
@@ -2245,6 +2341,8 @@ function InstanceProfile({
         </section>
       </div>}
 
+	  {selectedTab === 'profiles' && <HermesProfilesPanel instance={instance} token={token} onOperation={onOperation} refreshSignal={refreshSignal} blocked={instanceActionBusy} />}
+
       {selectedTab === 'messaging' && <MessagingSettings instance={instance} token={token} onChanged={onChanged} onOperation={onOperation} refreshSignal={refreshSignal} blocked={instanceActionBusy} />}
 
 	  {selectedTab === 'mcp' && <MCPSettings instance={instance} token={token} onChanged={onChanged} onOperation={onOperation} refreshSignal={refreshSignal} blocked={instanceActionBusy} />}
@@ -2278,6 +2376,197 @@ function InstanceProfile({
       {codexAuthOpen && <CodexAuthDialog instance={instance} token={token} onClose={() => setCodexAuthOpen(false)} onConnected={() => { void requestObservation(); onChanged() }} />}
     </div>
   )
+}
+
+function HermesProfilesPanel({
+	instance,
+	token,
+	onOperation,
+	refreshSignal,
+	blocked = false,
+}: {
+	instance: Instance
+	token: string
+	onOperation: (operation: Operation) => void
+	refreshSignal: number
+	blocked?: boolean
+}) {
+	const [inventory, setInventory] = useState<HermesProfileInventory | null>(null)
+	const [loading, setLoading] = useState(true)
+	const [busy, setBusy] = useState('')
+	const [error, setError] = useState('')
+	const [notice, setNotice] = useState('')
+	const [showCreate, setShowCreate] = useState(false)
+	const [profileName, setProfileName] = useState('')
+	const [cloneFrom, setCloneFrom] = useState('')
+	const [description, setDescription] = useState('')
+	const loadController = useRef<AbortController | null>(null)
+	const autoSyncInstance = useRef('')
+
+	const loadProfiles = useCallback(async () => {
+		loadController.current?.abort()
+		const controller = new AbortController()
+		loadController.current = controller
+		setLoading(true)
+		try {
+			const next = await apiRequest<HermesProfileInventory>(token, `/api/v1/instances/${instance.id}/profiles`, {
+				cache: 'no-store',
+				signal: controller.signal,
+			})
+			setInventory(next)
+			setCloneFrom((current) => current || next.profiles.find((profile) => profile.default)?.name || next.profiles[0]?.name || '')
+			setError('')
+		} catch (requestError) {
+			if (!(requestError instanceof DOMException && requestError.name === 'AbortError')) {
+				setError(requestError instanceof Error ? requestError.message : 'Hermes profiles could not be loaded')
+			}
+		} finally {
+			if (!controller.signal.aborted) setLoading(false)
+		}
+	}, [instance.id, token])
+
+	useEffect(() => {
+		const scheduledLoad = window.setTimeout(() => void loadProfiles(), 0)
+		return () => {
+			window.clearTimeout(scheduledLoad)
+			loadController.current?.abort()
+		}
+	}, [loadProfiles, refreshSignal])
+
+	const executeProfileOperation = useCallback(async (path: string, options: RequestInit, signal: AbortSignal) => {
+		let operation = await apiRequest<Operation>(token, path, { ...options, signal })
+		onOperation(operation)
+		if (['PENDING', 'RUNNING'].includes(operation.status)) {
+			operation = await waitForOperation(token, operation.id, signal)
+			onOperation(operation)
+		}
+		return operation
+	}, [onOperation, token])
+
+	const runOperation = async (action: string, path: string, options: RequestInit = {}) => {
+		const controller = new AbortController()
+		setBusy(action)
+		setError('')
+		setNotice('')
+		try {
+			await executeProfileOperation(path, options, controller.signal)
+			await loadProfiles()
+			return true
+		} catch (requestError) {
+			setError(requestError instanceof Error ? requestError.message : 'Hermes profile operation failed')
+			return false
+		} finally {
+			setBusy('')
+		}
+	}
+
+	const syncProfiles = useCallback(async (announce = true) => {
+		if (instance.status !== 'RUNNING' || blocked) return
+		const controller = new AbortController()
+		setBusy('sync')
+		setError('')
+		setNotice('')
+		let repaired = false
+		try {
+			try {
+				await executeProfileOperation(`/api/v1/instances/${instance.id}/profiles/refresh`, { method: 'POST' }, controller.signal)
+			} catch (requestError) {
+				if (!isRepairableHermesProfileAccessError(requestError)) throw requestError
+				repaired = true
+				await executeProfileOperation(`/api/v1/instances/${instance.id}/profiles/repair`, { method: 'POST' }, controller.signal)
+			}
+			await loadProfiles()
+			if (announce) setNotice(repaired ? 'Profile access repaired and profiles synced.' : 'Profiles synced.')
+		} catch (requestError) {
+			setError(requestError instanceof Error ? requestError.message : 'Hermes profiles could not be synced')
+		} finally {
+			setBusy('')
+		}
+	}, [blocked, executeProfileOperation, instance.id, instance.status, loadProfiles])
+
+	const createProfile = async (event: FormEvent) => {
+		event.preventDefault()
+		const created = await runOperation('create', `/api/v1/instances/${instance.id}/profiles`, {
+			method: 'POST',
+			body: JSON.stringify({ name: profileName.trim(), clone_from: cloneFrom, description: description.trim() }),
+		})
+		if (created) {
+			setProfileName('')
+			setDescription('')
+			setShowCreate(false)
+		}
+	}
+
+	const activateProfile = async (name: string) => {
+		const activated = await runOperation(`activate:${name}`, `/api/v1/instances/${instance.id}/profiles/${encodeURIComponent(name)}/active`, {
+			method: 'POST',
+		})
+		if (activated) setNotice(`${name} is now the active profile for new Hermes commands.`)
+	}
+
+	const deleteProfile = async (name: string) => {
+		if (!window.confirm(`Delete Hermes profile ${name}? Its configuration, API keys, memory, sessions, skills, and cron jobs will be permanently removed.`)) return
+		const deleted = await runOperation(`delete:${name}`, `/api/v1/instances/${instance.id}/profiles/${encodeURIComponent(name)}`, {
+			method: 'DELETE',
+		})
+		if (deleted) setNotice(`${name} was deleted.`)
+	}
+
+	const profiles = inventory?.profiles ?? []
+	const available = instance.status === 'RUNNING' && !blocked && busy === ''
+	const inventoryObservedAt = inventory?.observed_at && !inventory.observed_at.startsWith('0001-')
+		? inventory.observed_at
+		: ''
+
+	useEffect(() => {
+		if (loading || !available || autoSyncInstance.current === instance.id) return
+		const observedAt = inventoryObservedAt ? Date.parse(inventoryObservedAt) : 0
+		const stale = !observedAt || Date.now() - observedAt > 5 * 60 * 1000
+		if (!stale) return
+		const scheduledSync = window.setTimeout(() => {
+			autoSyncInstance.current = instance.id
+			void syncProfiles(false)
+		}, 0)
+		return () => window.clearTimeout(scheduledSync)
+	}, [available, instance.id, inventoryObservedAt, loading, syncProfiles])
+
+	return <div className="profile-tab-content">
+		<section className="section-block first-section profile-section hermes-profiles-section">
+			<div className="section-heading">
+				<div><h2>Hermes profiles</h2><p>Authoritative profiles reported by {instance.name}; secrets and filesystem paths stay on the managed host</p></div>
+				<div className="section-actions">
+					<button className="secondary-button compact-button" onClick={() => void syncProfiles()} disabled={!available}>
+						<RefreshCw size={16} className={busy === 'sync' ? 'spin' : ''} />{busy === 'sync' ? 'Syncing profiles' : 'Sync profiles'}
+					</button>
+					<button className="primary-button compact-button" onClick={() => setShowCreate((current) => !current)} disabled={!available || profiles.length === 0} aria-expanded={showCreate}>
+						<Plus size={16} />Create from profile
+					</button>
+				</div>
+			</div>
+			<div className="backup-scope"><ShieldCheck size={18} /><div><strong>Fleet-owned transport boundary</strong><span>Fleet requests inventory and lifecycle operations through the owning Host Agent. Active selects the profile for future Hermes commands; Gateway reports whether its process is running. The browser never receives Hermes profile tokens.</span></div></div>
+			{showCreate && <form className="hermes-profile-create" onSubmit={(event) => void createProfile(event)}>
+				<div className="form-grid">
+					<label>Profile name<input value={profileName} onChange={(event) => {
+						const value = event.target.value.toLowerCase()
+						event.currentTarget.setCustomValidity(hermesReservedProfileNames.has(value) ? 'This profile name is reserved by Hermes.' : '')
+						setProfileName(value)
+					}} pattern="[a-z0-9][a-z0-9_-]{0,63}" maxLength={64} placeholder="research-worker" required disabled={!available} /></label>
+					<label>Clone from<select value={cloneFrom} onChange={(event) => setCloneFrom(event.target.value)} required disabled={!available}>{profiles.map((profile) => <option key={profile.name} value={profile.name}>{profile.name}{profile.default ? ' · default' : ''}</option>)}</select></label>
+					<label className="form-wide">Description<input value={description} onChange={(event) => setDescription(event.target.value)} maxLength={1000} placeholder="Dedicated profile purpose" disabled={!available} /></label>
+				</div>
+					<div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setShowCreate(false)} disabled={busy === 'create'}>Cancel</button><button type="submit" className="primary-button" disabled={!available || !profileName.trim() || hermesReservedProfileNames.has(profileName.trim()) || !cloneFrom || profileName.trim() === cloneFrom}>{busy === 'create' ? <RefreshCw className="spin" size={16} /> : <Plus size={16} />}{busy === 'create' ? 'Creating profile' : 'Create profile'}</button></div>
+			</form>}
+			{notice && <div className="inline-notice">{notice}</div>}
+			{error && <div className="inline-error">{error}</div>}
+			{loading ? <div className="compact-empty"><LoaderCircle className="spin" size={18} /><div><strong>Loading profiles</strong><span>Reading the latest Fleet snapshot.</span></div></div> : profiles.length === 0 ? <div className="compact-empty"><Bot size={18} /><div><strong>No profile inventory yet</strong><span>Use Sync profiles to read the authoritative Hermes inventory. Fleet repairs legacy profile access only when refresh reports an access failure.</span></div></div> : <div className="table-wrap"><table className="provider-table hermes-profiles-table"><thead><tr><th>Profile</th><th>Runtime</th><th>Provider / model</th><th><span className="sr-only">Actions</span></th></tr></thead><tbody>{profiles.map((profile) => <tr key={profile.name}>
+				<td data-label="Profile"><strong>{profile.name}</strong><span className="secondary-text">{profile.description || 'No description'}</span></td>
+				<td data-label="Runtime"><div className="profile-statuses">{profile.default && <Status value="READY" label="Default" />}{profile.active && <Status value="RUNNING" label="Active" />}{profile.gateway_running ? <Status value="ONLINE" label="Gateway" /> : <Status value="STOPPED" label="Gateway stopped" />}</div></td>
+				<td data-label="Provider / model"><strong>{profile.provider || 'Not reported'}</strong><span className="secondary-text">{profile.model || 'Model not reported'}</span></td>
+				<td data-label="Actions"><div className="row-actions"><button className="icon-button" title={profile.active ? `${profile.name} is already active` : `Set ${profile.name} as active`} onClick={() => void activateProfile(profile.name)} disabled={!available || profile.active}>{busy === `activate:${profile.name}` ? <RefreshCw className="spin" size={15} /> : <Check size={15} />}</button>{!profile.default && <button className="icon-button danger-button" title={`Delete ${profile.name}`} onClick={() => void deleteProfile(profile.name)} disabled={!available}>{busy === `delete:${profile.name}` ? <RefreshCw className="spin" size={15} /> : <Trash2 size={15} />}</button>}</div></td>
+			</tr>)}</tbody></table></div>}
+			<div className="section-footer"><span>{inventoryObservedAt ? `Observed ${relativeTime(inventoryObservedAt)}` : 'Inventory has not been observed yet.'}</span><span>{profiles.length} {plural(profiles.length, 'profile')}</span></div>
+		</section>
+	</div>
 }
 
 type MessagingFormState = {
@@ -4592,6 +4881,11 @@ function requestErrorMessage(value: unknown) {
 	return value instanceof Error ? value.message : 'Source unavailable'
 }
 
+function isRepairableHermesProfileAccessError(value: unknown) {
+	const message = requestErrorMessage(value)
+	return /Hermes dashboard (?:session token is unavailable|returned HTTP (?:401|403)|profile login was rejected with HTTP (?:401|403))|Hermes profile access (?:is unavailable|failed)/i.test(message)
+}
+
 const codexSetupCheckNames = new Set(['codex_auth', 'runtime_configuration', 'codex_setup'])
 
 function instanceOperationalHealthStatus(instance: Instance) {
@@ -4764,6 +5058,24 @@ function chatTimestamp(timestamp: string, now = Date.now()) {
 	}).format(value)
 }
 
+function chatRailTimestamp(timestamp: string, now = Date.now()) {
+	const value = new Date(timestamp)
+	if (Number.isNaN(value.getTime())) return { date: '', time: timestamp, label: timestamp }
+	if (Math.max(0, now - value.getTime()) < 60000) return { date: '', time: 'Just now', label: 'Just now' }
+	const current = new Date(now)
+	const sameDay = value.getFullYear() === current.getFullYear()
+		&& value.getMonth() === current.getMonth()
+		&& value.getDate() === current.getDate()
+	const time = new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit' }).format(value)
+	if (sameDay) return { date: '', time, label: time }
+	const date = new Intl.DateTimeFormat('en-GB', {
+		day: '2-digit',
+		month: 'short',
+		...(value.getFullYear() === current.getFullYear() ? {} : { year: '2-digit' as const }),
+	}).format(value)
+	return { date, time, label: `${date}, ${time}` }
+}
+
 function chatIdentityCode(session: Pick<ChatSession, 'id' | 'title'>) {
 	const titleCode = session.title.match(/\b(\d{3})\s*$/)?.[1]
 	if (titleCode) return titleCode
@@ -4772,6 +5084,11 @@ function chatIdentityCode(session: Pick<ChatSession, 'id' | 'title'>) {
 		hash = (Math.imul(hash, 31) + character.charCodeAt(0)) >>> 0
 	}
 	return String(100 + (hash % 900))
+}
+
+function normalizeChatSessionTitle(session: ChatSession): ChatSession {
+	if (!/^New Chat \d{3}$/.test(session.title)) return session
+	return { ...session, title: `Chat ${chatIdentityCode(session)}` }
 }
 
 function fullChatTimestamp(timestamp: string) {

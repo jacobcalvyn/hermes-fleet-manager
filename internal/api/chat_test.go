@@ -11,7 +11,7 @@ import (
 
 func TestDefaultChatSessionTitleUsesThreeDigitSuffix(t *testing.T) {
 	title := defaultChatSessionTitle("11111111-1111-4111-8111-111111111111")
-	if !regexp.MustCompile(`^New Chat [0-9]{3}$`).MatchString(title) {
+	if !regexp.MustCompile(`^Chat [0-9]{3}$`).MatchString(title) {
 		t.Fatalf("default title=%q", title)
 	}
 	if title != defaultChatSessionTitle("11111111-1111-4111-8111-111111111111") {

@@ -1,8 +1,8 @@
 FROM node:22-bookworm-slim
 
 ARG HERMES_REPO=https://github.com/NousResearch/hermes-agent.git
-ARG HERMES_REF=7acaff5ef2bcbaa22bd23b72efe60906123a4f55
-ARG HERMES_VERSION=0.18.2
+ARG HERMES_REF=f80f453ae0679347e38abc917c7f94f717bf96c5
+ARG HERMES_VERSION=0.20.1
 ARG RUNTIME_BUILD_ID=unknown
 
 ENV PIP_DEFAULT_TIMEOUT=180 \
@@ -69,7 +69,9 @@ ENV HERMES_HOME=/data \
 RUN git clone --depth 1 "${HERMES_REPO}" /opt/hermes-agent \
     && cd /opt/hermes-agent \
     && git fetch --depth 1 origin "${HERMES_REF}" \
-    && git checkout "${HERMES_REF}" \
+    && git checkout "${HERMES_REF}"
+
+RUN cd /opt/hermes-agent \
     && uv venv .venv --python python3 \
     && uv pip install -e ".[all]" \
     && uv pip install playwright \

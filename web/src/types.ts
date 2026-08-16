@@ -111,6 +111,22 @@ export type OperationPage = {
   next_cursor?: string | null
 }
 
+export type HermesProfile = {
+	name: string
+	description?: string
+	provider?: string
+	model?: string
+	active: boolean
+	default: boolean
+	gateway_running: boolean
+}
+
+export type HermesProfileInventory = {
+	instance_id: string
+	profiles: HermesProfile[]
+	observed_at?: string
+}
+
 export type ChatSession = {
 	id: string
 	instance_id: string
