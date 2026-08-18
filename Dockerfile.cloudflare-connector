@@ -1,4 +1,4 @@
-FROM cloudflare/cloudflared:2026.7.3 AS cloudflared
+FROM cloudflare/cloudflared:2026.8.2 AS cloudflared
 
 FROM golang:1.26.6-bookworm AS build
 ARG GOVULNCHECK_VERSION=v1.6.0
