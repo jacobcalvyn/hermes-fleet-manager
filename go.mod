@@ -1,9 +1,9 @@
 module github.com/jacobcalvyn/hermes-fleet-manager
 
-go 1.22
+go 1.25.0
 
 require (
-	golang.org/x/sys v0.19.0
+	golang.org/x/sys v0.47.0
 	modernc.org/sqlite v1.29.10
 )
 
