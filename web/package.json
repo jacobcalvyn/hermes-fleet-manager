@@ -11,7 +11,7 @@
     "test:e2e": "playwright test"
   },
   "dependencies": {
-    "@assistant-ui/react": "^0.15.13",
+    "@assistant-ui/react": "^0.15.14",
     "@vitejs/plugin-react": "6.0.3",
     "lucide-react": "1.24.0",
     "react": "19.2.7",
