@@ -1,8 +1,14 @@
 .env
 .git
+.github
 .state
+.cursor
+.cache
 bin
+backups
 output
+playwright-report
+test-results
 web/dist
 web/node_modules
 *.db

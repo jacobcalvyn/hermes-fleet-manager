@@ -1,5 +1,9 @@
 .env
 .state/
+.cursor/
+.vscode/
+*.log
+
 .artifacts/
 .cache/
 .codex-artifacts/

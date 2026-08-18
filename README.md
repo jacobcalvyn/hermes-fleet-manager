@@ -1,8 +1,8 @@
 # Hermes Fleet Manager
 
 Hermes Fleet Manager is a local-first control plane that provisions new,
-isolated Hermes Agent instances. Existing Nara, Sena, Raka, and Arka
-deployments are outside its ownership and are never imported or modified.
+isolated Hermes Agent instances. Existing unmanaged Hermes deployments are
+outside its ownership and are never imported or modified.
 
 ## Components
 
@@ -65,6 +65,8 @@ Requirements:
 Run:
 
 ```sh
+git clone https://github.com/jacobcalvyn/hermes-fleet-manager.git
+cd hermes-fleet-manager
 ./scripts/fleet-bootstrap.sh
 ```
 
@@ -639,3 +641,17 @@ at 25 MiB with four files retained. Its credential remains in
   data. Recovery-point deletion requires its exact generated filename.
 
 See [docs/architecture.md](docs/architecture.md) for the current V1 contract.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Please read [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
+before opening an issue or pull request.
+
+## Security
+
+See [SECURITY.md](SECURITY.md). Do not file public issues for leaked tokens,
+provider keys, or instance data.
+
+## License
+
+Hermes Fleet Manager is released under the [MIT License](LICENSE).

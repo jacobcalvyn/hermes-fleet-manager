@@ -71,11 +71,11 @@ func (store *memoryOwnershipStore) DeleteRemoteAccessResource(_ context.Context,
 }
 
 func TestBuildInstancePublicHostname(t *testing.T) {
-	hostname, err := BuildInstancePublicHostname(" Andes ", "Test01", "JACOBCALVYN.IO.")
+	hostname, err := BuildInstancePublicHostname(" Andes ", "Test01", "EXAMPLE.COM.")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hostname != "andes-test01.jacobcalvyn.io" {
+	if hostname != "andes-test01.example.com" {
 		t.Fatalf("hostname=%q", hostname)
 	}
 	for _, test := range []struct {

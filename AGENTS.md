@@ -5,7 +5,7 @@ Agent. It provisions only new, isolated Fleet-owned Hermes instances.
 
 ## Boundaries
 
-- Do not adopt or mutate the existing Nara, Sena, Raka, or Arka deployments.
+- Do not adopt or mutate existing unmanaged Hermes deployments.
 - Keep control-plane state in the `hermes-fleet-manager-data` Docker volume.
 - Preserve `.env`, Host Agent enrollment state, and managed instance data during
   upgrades.
