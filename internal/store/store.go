@@ -434,6 +434,7 @@ CREATE TABLE IF NOT EXISTS instance_observations (
   hermes_source TEXT NOT NULL DEFAULT '',
   model_catalog BLOB NOT NULL DEFAULT '[]',
   recommended_model TEXT NOT NULL DEFAULT '',
+  provider_model_catalogs BLOB NOT NULL DEFAULT '{}',
   status TEXT NOT NULL,
   summary TEXT NOT NULL,
   checks BLOB NOT NULL,
@@ -641,6 +642,9 @@ CREATE INDEX IF NOT EXISTS idx_observation_requests_host ON observation_requests
 		return err
 	}
 	if err := s.ensureColumn("instance_observations", "recommended_model", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("instance_observations", "provider_model_catalogs", "BLOB NOT NULL DEFAULT '{}'"); err != nil {
 		return err
 	}
 	if err := s.migrateCodexConfigurationState(); err != nil {
@@ -1740,7 +1744,7 @@ SELECT i.id, i.name, i.host_id, h.name, i.status, i.image, i.image_id, i.provide
        i.service_tier, i.codex_configured, i.api_port, i.dashboard_port, i.public_hostname, i.project_name, i.data_volume, i.managed_path,
        i.last_error, i.created_at, i.updated_at,
 	       o.host_id, o.target_generation, o.hermes_version, o.hermes_source, o.model_catalog, o.recommended_model,
-	       o.status, o.summary, o.checks, o.observed_at, o.received_at,
+	       o.provider_model_catalogs, o.status, o.summary, o.checks, o.observed_at, o.received_at,
        r.request_id, r.requested_at
 FROM instances i
 JOIN hosts h ON h.id=i.host_id
@@ -1756,34 +1760,28 @@ ORDER BY i.created_at DESC`)
 	for rows.Next() {
 		var i domain.Instance
 		var observationHostID, targetGeneration, hermesVersion, hermesSource, recommendedModel, observationStatus, observationSummary sql.NullString
-		var observationChecks, modelCatalog []byte
+		var observationChecks, modelCatalog, providerCatalogs []byte
 		var observedAt, receivedAt sql.NullTime
 		var requestID sql.NullString
 		var requestedAt sql.NullTime
 		if err := rows.Scan(&i.ID, &i.Name, &i.HostID, &i.HostName, &i.Status, &i.Image, &i.ImageID, &i.Provider,
 			&i.Model, &i.Reasoning, &i.ServiceTier, &i.CodexConfigured, &i.APIPort, &i.DashboardPort, &i.PublicHostname, &i.ProjectName, &i.DataVolume,
 			&i.ManagedPath, &i.LastError, &i.CreatedAt, &i.UpdatedAt,
-			&observationHostID, &targetGeneration, &hermesVersion, &hermesSource, &modelCatalog, &recommendedModel,
+			&observationHostID, &targetGeneration, &hermesVersion, &hermesSource, &modelCatalog, &recommendedModel, &providerCatalogs,
 			&observationStatus, &observationSummary, &observationChecks, &observedAt, &receivedAt,
 			&requestID, &requestedAt); err != nil {
 			return nil, err
 		}
 		if observationStatus.Valid {
-			var checks []domain.ObservationCheck
-			if err := json.Unmarshal(observationChecks, &checks); err != nil {
-				return nil, fmt.Errorf("decode observation checks for %s: %w", i.ID, err)
+			observation, err := decodeStoredObservation(
+				i.ID, observationHostID.String, targetGeneration.String, hermesVersion.String, hermesSource.String,
+				recommendedModel.String, observationStatus.String, observationSummary.String,
+				observationChecks, modelCatalog, providerCatalogs, observedAt.Time, receivedAt.Time,
+			)
+			if err != nil {
+				return nil, err
 			}
-			var models []string
-			if err := json.Unmarshal(modelCatalog, &models); err != nil {
-				return nil, fmt.Errorf("decode model catalog for %s: %w", i.ID, err)
-			}
-			i.Observation = &domain.InstanceObservation{
-				InstanceID: i.ID, HostID: observationHostID.String, TargetGeneration: targetGeneration.String,
-				HermesVersion: hermesVersion.String, HermesSource: hermesSource.String,
-				ModelCatalog: models, RecommendedModel: recommendedModel.String,
-				Status: observationStatus.String, Summary: observationSummary.String, Checks: checks,
-				ObservedAt: observedAt.Time, ReceivedAt: receivedAt.Time,
-			}
+			i.Observation = observation
 		}
 		if requestID.Valid {
 			i.ObservationRequest = &domain.ObservationRequest{ID: requestID.String, InstanceID: i.ID, RequestedAt: requestedAt.Time}
@@ -1880,11 +1878,19 @@ func (s *Store) RecordObservations(ctx context.Context, hostID string, observati
 		if err != nil {
 			return fmt.Errorf("encode observation model catalog: %w", err)
 		}
+		providerCatalogs := observation.ProviderModelCatalogs
+		if providerCatalogs == nil {
+			providerCatalogs = map[string]domain.ProviderModelCatalog{}
+		}
+		encodedProviderCatalogs, err := json.Marshal(providerCatalogs)
+		if err != nil {
+			return fmt.Errorf("encode observation provider model catalogs: %w", err)
+		}
 		if _, err := tx.ExecContext(ctx, `
 INSERT INTO instance_observations (
   instance_id, host_id, target_generation, hermes_version, hermes_source, model_catalog, recommended_model,
-  status, summary, checks, observed_at, received_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  provider_model_catalogs, status, summary, checks, observed_at, received_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(instance_id) DO UPDATE SET
   host_id=excluded.host_id,
   target_generation=excluded.target_generation,
@@ -1892,13 +1898,14 @@ ON CONFLICT(instance_id) DO UPDATE SET
   hermes_source=excluded.hermes_source,
   model_catalog=excluded.model_catalog,
   recommended_model=excluded.recommended_model,
+  provider_model_catalogs=excluded.provider_model_catalogs,
   status=excluded.status,
   summary=excluded.summary,
   checks=excluded.checks,
   observed_at=excluded.observed_at,
   received_at=excluded.received_at`,
 			observation.InstanceID, hostID, observation.TargetGeneration, observation.HermesVersion, observation.HermesSource,
-			modelCatalog, observation.RecommendedModel, observation.Status, observation.Summary, checks, observation.ObservedAt, effectiveReceivedAt,
+			modelCatalog, observation.RecommendedModel, encodedProviderCatalogs, observation.Status, observation.Summary, checks, observation.ObservedAt, effectiveReceivedAt,
 		); err != nil {
 			return fmt.Errorf("record instance observation: %w", err)
 		}
@@ -2396,7 +2403,7 @@ func observationGeneration(updatedAt time.Time) string {
 func (s *Store) GetInstance(ctx context.Context, id string) (domain.Instance, error) {
 	var i domain.Instance
 	var observationHostID, targetGeneration, hermesVersion, hermesSource, recommendedModel, observationStatus, observationSummary sql.NullString
-	var observationChecks, modelCatalog []byte
+	var observationChecks, modelCatalog, providerCatalogs []byte
 	var observedAt, receivedAt sql.NullTime
 	var requestID sql.NullString
 	var requestedAt sql.NullTime
@@ -2405,7 +2412,7 @@ SELECT i.id, i.name, i.host_id, i.status, i.image, i.image_id, i.provider, i.mod
        i.service_tier, i.codex_configured, i.api_port, i.dashboard_port, i.public_hostname, i.project_name, i.data_volume,
        i.managed_path, i.last_error, i.created_at, i.updated_at,
        o.host_id, o.target_generation, o.hermes_version, o.hermes_source, o.model_catalog, o.recommended_model,
-       o.status, o.summary, o.checks, o.observed_at, o.received_at,
+       o.provider_model_catalogs, o.status, o.summary, o.checks, o.observed_at, o.received_at,
        r.request_id, r.requested_at
 FROM instances i
 LEFT JOIN instance_observations o ON o.instance_id=i.id
@@ -2413,7 +2420,7 @@ LEFT JOIN observation_requests r ON r.instance_id=i.id
 WHERE i.id=?`, id).Scan(&i.ID, &i.Name, &i.HostID, &i.Status, &i.Image, &i.ImageID,
 		&i.Provider, &i.Model, &i.Reasoning, &i.ServiceTier, &i.CodexConfigured, &i.APIPort, &i.DashboardPort,
 		&i.PublicHostname, &i.ProjectName, &i.DataVolume, &i.ManagedPath, &i.LastError, &i.CreatedAt, &i.UpdatedAt,
-		&observationHostID, &targetGeneration, &hermesVersion, &hermesSource, &modelCatalog, &recommendedModel,
+		&observationHostID, &targetGeneration, &hermesVersion, &hermesSource, &modelCatalog, &recommendedModel, &providerCatalogs,
 		&observationStatus, &observationSummary, &observationChecks, &observedAt, &receivedAt,
 		&requestID, &requestedAt)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -2423,21 +2430,15 @@ WHERE i.id=?`, id).Scan(&i.ID, &i.Name, &i.HostID, &i.Status, &i.Image, &i.Image
 		return i, err
 	}
 	if observationStatus.Valid {
-		var checks []domain.ObservationCheck
-		if err := json.Unmarshal(observationChecks, &checks); err != nil {
-			return i, fmt.Errorf("decode observation checks for %s: %w", i.ID, err)
+		observation, decodeErr := decodeStoredObservation(
+			i.ID, observationHostID.String, targetGeneration.String, hermesVersion.String, hermesSource.String,
+			recommendedModel.String, observationStatus.String, observationSummary.String,
+			observationChecks, modelCatalog, providerCatalogs, observedAt.Time, receivedAt.Time,
+		)
+		if decodeErr != nil {
+			return i, decodeErr
 		}
-		var models []string
-		if err := json.Unmarshal(modelCatalog, &models); err != nil {
-			return i, fmt.Errorf("decode model catalog for %s: %w", i.ID, err)
-		}
-		i.Observation = &domain.InstanceObservation{
-			InstanceID: i.ID, HostID: observationHostID.String, TargetGeneration: targetGeneration.String,
-			HermesVersion: hermesVersion.String, HermesSource: hermesSource.String,
-			ModelCatalog: models, RecommendedModel: recommendedModel.String,
-			Status: observationStatus.String, Summary: observationSummary.String, Checks: checks,
-			ObservedAt: observedAt.Time, ReceivedAt: receivedAt.Time,
-		}
+		i.Observation = observation
 	}
 	if requestID.Valid {
 		i.ObservationRequest = &domain.ObservationRequest{ID: requestID.String, InstanceID: i.ID, RequestedAt: requestedAt.Time}
@@ -2681,23 +2682,80 @@ func (s *Store) DeleteRemoteAccessResource(ctx context.Context, instanceID, kind
 }
 
 func (s *Store) GetInstanceModelCatalog(ctx context.Context, instanceID string) ([]string, string, error) {
-	var encoded []byte
-	var recommended string
+	return s.GetInstanceProviderModelCatalog(ctx, instanceID, "")
+}
+
+func (s *Store) GetInstanceProviderModelCatalog(ctx context.Context, instanceID, provider string) ([]string, string, error) {
+	var encoded, providerCatalogs []byte
+	var recommended, activeProvider string
 	err := s.db.QueryRowContext(ctx, `
-SELECT model_catalog, recommended_model
-FROM instance_observations
-WHERE instance_id=?`, instanceID).Scan(&encoded, &recommended)
+SELECT o.model_catalog, o.recommended_model, o.provider_model_catalogs, i.provider
+FROM instance_observations o
+JOIN instances i ON i.id=o.instance_id
+WHERE o.instance_id=?`, instanceID).Scan(&encoded, &recommended, &providerCatalogs, &activeProvider)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, "", ErrNotFound
 	}
 	if err != nil {
 		return nil, "", err
 	}
+	if provider != "" {
+		catalogs, decodeErr := decodeProviderModelCatalogs(providerCatalogs)
+		if decodeErr != nil {
+			return nil, "", fmt.Errorf("decode instance provider model catalogs: %w", decodeErr)
+		}
+		if catalog, ok := catalogs[provider]; ok && len(catalog.Models) > 0 {
+			return catalog.Models, catalog.Recommended, nil
+		}
+		if provider != activeProvider {
+			return nil, "", ErrNotFound
+		}
+	}
 	var models []string
 	if err := json.Unmarshal(encoded, &models); err != nil {
 		return nil, "", fmt.Errorf("decode instance model catalog: %w", err)
 	}
 	return models, recommended, nil
+}
+
+func decodeStoredObservation(
+	instanceID, hostID, targetGeneration, hermesVersion, hermesSource, recommendedModel, status, summary string,
+	checksJSON, modelCatalogJSON, providerCatalogsJSON []byte,
+	observedAt, receivedAt time.Time,
+) (*domain.InstanceObservation, error) {
+	var checks []domain.ObservationCheck
+	if err := json.Unmarshal(checksJSON, &checks); err != nil {
+		return nil, fmt.Errorf("decode observation checks for %s: %w", instanceID, err)
+	}
+	var models []string
+	if err := json.Unmarshal(modelCatalogJSON, &models); err != nil {
+		return nil, fmt.Errorf("decode model catalog for %s: %w", instanceID, err)
+	}
+	catalogs, err := decodeProviderModelCatalogs(providerCatalogsJSON)
+	if err != nil {
+		return nil, fmt.Errorf("decode provider model catalogs for %s: %w", instanceID, err)
+	}
+	return &domain.InstanceObservation{
+		InstanceID: instanceID, HostID: hostID, TargetGeneration: targetGeneration,
+		HermesVersion: hermesVersion, HermesSource: hermesSource,
+		ModelCatalog: models, RecommendedModel: recommendedModel, ProviderModelCatalogs: catalogs,
+		Status: status, Summary: summary, Checks: checks,
+		ObservedAt: observedAt, ReceivedAt: receivedAt,
+	}, nil
+}
+
+func decodeProviderModelCatalogs(encoded []byte) (map[string]domain.ProviderModelCatalog, error) {
+	if len(encoded) == 0 {
+		return nil, nil
+	}
+	var catalogs map[string]domain.ProviderModelCatalog
+	if err := json.Unmarshal(encoded, &catalogs); err != nil {
+		return nil, err
+	}
+	if len(catalogs) == 0 {
+		return nil, nil
+	}
+	return catalogs, nil
 }
 
 const jobLeaseMaxClaims = 3
@@ -2981,6 +3039,30 @@ ORDER BY j.lease_expires_at, j.id`, domain.JobLeased, domain.JobRunning, now, jo
 	return len(expired), nil
 }
 
+// hermesUpdateOriginalStatus membaca status runtime sebelum update agar lease
+// yang habis tidak memaksa instance ke FAILED.
+func hermesUpdateOriginalStatus(job domain.Job, metadata map[string]any) string {
+	if job.Type != "instance.hermes.update" {
+		return ""
+	}
+	var payload domain.HermesUpdatePayload
+	if err := json.Unmarshal(job.Payload, &payload); err == nil {
+		switch payload.OriginalStatus {
+		case domain.InstanceRunning, domain.InstanceStopped:
+			return payload.OriginalStatus
+		}
+	}
+	if metadata != nil {
+		if status, ok := metadata["original_status"].(string); ok {
+			switch status {
+			case domain.InstanceRunning, domain.InstanceStopped:
+				return status
+			}
+		}
+	}
+	return ""
+}
+
 func failExpiredJobLease(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -3034,6 +3116,10 @@ UPDATE operations SET status=?, error=?, metadata=?, updated_at=? WHERE id=?`,
 			instanceStatus = domain.InstanceRunning
 		case "instance.recovery.create":
 			instanceStatus = domain.InstanceStopped
+		case "instance.hermes.update":
+			if status := hermesUpdateOriginalStatus(job, metadata); status != "" {
+				instanceStatus = status
+			}
 		case "instance.chat.send":
 			instanceStatus = ""
 		}
@@ -3180,8 +3266,16 @@ func (s *Store) GetCodexAuthSession(ctx context.Context, instanceID, operationID
 	return s.getCodexAuthSession(ctx, instanceID, "o.id=?", operationID)
 }
 
-func (s *Store) GetActiveCodexAuthSession(ctx context.Context, instanceID string) (domain.CodexAuthSession, error) {
-	return s.getCodexAuthSession(ctx, instanceID, "j.status IN ('PENDING','LEASED','RUNNING')", nil)
+func (s *Store) GetActiveCodexAuthSession(ctx context.Context, instanceID, provider string) (domain.CodexAuthSession, error) {
+	if provider == "" {
+		provider = "openai-codex"
+	}
+	return s.getCodexAuthSession(
+		ctx,
+		instanceID,
+		"j.status IN ('PENDING','LEASED','RUNNING') AND COALESCE(NULLIF(json_extract(j.payload, '$.provider'), ''), 'openai-codex')=?",
+		provider,
+	)
 }
 
 func (s *Store) CancelCodexAuth(ctx context.Context, instanceID, operationID, reason string) error {
@@ -3225,9 +3319,9 @@ WHERE id=? AND instance_id=? AND type='CODEX_AUTH'`,
 
 func (s *Store) getCodexAuthSession(ctx context.Context, instanceID, predicate string, argument any) (domain.CodexAuthSession, error) {
 	var session domain.CodexAuthSession
-	var progress []byte
+	var payload, progress []byte
 	query := `
-SELECT o.id, o.instance_id, o.status, o.error, o.created_at, o.updated_at, j.progress
+SELECT o.id, o.instance_id, o.status, o.error, o.created_at, o.updated_at, j.payload, j.progress
 FROM operations o
 JOIN jobs j ON j.operation_id=o.id
 WHERE o.instance_id=? AND o.type='CODEX_AUTH' AND j.type='instance.auth.codex' AND ` + predicate + `
@@ -3238,13 +3332,23 @@ ORDER BY o.created_at DESC LIMIT 1`
 	}
 	err := s.db.QueryRowContext(ctx, query, args...).Scan(
 		&session.OperationID, &session.InstanceID, &session.Status, &session.Error,
-		&session.CreatedAt, &session.UpdatedAt, &progress,
+		&session.CreatedAt, &session.UpdatedAt, &payload, &progress,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return session, ErrNotFound
 	}
 	if err != nil {
 		return session, err
+	}
+	var authPayload domain.CodexAuthPayload
+	if len(payload) > 0 {
+		if err := json.Unmarshal(payload, &authPayload); err != nil {
+			return session, fmt.Errorf("decode provider authentication payload: %w", err)
+		}
+	}
+	session.Provider = strings.TrimSpace(authPayload.Provider)
+	if session.Provider == "" {
+		session.Provider = "openai-codex"
 	}
 	var decoded domain.JobProgress
 	if len(progress) > 0 {
@@ -3255,17 +3359,20 @@ ORDER BY o.created_at DESC LIMIT 1`
 	session.Stage = decoded.Stage
 	session.VerificationURI = decoded.VerificationURI
 	session.UserCode = decoded.UserCode
-	session.ExpiresAt = decoded.ExpiresAt
+	if !decoded.ExpiresAt.IsZero() {
+		expiresAt := decoded.ExpiresAt
+		session.ExpiresAt = &expiresAt
+	}
 	if session.Status == domain.OperationSucceeded {
 		session.Stage = "COMPLETED"
 		session.VerificationURI = ""
 		session.UserCode = ""
-		session.ExpiresAt = time.Time{}
+		session.ExpiresAt = nil
 	} else if session.Status == domain.OperationFailed {
 		session.Stage = ""
 		session.VerificationURI = ""
 		session.UserCode = ""
-		session.ExpiresAt = time.Time{}
+		session.ExpiresAt = nil
 	}
 	return session, nil
 }
@@ -3651,7 +3758,13 @@ WHERE j.id=? AND j.host_id=? AND j.lease_token=?
 			}
 			imageID = result.ImageID
 		} else if result.ImageID != "" {
-			return invalidJobResult("failed Hermes update workflow returned target image metadata")
+			if !immutableImageIDPattern.MatchString(result.ImageID) {
+				return invalidJobResult("failed Hermes update workflow returned invalid target image metadata")
+			}
+			if result.InstanceStatus != domain.InstanceStopped && result.InstanceStatus != domain.InstanceFailed {
+				return invalidJobResult("failed Hermes update workflow with target image returned an invalid instance status")
+			}
+			imageID = result.ImageID
 		}
 		updatePayload = &payload
 	case "instance.recovery.restore":
@@ -3816,7 +3929,7 @@ UPDATE instances SET image=?, image_id=?, provider=?, model=?, reasoning=?, serv
 			return err
 		}
 	}
-	if jobType == "instance.hermes.update" && result.Success && updatePayload != nil {
+	if jobType == "instance.hermes.update" && updatePayload != nil && result.ImageID != "" {
 		if _, err := tx.ExecContext(ctx, `UPDATE instances SET image=?, updated_at=? WHERE id=?`, updatePayload.Upgrade.TargetImage, now, instanceID); err != nil {
 			return err
 		}

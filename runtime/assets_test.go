@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -53,6 +54,57 @@ func TestDockerfileDeclaresRuntimeConfigSchemaV2(t *testing.T) {
 		`io.hermes-fleet.runtime-config-schema="2"`,
 	) {
 		t.Fatal("runtime image does not advertise readiness schema 2")
+	}
+}
+
+func TestDockerfilePinsImmutableNodeBase(t *testing.T) {
+	contents := string(dockerfile)
+	if !regexp.MustCompile(`(?m)^FROM node:22-bookworm-slim@sha256:[a-f0-9]{64}$`).MatchString(contents) {
+		t.Fatal("runtime Dockerfile does not pin node:22-bookworm-slim by digest")
+	}
+	if strings.Contains(contents, "FROM node:22-bookworm-slim\n") {
+		t.Fatal("runtime Dockerfile still uses a floating node:22-bookworm-slim tag")
+	}
+}
+
+func TestDockerfileInstallsUvSeparatelyWithRetry(t *testing.T) {
+	contents := string(dockerfile)
+	aptIdx := strings.Index(contents, "RUN apt-get")
+	if aptIdx < 0 {
+		t.Fatal("runtime Dockerfile is missing the apt-get layer")
+	}
+	aptBlock := contents[aptIdx:]
+	if next := strings.Index(aptBlock[4:], "\nRUN "); next >= 0 {
+		aptBlock = aptBlock[:next+4]
+	}
+	if strings.Contains(aptBlock, "pip install") {
+		t.Fatal("uv install still shares the apt-get layer")
+	}
+	for _, fragment := range []string{
+		`until python3 -m pip install --break-system-packages --no-cache-dir uv`,
+		`if [ "$n" -ge 3 ]; then exit 1; fi`,
+	} {
+		if !strings.Contains(contents, fragment) {
+			t.Fatalf("runtime Dockerfile is missing uv install retry %q", fragment)
+		}
+	}
+}
+
+func TestDockerfileFetchesPinnedHermesCommit(t *testing.T) {
+	contents := string(dockerfile)
+	if strings.Contains(contents, `git clone --depth 1 "${HERMES_REPO}"`) {
+		t.Fatal("runtime Dockerfile clones the default branch instead of the pinned commit")
+	}
+	for _, fragment := range []string{
+		`fetch --depth 1 origin "${HERMES_REF}"`,
+		`until GIT_TERMINAL_PROMPT=0 git -C /opt/hermes-agent fetch --depth 1 origin "${HERMES_REF}"`,
+		`if [ "$n" -ge 3 ]; then exit 1; fi`,
+		`checkout --detach FETCH_HEAD`,
+		`test "$(git -C /opt/hermes-agent rev-parse HEAD)" = "${HERMES_REF}"`,
+	} {
+		if !strings.Contains(contents, fragment) {
+			t.Fatalf("runtime Dockerfile is missing pinned checkout %q", fragment)
+		}
 	}
 }
 

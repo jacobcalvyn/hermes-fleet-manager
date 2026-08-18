@@ -127,20 +127,26 @@ type ObservationCheck struct {
 	Detail string `json:"detail"`
 }
 
+type ProviderModelCatalog struct {
+	Models      []string `json:"models"`
+	Recommended string   `json:"recommended,omitempty"`
+}
+
 type InstanceObservation struct {
-	InstanceID       string             `json:"instance_id"`
-	HostID           string             `json:"-"`
-	TargetGeneration string             `json:"target_generation"`
-	RefreshRequestID string             `json:"refresh_request_id,omitempty"`
-	HermesVersion    string             `json:"hermes_version,omitempty"`
-	HermesSource     string             `json:"hermes_source,omitempty"`
-	ModelCatalog     []string           `json:"model_catalog,omitempty"`
-	RecommendedModel string             `json:"recommended_model,omitempty"`
-	Status           string             `json:"status"`
-	Summary          string             `json:"summary"`
-	Checks           []ObservationCheck `json:"checks"`
-	ObservedAt       time.Time          `json:"observed_at"`
-	ReceivedAt       time.Time          `json:"received_at,omitempty"`
+	InstanceID            string                          `json:"instance_id"`
+	HostID                string                          `json:"-"`
+	TargetGeneration      string                          `json:"target_generation"`
+	RefreshRequestID      string                          `json:"refresh_request_id,omitempty"`
+	HermesVersion         string                          `json:"hermes_version,omitempty"`
+	HermesSource          string                          `json:"hermes_source,omitempty"`
+	ModelCatalog          []string                        `json:"model_catalog,omitempty"`
+	RecommendedModel      string                          `json:"recommended_model,omitempty"`
+	ProviderModelCatalogs map[string]ProviderModelCatalog `json:"provider_model_catalogs,omitempty"`
+	Status                string                          `json:"status"`
+	Summary               string                          `json:"summary"`
+	Checks                []ObservationCheck              `json:"checks"`
+	ObservedAt            time.Time                       `json:"observed_at"`
+	ReceivedAt            time.Time                       `json:"received_at,omitempty"`
 }
 
 type ObservationRequest struct {
@@ -199,19 +205,21 @@ type CodexAuthPayload struct {
 	Name        string `json:"name"`
 	ProjectName string `json:"project_name"`
 	ManagedPath string `json:"managed_path"`
+	Provider    string `json:"provider,omitempty"`
 }
 
 type CodexAuthSession struct {
-	OperationID     string    `json:"operation_id"`
-	InstanceID      string    `json:"instance_id"`
-	Status          string    `json:"status"`
-	Stage           string    `json:"stage,omitempty"`
-	VerificationURI string    `json:"verification_uri,omitempty"`
-	UserCode        string    `json:"user_code,omitempty"`
-	ExpiresAt       time.Time `json:"expires_at,omitempty"`
-	Error           string    `json:"error,omitempty"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	OperationID     string     `json:"operation_id"`
+	InstanceID      string     `json:"instance_id"`
+	Provider        string     `json:"provider"`
+	Status          string     `json:"status"`
+	Stage           string     `json:"stage,omitempty"`
+	VerificationURI string     `json:"verification_uri,omitempty"`
+	UserCode        string     `json:"user_code,omitempty"`
+	ExpiresAt       *time.Time `json:"expires_at,omitempty"`
+	Error           string     `json:"error,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
 type Operation struct {

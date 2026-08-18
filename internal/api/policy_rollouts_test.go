@@ -97,6 +97,53 @@ func TestControlledPolicyRolloutCanaryPauseResumeAndCancel(t *testing.T) {
 	}
 }
 
+func TestPolicyRolloutBlocksStaleHostAgent(t *testing.T) {
+	environment := newAPITestEnvironment(t)
+	hostID, hostToken := environment.enrollHost(t)
+	canary := environment.provisionRolloutInstance(t, hostID, hostToken, "stale-canary")
+	wave := environment.provisionRolloutInstance(t, hostID, hostToken, "stale-wave")
+	policy := environment.createControlledPolicy(t, []string{canary.ID, wave.ID})
+	response := environment.request(t, http.MethodPost, "/api/v1/policies/"+policy.ID+"/rollouts", map[string]any{}, environment.adminToken, nil)
+	if response.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(response.Body)
+		response.Body.Close()
+		t.Fatalf("start rollout status=%d body=%s", response.StatusCode, body)
+	}
+	var rollout domain.Operation
+	decodeResponse(t, response, &rollout)
+	response.Body.Close()
+	assertPolicyRolloutTargetCounts(t, environment, rollout.ID, 1, 1, 0, 0)
+	if err := environment.dataStore.Heartbeat(
+		context.Background(), hostID, "host", "darwin", "arm64", "0.0.0", time.Now().UTC(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	targets, err := environment.dataStore.ListPolicyRolloutTargets(context.Background(), rollout.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canaryTarget := policyRolloutTarget(targets, canary.ID)
+	if canaryTarget == nil || canaryTarget.ChildOperationID == "" {
+		t.Fatalf("canary target=%+v", canaryTarget)
+	}
+	if err := environment.dataStore.UpdateControlPlaneOperation(context.Background(), canaryTarget.ChildOperationID,
+		domain.OperationSucceeded, domain.JobProgress{Stage: "health_checked"}, "", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	rollout, _ = environment.dataStore.GetOperation(context.Background(), rollout.ID)
+	environment.server.reconcilePolicyRollout(context.Background(), rollout)
+	assertPolicyRolloutTargetCounts(t, environment, rollout.ID, 0, 0, 1, 1)
+	targets, err = environment.dataStore.ListPolicyRolloutTargets(context.Background(), rollout.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked := policyRolloutTarget(targets, wave.ID)
+	if blocked == nil || blocked.Status != domain.PolicyTargetBlocked ||
+		!strings.Contains(blocked.Detail, "Host Agent must be upgraded") {
+		t.Fatalf("stale Host Agent wave target=%+v", blocked)
+	}
+}
+
 func TestPolicyRejectsUnboundedAllAtOnceRolloutStrategy(t *testing.T) {
 	environment := newAPITestEnvironment(t)
 	hostID, hostToken := environment.enrollHost(t)

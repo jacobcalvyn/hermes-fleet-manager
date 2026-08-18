@@ -541,6 +541,324 @@ func TestHermesUpdateDoesNotRestoreBackupWhileTargetRuntimeIsStillRunning(t *tes
 	}
 }
 
+func TestHermesUpdateStopsEvenWhenOriginalStatusIsStopped(t *testing.T) {
+	plaintext := bytes.Repeat([]byte("verified-stopped-update-backup"), 500)
+	pointID := "recovery-" + strings.Repeat("1", 32)
+	executor := &hermesUpdateTestExecutor{
+		t: t, root: t.TempDir(), plaintext: plaintext, pointID: pointID,
+		targetImageID: "sha256:" + strings.Repeat("2", 64),
+	}
+	client := New(Config{ControlPlaneURL: "http://fleet.test", HostID: "host-1", HostToken: "host-token"}, executor)
+	client.httpClient.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		assertLeaseHeader(t, request, "lease-stopped")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/api/v1/agent/jobs/job-stopped/recovery-point":
+			return testHTTPResponse(request, http.StatusNotFound, `{"error":"not ready"}`), nil
+		case request.Method == http.MethodPost && request.URL.Path == "/api/v1/agent/jobs/job-stopped/progress":
+			return testHTTPResponse(request, http.StatusNoContent, ""), nil
+		case request.Method == http.MethodPut && request.URL.Path == "/api/v1/agent/jobs/job-stopped/recovery-point":
+			if _, err := io.Copy(io.Discard, request.Body); err != nil {
+				t.Fatal(err)
+			}
+			return testHTTPResponse(request, http.StatusNoContent, ""), nil
+		case request.Method == http.MethodPost && request.URL.Path == "/api/v1/agent/jobs/job-stopped/recovery-point/verify":
+			return testHTTPResponse(request, http.StatusNoContent, ""), nil
+		default:
+			t.Fatalf("unexpected stopped Hermes update request %s %s", request.Method, request.URL.Path)
+			return nil, nil
+		}
+	})
+	update := domain.HermesUpdatePayload{
+		OriginalStatus: domain.InstanceStopped,
+		Backup: domain.RecoveryPointPayload{
+			RecoveryPointID: pointID, InstanceID: "instance-1", Name: "fleet-test-01", MaxBytes: 1 << 20,
+		},
+		Upgrade: domain.HermesUpgradePayload{
+			InstanceID: "instance-1", Name: "fleet-test-01",
+			CurrentImage: "runtime:0.18.2", CurrentImageID: "sha256:" + strings.Repeat("a", 64),
+			TargetImage: "runtime:0.19.0", TargetVersion: "0.19.0",
+			ProjectName: "hermes-fleet-test", ManagedPath: "/managed/fleet-test",
+			APIPort: 8650, DashboardPort: 9130,
+			Rollback: domain.RecoveryRestorePayload{RecoveryPointID: pointID, RequireImageID: true},
+		},
+	}
+	encoded, err := json.Marshal(update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := client.executeHermesUpdate(context.Background(), domain.Job{
+		ID: "job-stopped", Type: "instance.hermes.update", Payload: encoded, LeaseToken: "lease-stopped",
+	})
+	if !result.Success || result.InstanceStatus != domain.InstanceStopped || result.ImageID != executor.targetImageID {
+		t.Fatalf("stopped Hermes update result=%+v", result)
+	}
+	expectedExecutions := []string{"instance.hermes.prepare", "instance.stop", "instance.recovery.create", "instance.hermes.upgrade"}
+	if strings.Join(executor.executions, ",") != strings.Join(expectedExecutions, ",") {
+		t.Fatalf("executor calls=%v want=%v", executor.executions, expectedExecutions)
+	}
+}
+
+func TestHermesUpdateCompletesAfterProgressFailureOnceInstallIsVerified(t *testing.T) {
+	plaintext := bytes.Repeat([]byte("verified-progress-backup"), 500)
+	pointID := "recovery-" + strings.Repeat("3", 32)
+	executor := &hermesUpdateTestExecutor{
+		t: t, root: t.TempDir(), plaintext: plaintext, pointID: pointID,
+		targetImageID: "sha256:" + strings.Repeat("4", 64),
+	}
+	client := New(Config{ControlPlaneURL: "http://fleet.test", HostID: "host-1", HostToken: "host-token"}, executor)
+	client.httpClient.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		assertLeaseHeader(t, request, "lease-progress")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/api/v1/agent/jobs/job-progress/recovery-point":
+			return testHTTPResponse(request, http.StatusNotFound, `{"error":"not ready"}`), nil
+		case request.Method == http.MethodPost && request.URL.Path == "/api/v1/agent/jobs/job-progress/progress":
+			var progress domain.JobProgress
+			if err := json.NewDecoder(request.Body).Decode(&progress); err != nil {
+				t.Fatal(err)
+			}
+			if progress.Stage == "RESTORING_STATE" || progress.Stage == "VERIFYING_VERSION" {
+				return testHTTPResponse(request, http.StatusInternalServerError, `{"error":"progress unavailable"}`), nil
+			}
+			return testHTTPResponse(request, http.StatusNoContent, ""), nil
+		case request.Method == http.MethodPut && request.URL.Path == "/api/v1/agent/jobs/job-progress/recovery-point":
+			if _, err := io.Copy(io.Discard, request.Body); err != nil {
+				t.Fatal(err)
+			}
+			return testHTTPResponse(request, http.StatusNoContent, ""), nil
+		case request.Method == http.MethodPost && request.URL.Path == "/api/v1/agent/jobs/job-progress/recovery-point/verify":
+			return testHTTPResponse(request, http.StatusNoContent, ""), nil
+		default:
+			t.Fatalf("unexpected progress Hermes update request %s %s", request.Method, request.URL.Path)
+			return nil, nil
+		}
+	})
+	update := domain.HermesUpdatePayload{
+		OriginalStatus: domain.InstanceRunning,
+		Backup: domain.RecoveryPointPayload{
+			RecoveryPointID: pointID, InstanceID: "instance-1", Name: "fleet-test-01", MaxBytes: 1 << 20,
+		},
+		Upgrade: domain.HermesUpgradePayload{
+			InstanceID: "instance-1", Name: "fleet-test-01",
+			CurrentImage: "runtime:0.18.2", CurrentImageID: "sha256:" + strings.Repeat("a", 64),
+			TargetImage: "runtime:0.19.0", TargetVersion: "0.19.0",
+			ProjectName: "hermes-fleet-test", ManagedPath: "/managed/fleet-test",
+			APIPort: 8650, DashboardPort: 9130,
+			Rollback: domain.RecoveryRestorePayload{RecoveryPointID: pointID, RequireImageID: true},
+		},
+	}
+	encoded, err := json.Marshal(update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := client.executeHermesUpdate(context.Background(), domain.Job{
+		ID: "job-progress", Type: "instance.hermes.update", Payload: encoded, LeaseToken: "lease-progress",
+	})
+	if !result.Success || result.InstanceStatus != domain.InstanceRunning || result.ImageID != executor.targetImageID {
+		t.Fatalf("progress-failed Hermes update result=%+v", result)
+	}
+	if !strings.Contains(result.Message, "progress could not be confirmed") {
+		t.Fatalf("progress-failed Hermes update message=%q", result.Message)
+	}
+	expectedExecutions := []string{"instance.hermes.prepare", "instance.stop", "instance.recovery.create", "instance.hermes.upgrade", "instance.start"}
+	if strings.Join(executor.executions, ",") != strings.Join(expectedExecutions, ",") {
+		t.Fatalf("executor calls=%v want=%v", executor.executions, expectedExecutions)
+	}
+}
+
+func TestHermesUpdateReportsInstalledImageWhenLeaseIsLostAfterInstall(t *testing.T) {
+	plaintext := bytes.Repeat([]byte("verified-lease-backup"), 500)
+	pointID := "recovery-" + strings.Repeat("5", 32)
+	executor := &hermesUpdateTestExecutor{
+		t: t, root: t.TempDir(), plaintext: plaintext, pointID: pointID,
+		targetImageID: "sha256:" + strings.Repeat("6", 64),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := New(Config{ControlPlaneURL: "http://fleet.test", HostID: "host-1", HostToken: "host-token"}, executor)
+	client.httpClient.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		assertLeaseHeader(t, request, "lease-lost")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/api/v1/agent/jobs/job-lost/recovery-point":
+			return testHTTPResponse(request, http.StatusNotFound, `{"error":"not ready"}`), nil
+		case request.Method == http.MethodPost && request.URL.Path == "/api/v1/agent/jobs/job-lost/progress":
+			var progress domain.JobProgress
+			if err := json.NewDecoder(request.Body).Decode(&progress); err != nil {
+				t.Fatal(err)
+			}
+			if progress.Stage == "RESTORING_STATE" {
+				cancel()
+				return testHTTPResponse(request, http.StatusConflict, `{"error":"job lease is no longer active"}`), nil
+			}
+			return testHTTPResponse(request, http.StatusNoContent, ""), nil
+		case request.Method == http.MethodPut && request.URL.Path == "/api/v1/agent/jobs/job-lost/recovery-point":
+			if _, err := io.Copy(io.Discard, request.Body); err != nil {
+				t.Fatal(err)
+			}
+			return testHTTPResponse(request, http.StatusNoContent, ""), nil
+		case request.Method == http.MethodPost && request.URL.Path == "/api/v1/agent/jobs/job-lost/recovery-point/verify":
+			return testHTTPResponse(request, http.StatusNoContent, ""), nil
+		default:
+			t.Fatalf("unexpected lease-lost Hermes update request %s %s", request.Method, request.URL.Path)
+			return nil, nil
+		}
+	})
+	update := domain.HermesUpdatePayload{
+		OriginalStatus: domain.InstanceRunning,
+		Backup: domain.RecoveryPointPayload{
+			RecoveryPointID: pointID, InstanceID: "instance-1", Name: "fleet-test-01", MaxBytes: 1 << 20,
+		},
+		Upgrade: domain.HermesUpgradePayload{
+			InstanceID: "instance-1", Name: "fleet-test-01",
+			CurrentImage: "runtime:0.18.2", CurrentImageID: "sha256:" + strings.Repeat("a", 64),
+			TargetImage: "runtime:0.19.0", TargetVersion: "0.19.0",
+			ProjectName: "hermes-fleet-test", ManagedPath: "/managed/fleet-test",
+			APIPort: 8650, DashboardPort: 9130,
+			Rollback: domain.RecoveryRestorePayload{RecoveryPointID: pointID, RequireImageID: true},
+		},
+	}
+	encoded, err := json.Marshal(update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := client.executeHermesUpdate(ctx, domain.Job{
+		ID: "job-lost", Type: "instance.hermes.update", Payload: encoded, LeaseToken: "lease-lost",
+	})
+	if result.Success || result.InstanceStatus != domain.InstanceStopped || result.ImageID != executor.targetImageID {
+		t.Fatalf("lease-lost Hermes update result=%+v", result)
+	}
+	if !strings.Contains(result.Error, "installed but the job lease was lost") {
+		t.Fatalf("lease-lost Hermes update error=%q", result.Error)
+	}
+	expectedExecutions := []string{"instance.hermes.prepare", "instance.stop", "instance.recovery.create", "instance.hermes.upgrade"}
+	if strings.Join(executor.executions, ",") != strings.Join(expectedExecutions, ",") {
+		t.Fatalf("executor calls=%v want=%v", executor.executions, expectedExecutions)
+	}
+}
+
+func TestHermesUpdateStopsDockerWorkWhenTheControlPlaneRejectsTheLease(t *testing.T) {
+	plaintext := bytes.Repeat([]byte("fenced-progress-backup"), 500)
+	pointID := "recovery-" + strings.Repeat("7", 32)
+	executor := &hermesUpdateTestExecutor{
+		t: t, root: t.TempDir(), plaintext: plaintext, pointID: pointID,
+		targetImageID: "sha256:" + strings.Repeat("8", 64),
+	}
+	client := New(Config{ControlPlaneURL: "http://fleet.test", HostID: "host-1", HostToken: "host-token"}, executor)
+	client.httpClient.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		assertLeaseHeader(t, request, "lease-fenced")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/api/v1/agent/jobs/job-fenced/recovery-point":
+			return testHTTPResponse(request, http.StatusNotFound, `{"error":"not ready"}`), nil
+		case request.Method == http.MethodPost && request.URL.Path == "/api/v1/agent/jobs/job-fenced/progress":
+			var progress domain.JobProgress
+			if err := json.NewDecoder(request.Body).Decode(&progress); err != nil {
+				t.Fatal(err)
+			}
+			// Lease ditolak tanpa membatalkan context eksekusi, meniru jendela
+			// sebelum goroutine perpanjangan lease sempat bereaksi.
+			if progress.Stage == "RESTORING_STATE" {
+				return testHTTPResponse(request, http.StatusConflict, `{"error":"job lease is no longer active"}`), nil
+			}
+			return testHTTPResponse(request, http.StatusNoContent, ""), nil
+		case request.Method == http.MethodPut && request.URL.Path == "/api/v1/agent/jobs/job-fenced/recovery-point":
+			if _, err := io.Copy(io.Discard, request.Body); err != nil {
+				t.Fatal(err)
+			}
+			return testHTTPResponse(request, http.StatusNoContent, ""), nil
+		case request.Method == http.MethodPost && request.URL.Path == "/api/v1/agent/jobs/job-fenced/recovery-point/verify":
+			return testHTTPResponse(request, http.StatusNoContent, ""), nil
+		default:
+			t.Fatalf("unexpected fenced Hermes update request %s %s", request.Method, request.URL.Path)
+			return nil, nil
+		}
+	})
+	update := domain.HermesUpdatePayload{
+		OriginalStatus: domain.InstanceRunning,
+		Backup: domain.RecoveryPointPayload{
+			RecoveryPointID: pointID, InstanceID: "instance-1", Name: "fleet-test-01", MaxBytes: 1 << 20,
+		},
+		Upgrade: domain.HermesUpgradePayload{
+			InstanceID: "instance-1", Name: "fleet-test-01",
+			CurrentImage: "runtime:0.18.2", CurrentImageID: "sha256:" + strings.Repeat("a", 64),
+			TargetImage: "runtime:0.19.0", TargetVersion: "0.19.0",
+			ProjectName: "hermes-fleet-test", ManagedPath: "/managed/fleet-test",
+			APIPort: 8650, DashboardPort: 9130,
+			Rollback: domain.RecoveryRestorePayload{RecoveryPointID: pointID, RequireImageID: true},
+		},
+	}
+	encoded, err := json.Marshal(update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := client.executeHermesUpdate(context.Background(), domain.Job{
+		ID: "job-fenced", Type: "instance.hermes.update", Payload: encoded, LeaseToken: "lease-fenced",
+	})
+	if result.Success || result.InstanceStatus != domain.InstanceStopped || result.ImageID != executor.targetImageID {
+		t.Fatalf("fenced Hermes update result=%+v", result)
+	}
+	if !strings.Contains(result.Error, "installed but the job lease was lost") {
+		t.Fatalf("fenced Hermes update error=%q", result.Error)
+	}
+	expectedExecutions := []string{"instance.hermes.prepare", "instance.stop", "instance.recovery.create", "instance.hermes.upgrade"}
+	if strings.Join(executor.executions, ",") != strings.Join(expectedExecutions, ",") {
+		t.Fatalf("fenced executor calls=%v want=%v", executor.executions, expectedExecutions)
+	}
+}
+
+func TestHermesUpdateDoesNotRestartTheInstanceAfterTheLeaseIsRejectedEarly(t *testing.T) {
+	plaintext := bytes.Repeat([]byte("fenced-backup-stage"), 500)
+	pointID := "recovery-" + strings.Repeat("9", 32)
+	executor := &hermesUpdateTestExecutor{
+		t: t, root: t.TempDir(), plaintext: plaintext, pointID: pointID,
+		targetImageID: "sha256:" + strings.Repeat("b", 64),
+	}
+	client := New(Config{ControlPlaneURL: "http://fleet.test", HostID: "host-1", HostToken: "host-token"}, executor)
+	client.httpClient.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch {
+		case request.Method == http.MethodPost && request.URL.Path == "/api/v1/agent/jobs/job-early/progress":
+			var progress domain.JobProgress
+			if err := json.NewDecoder(request.Body).Decode(&progress); err != nil {
+				t.Fatal(err)
+			}
+			if progress.Stage == "BACKING_UP" {
+				return testHTTPResponse(request, http.StatusConflict, `{"error":"job lease is no longer active"}`), nil
+			}
+			return testHTTPResponse(request, http.StatusNoContent, ""), nil
+		default:
+			t.Fatalf("unexpected early fenced request %s %s", request.Method, request.URL.Path)
+			return nil, nil
+		}
+	})
+	update := domain.HermesUpdatePayload{
+		OriginalStatus: domain.InstanceRunning,
+		Backup: domain.RecoveryPointPayload{
+			RecoveryPointID: pointID, InstanceID: "instance-1", Name: "fleet-test-01", MaxBytes: 1 << 20,
+		},
+		Upgrade: domain.HermesUpgradePayload{
+			InstanceID: "instance-1", Name: "fleet-test-01",
+			CurrentImage: "runtime:0.18.2", CurrentImageID: "sha256:" + strings.Repeat("a", 64),
+			TargetImage: "runtime:0.19.0", TargetVersion: "0.19.0",
+			ProjectName: "hermes-fleet-test", ManagedPath: "/managed/fleet-test",
+			APIPort: 8650, DashboardPort: 9130,
+			Rollback: domain.RecoveryRestorePayload{RecoveryPointID: pointID, RequireImageID: true},
+		},
+	}
+	encoded, err := json.Marshal(update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := client.executeHermesUpdate(context.Background(), domain.Job{
+		ID: "job-early", Type: "instance.hermes.update", Payload: encoded, LeaseToken: "lease-early",
+	})
+	if result.Success || result.InstanceStatus != domain.InstanceStopped {
+		t.Fatalf("early fenced Hermes update result=%+v", result)
+	}
+	// Restart tidak boleh dijalankan: pekerja lain berhak atas instance ini.
+	expectedExecutions := []string{"instance.hermes.prepare", "instance.stop"}
+	if strings.Join(executor.executions, ",") != strings.Join(expectedExecutions, ",") {
+		t.Fatalf("early fenced executor calls=%v want=%v", executor.executions, expectedExecutions)
+	}
+}
+
 func TestRecoveryPointDownloadIsLeaseFencedAndVerified(t *testing.T) {
 	plaintext := bytes.Repeat([]byte("verified-recovery-data"), 1000)
 	digest := sha256.Sum256(plaintext)

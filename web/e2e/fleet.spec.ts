@@ -70,6 +70,7 @@ test('create instance exposes only operator choices and locks while submitting',
 		}
 	})).resolves.toBe(true)
   await expect(dialog.getByLabel('Host')).toBeVisible()
+  await expect(dialog.getByLabel('Provider')).toHaveValue('openai-codex')
   await expect(dialog.getByLabel('Hermes version')).toHaveValue('0.19.0')
   await expect(dialog.getByLabel('Hermes version').locator('option')).toHaveCount(3)
   await expect(dialog.getByText(/Model|Reasoning|API port|Dashboard port/)).toHaveCount(0)
@@ -78,7 +79,7 @@ test('create instance exposes only operator choices and locks while submitting',
   await dialog.getByRole('button', { name: 'Create instance' }).click()
   await expect(dialog.getByRole('button', { name: 'Creating' })).toBeDisabled()
   await expect(dialog.getByLabel('Instance name')).toBeDisabled()
-  await expect.poll(() => requestBody).toEqual({ name: 'fleet-e2e-01', host_id: 'host-1', hermes_version: '0.19.0' })
+  await expect.poll(() => requestBody).toEqual({ name: 'fleet-e2e-01', host_id: 'host-1', hermes_version: '0.19.0', provider: 'openai-codex' })
 
   releaseRequest()
   await expect(dialog).toBeHidden()
@@ -112,7 +113,8 @@ test('System keeps Fleet Manager settings, remote access, and backups outside in
 	await expect(page.getByText('Hermes version')).toBeVisible()
 	await expect(page.getByText('Latest version installed')).toBeVisible()
 	await expect(page.getByRole('link', { name: /GitHub Releases/ })).toBeVisible()
-	await page.getByRole('button', { name: 'Codex' }).click()
+	await page.getByRole('button', { name: 'Provider' }).click()
+	await expect(page.getByRole('heading', { name: 'Providers', exact: true })).toBeVisible()
 	await expect(page.getByRole('heading', { name: 'Codex configuration', exact: true })).toBeVisible()
 	await expect(page.getByLabel('Model')).toHaveValue('gpt-5.6-sol')
 	await expect(page.getByLabel('Reasoning')).toHaveValue('medium')
@@ -291,9 +293,10 @@ test('unconfigured instance shows authentication before Codex settings', async (
     codex_configured: false,
     api_port: 8650, dashboard_port: 9130, project_name: 'hermes-fleet-pending', data_volume: 'hermes-fleet-pending-data',
     managed_path: '/tmp/hermes-fleet-pending', created_at: now, updated_at: now,
-    observation: { instance_id: 'instance-pending', status: 'DEGRADED', summary: 'Codex sign-in required', received_at: now, checks: [
-      { name: 'codex_auth', status: 'DRIFT', detail: 'No Codex credentials stored' },
-      { name: 'runtime_configuration', status: 'DRIFT', detail: 'Choose a Codex model in Hermes Fleet' },
+	    observation: { instance_id: 'instance-pending', status: 'DEGRADED', summary: 'Codex sign-in required', received_at: now, checks: [
+	      { name: 'codex_auth', status: 'DRIFT', detail: 'No Codex credentials stored' },
+	      { name: 'provider_auth', status: 'DRIFT', detail: 'Grok authentication is not connected' },
+	      { name: 'runtime_configuration', status: 'DRIFT', detail: 'Choose a Codex model in Hermes Fleet' },
     ] },
   }
   await page.route('**/api/v1/instances/instance-pending/recovery-points', async (route) => route.fulfill({ json: [] }))
@@ -306,11 +309,15 @@ test('unconfigured instance shows authentication before Codex settings', async (
 	await expect(page.getByText('0 issues · 1 setup item · 0 passed')).toBeVisible()
 	await expect(page.getByRole('cell', { name: 'Codex setup' })).toBeVisible()
 	await expect(page.getByRole('cell', { name: 'Setup incomplete' })).toHaveCount(1)
-  await page.getByRole('button', { name: 'Codex', exact: true }).click()
+  await page.getByRole('button', { name: 'Provider', exact: true }).click()
+  await expect(page.getByRole('heading', { name: 'Providers', exact: true })).toBeVisible()
   await expect(page.getByRole('heading', { name: 'Codex configuration' })).toBeVisible()
   await expect(page.getByText('Not configured')).toHaveCount(4)
   await expect(page.getByText('gpt-5.6-sol')).toHaveCount(0)
   await expect(page.getByLabel('Model')).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Authenticate Codex' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Authenticate Grok' })).toBeVisible()
+	  await expect(page.getByRole('button', { name: 'Configure as default' })).toHaveCount(1)
 })
 
 test('connected Codex does not turn legacy defaults into a saved configuration', async ({ page }) => {
@@ -334,17 +341,17 @@ test('connected Codex does not turn legacy defaults into a saved configuration',
 
   await page.getByRole('button', { name: instance.name }).click()
 	await expect(page.getByRole('button', { name: 'Overview', exact: true })).toBeVisible()
-	await expect(page.getByText('Signed in')).toBeVisible()
+	await expect(page.getByText('Signed in', { exact: true })).toBeVisible()
 	await expect(page.getByText('Model not configured')).toBeVisible()
 	await expect(page.getByText('Choose a Codex model')).toBeVisible()
-  await page.getByRole('button', { name: 'Codex', exact: true }).click()
+  await page.getByRole('button', { name: 'Provider', exact: true }).click()
   await expect(page.getByRole('heading', { name: 'Configure Codex' })).toBeVisible()
 	await expect(page.getByLabel('Model')).toHaveValue('gpt-5.6-sol')
 	await expect(page.getByLabel('Model').locator('option')).toHaveCount(3)
 	await expect(page.getByLabel('Model').locator('option').filter({ hasText: '· recommended' })).toHaveCount(1)
 	await expect(page.getByText('Recommended by Hermes on this instance')).toHaveCount(0)
-  await expect(page.getByLabel('Reasoning')).toHaveValue('')
-  await expect(page.getByLabel('Service tier')).toHaveValue('')
+  await expect(page.getByLabel('Reasoning')).toHaveValue('medium')
+  await expect(page.getByLabel('Service tier')).toHaveValue('normal')
 })
 
 test('failed Codex authentication preserves and identifies an existing configuration', async ({ page }) => {
@@ -381,14 +388,14 @@ test('failed Codex authentication preserves and identifies an existing configura
   })
   await page.route('**/api/v1/instances/instance-1/codex-auth', async (route) => {
     await route.fulfill({ status: 202, json: {
-      operation_id: 'auth-1', instance_id: 'instance-1', status: 'RUNNING', stage: 'AWAITING_USER',
+	      operation_id: 'auth-1', instance_id: 'instance-1', provider: 'openai-codex', status: 'RUNNING', stage: 'AWAITING_USER',
       verification_uri: 'https://example.test/device', user_code: 'STALE-CODE', expires_at: '2026-07-20T01:00:00Z',
       created_at: now, updated_at: now,
     } })
   })
   await page.route('**/api/v1/instances/instance-1/codex-auth/auth-1', async (route) => {
     await route.fulfill({ json: {
-      operation_id: 'auth-1', instance_id: 'instance-1', status: 'FAILED', stage: 'AWAITING_USER',
+	      operation_id: 'auth-1', instance_id: 'instance-1', provider: 'openai-codex', status: 'FAILED', stage: 'AWAITING_USER',
       verification_uri: 'https://example.test/device', user_code: 'STALE-CODE',
       error: 'Device authorization expired', created_at: now, updated_at: now,
     } })
@@ -396,7 +403,7 @@ test('failed Codex authentication preserves and identifies an existing configura
   await openFleet(page, [instance])
 
   await page.getByRole('button', { name: 'fleet-test-01' }).click()
-	await page.getByRole('button', { name: 'Codex', exact: true }).click()
+	await page.getByRole('button', { name: 'Provider', exact: true }).click()
 	await expect(page.getByRole('heading', { name: 'Codex configuration' })).toBeVisible()
 	await expect(page.getByText('Configuration saved, Codex not connected')).toBeVisible()
 	await expect(page.getByText('gpt-5.6-sol')).toBeVisible()

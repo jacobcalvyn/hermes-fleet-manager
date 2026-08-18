@@ -105,6 +105,7 @@ type observationBuilder struct {
 	hermesSource     string
 	modelCatalog     []string
 	recommendedModel string
+	providerCatalogs map[string]domain.ProviderModelCatalog
 	missing          bool
 	drift            bool
 	unknown          bool
@@ -123,6 +124,10 @@ func (builder *observationBuilder) add(name, status, detail string) {
 	}
 }
 
+func (builder *observationBuilder) addInformational(name, status, detail string) {
+	builder.checks = append(builder.checks, domain.ObservationCheck{Name: name, Status: status, Detail: detail})
+}
+
 func (builder *observationBuilder) finish(target domain.ObservationTarget) domain.InstanceObservation {
 	status, summary := domain.ObservationInSync, "Runtime matches desired state"
 	if builder.missing {
@@ -132,11 +137,16 @@ func (builder *observationBuilder) finish(target domain.ObservationTarget) domai
 	} else if builder.unknown {
 		status, summary = domain.ObservationUnknown, "Runtime state could not be fully verified"
 	}
+	if catalog, ok := builder.providerCatalogs[target.Provider]; ok {
+		builder.modelCatalog = catalog.Models
+		builder.recommendedModel = catalog.Recommended
+	}
 	return domain.InstanceObservation{
 		InstanceID: target.InstanceID, TargetGeneration: target.Generation, RefreshRequestID: target.RefreshRequestID,
 		HermesVersion: builder.hermesVersion, HermesSource: builder.hermesSource,
 		ModelCatalog: builder.modelCatalog, RecommendedModel: builder.recommendedModel,
-		Status: status, Summary: summary, Checks: builder.checks, ObservedAt: time.Now().UTC(),
+		ProviderModelCatalogs: builder.providerCatalogs,
+		Status:                status, Summary: summary, Checks: builder.checks, ObservedAt: time.Now().UTC(),
 	}
 }
 
@@ -345,6 +355,9 @@ func (p *Provisioner) ExecuteWithProgress(ctx context.Context, job domain.Job, r
 		var payload domain.CodexAuthPayload
 		if err := json.Unmarshal(job.Payload, &payload); err != nil {
 			return failure("invalid Codex authentication payload", err)
+		}
+		if payload.Provider == "" {
+			payload.Provider = "openai-codex"
 		}
 		return p.authenticateCodex(ctx, payload, report)
 	case "instance.chat.send":
@@ -1932,22 +1945,33 @@ func (p *Provisioner) authenticateCodex(ctx context.Context, payload domain.Code
 	fail := func(message string, err error) domain.JobResult {
 		return domain.JobResult{Success: false, Error: message + ": " + err.Error()}
 	}
+	provider := strings.TrimSpace(payload.Provider)
+	if provider == "" {
+		provider = "openai-codex"
+	}
+	entry, ok := providers.Lookup(provider)
+	deviceURL, _ := providers.DeviceURL(provider)
+	if !ok || entry.AuthType != providers.AuthInstanceOAuth {
+		return domain.JobResult{Success: false, Error: "provider authentication is not supported for " + provider}
+	}
 	if report == nil {
-		return domain.JobResult{Success: false, Error: "Codex authentication requires a progress-capable Host Agent"}
+		return domain.JobResult{Success: false, Error: entry.Label + " authentication requires a progress-capable Host Agent"}
 	}
 	managedPath, hermesContainer, err := p.validateCodexAuthTarget(ctx, payload)
 	if err != nil {
-		return fail("Codex authentication preflight failed", err)
+		return fail(entry.Label+" authentication preflight failed", err)
 	}
 	if err := report(ctx, domain.JobProgress{Stage: "STARTING"}); err != nil {
-		return fail("Codex authentication progress could not be recorded", err)
+		return fail(entry.Label+" authentication progress could not be recorded", err)
 	}
 	awaitingCode := false
 	reportedCode := false
+	verificationURI := deviceURL
+	userCode := ""
 	authArgs := []string{
 		"compose", "--env-file", filepath.Join(managedPath, ".env"), "-p", payload.ProjectName,
-		"-f", filepath.Join(managedPath, "compose.yaml"), "exec", "-T", "hermes",
-		"hermes", "auth", "add", "openai-codex", "--no-browser", "--timeout", "900",
+		"-f", filepath.Join(managedPath, "compose.yaml"), "exec", "-T", "-e", "PYTHONUNBUFFERED=1", "hermes",
+		"hermes", "auth", "add", provider, "--no-browser", "--timeout", "900",
 	}
 	runner := p.authRun
 	if runner == nil {
@@ -1958,33 +1982,71 @@ func (p *Provisioner) authenticateCodex(ctx context.Context, payload domain.Code
 		if line == "" {
 			return nil
 		}
-		if strings.Contains(line, "Enter this code:") {
-			awaitingCode = true
-			return nil
+		if parsedURI := deviceVerificationURIFromLine(line); parsedURI != "" {
+			verificationURI = parsedURI
 		}
-		if !awaitingCode || reportedCode || !codexUserCode.MatchString(line) {
+		if deviceCodePrompt(line) {
+			awaitingCode = true
+		}
+		if parsedCode := deviceUserCodeFromLine(line, awaitingCode); parsedCode != "" {
+			userCode = parsedCode
+		}
+		if verificationURI == "" || userCode == "" || reportedCode {
 			return nil
 		}
 		reportedCode = true
 		return report(ctx, domain.JobProgress{
-			Stage: "AWAITING_USER", VerificationURI: codexDeviceURL, UserCode: line,
-			ExpiresAt: time.Now().UTC().Add(15 * time.Minute),
+			Stage: "AWAITING_USER", VerificationURI: verificationURI, UserCode: userCode,
 		})
 	})
 	if err != nil {
-		return fail("Codex authentication failed", err)
+		return fail(entry.Label+" authentication failed", err)
+	}
+	if !reportedCode {
+		return domain.JobResult{Success: false, Error: entry.Label + " authentication did not return a safe verification URL and user code"}
 	}
 	if err := report(ctx, domain.JobProgress{Stage: "VERIFYING"}); err != nil {
-		return fail("Codex authentication progress could not be recorded", err)
+		return fail(entry.Label+" authentication progress could not be recorded", err)
 	}
-	status, err := p.docker(ctx, "exec", hermesContainer, "hermes", "auth", "status", "openai-codex")
-	if err != nil || !strings.Contains(status, "openai-codex: logged in") {
+	status, err := p.docker(ctx, "exec", hermesContainer, "hermes", "auth", "status", provider)
+	if err != nil || !strings.Contains(status, providers.AuthStatusLoggedIn(provider)) {
 		if err == nil {
-			err = errors.New("Hermes did not report a connected Codex session")
+			err = errors.New("Hermes did not report a connected " + entry.Label + " session")
 		}
-		return fail("Codex authentication verification failed", err)
+		return fail(entry.Label+" authentication verification failed", err)
 	}
-	return domain.JobResult{Success: true, Message: "Codex authentication connected"}
+	return domain.JobResult{Success: true, Message: entry.Label + " authentication connected"}
+}
+
+func deviceCodePrompt(line string) bool {
+	lower := strings.ToLower(line)
+	return strings.Contains(lower, "enter this code") || strings.Contains(lower, "enter code")
+}
+
+func deviceVerificationURIFromLine(line string) string {
+	for _, field := range strings.Fields(line) {
+		candidate := strings.Trim(field, "<>[]{}(),;'\"")
+		if providers.AllowedDeviceURL(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func deviceUserCodeFromLine(line string, awaitingStandalone bool) string {
+	if deviceCodePrompt(line) {
+		for _, field := range strings.Fields(line) {
+			token := strings.Trim(field, ".:;,'\"()")
+			if codexUserCode.MatchString(token) {
+				return token
+			}
+		}
+		return ""
+	}
+	if awaitingStandalone && codexUserCode.MatchString(line) {
+		return line
+	}
+	return ""
 }
 
 func (p *Provisioner) validateCodexAuthTarget(ctx context.Context, payload domain.CodexAuthPayload) (string, string, error) {
@@ -2055,11 +2117,12 @@ except (FileNotFoundError, json.JSONDecodeError, OSError):
     pass
 print(json.dumps({"agent": agent, "environment": environment, "model": model, "state": state}, sort_keys=True))`
 
-const codexModelCatalogProbe = `import json
+const providerModelCatalogProbe = `import json, sys
 from hermes_cli.models import get_default_model_for_provider, provider_model_ids
+provider = sys.argv[1]
 print(json.dumps({
-    "models": provider_model_ids("openai-codex"),
-    "recommended": get_default_model_for_provider("openai-codex"),
+    "models": provider_model_ids(provider),
+    "recommended": get_default_model_for_provider(provider),
 }, sort_keys=True))`
 
 const runtimeStateApply = `import fcntl, hashlib, json, os, sys, tempfile
@@ -3647,10 +3710,6 @@ func (p *Provisioner) upgradeHermes(ctx context.Context, payload domain.HermesUp
 	if err := p.ensureCurrentImageReference(ctx, payload); err != nil {
 		return failureResult("Hermes update preflight failed", err, domain.InstanceStopped)
 	}
-	managedPath, err := p.verifyStoppedUpgradeSource(ctx, payload)
-	if err != nil {
-		return failureResult("Hermes update preflight failed", err, domain.InstanceStopped)
-	}
 	targetImageID, err := p.verifyHermesUpdateTarget(ctx, payload)
 	if err != nil {
 		return failureResult("Hermes update target failed verification", err, domain.InstanceStopped)
@@ -3659,13 +3718,21 @@ func (p *Provisioner) upgradeHermes(ctx context.Context, payload domain.HermesUp
 		return failureResult("Hermes update target resolves to the current immutable image", nil, domain.InstanceStopped)
 	}
 
-	manifest := renderCompose(domain.ProvisionPayload{
-		InstanceID: payload.InstanceID, Name: payload.Name, Image: payload.TargetImage,
-		Provider: payload.Provider, Model: payload.Model, Reasoning: payload.Reasoning,
-		ServiceTier: payload.ServiceTier, APIPort: payload.APIPort, DashboardPort: payload.DashboardPort,
-	}, payload.ProjectName, payload.DataVolume)
-	if err := writeAtomicReplaceContext(ctx, filepath.Join(managedPath, "compose.yaml"), []byte(manifest), 0o600); err != nil {
-		return failureResult("Hermes update manifest could not be written", err, domain.InstanceStopped)
+	managedPath, sourceErr := p.verifyStoppedUpgradeSource(ctx, payload)
+	if sourceErr != nil {
+		managedPath, err = p.safeManagedPath(payload.ManagedPath)
+		if err != nil || !p.composeUsesImage(ctx, managedPath, payload.ProjectName, payload.TargetImage) {
+			return failureResult("Hermes update preflight failed", sourceErr, domain.InstanceStopped)
+		}
+	} else {
+		manifest := renderCompose(domain.ProvisionPayload{
+			InstanceID: payload.InstanceID, Name: payload.Name, Image: payload.TargetImage,
+			Provider: payload.Provider, Model: payload.Model, Reasoning: payload.Reasoning,
+			ServiceTier: payload.ServiceTier, APIPort: payload.APIPort, DashboardPort: payload.DashboardPort,
+		}, payload.ProjectName, payload.DataVolume)
+		if err := writeAtomicReplaceContext(ctx, filepath.Join(managedPath, "compose.yaml"), []byte(manifest), 0o600); err != nil {
+			return failureResult("Hermes update manifest could not be written", err, domain.InstanceStopped)
+		}
 	}
 
 	updateErr := func() error {
@@ -3703,13 +3770,20 @@ func (p *Provisioner) upgradeHermes(ctx context.Context, payload domain.HermesUp
 }
 
 func (p *Provisioner) prepareHermesImage(ctx context.Context, payload domain.HermesUpgradePayload) (string, error) {
-	p.imageBuildMu.Lock()
-	defer p.imageBuildMu.Unlock()
-
 	if !hermesVersionRef.MatchString(payload.TargetVersion) || !hermesCommitRef.MatchString(payload.TargetSource) ||
 		providers.ValidateImageReference(payload.TargetImage) != nil {
 		return "", errors.New("target Hermes release identity is invalid")
 	}
+	// Membangun runtime bisa memakan puluhan menit dan dikunci untuk seluruh
+	// host. Verifikasi image target lebih dulu di luar kunci agar instance yang
+	// rilisnya sudah terpasang tidak ikut mengantre di belakang build lain.
+	if imageID, err := p.verifyHermesUpdateTarget(ctx, payload); err == nil {
+		return imageID, nil
+	}
+
+	p.imageBuildMu.Lock()
+	defer p.imageBuildMu.Unlock()
+
 	imageID, verificationErr := p.verifyHermesUpdateTarget(ctx, payload)
 	if verificationErr == nil {
 		return imageID, nil
@@ -3736,7 +3810,7 @@ func (p *Provisioner) prepareHermesImage(ctx context.Context, payload domain.Her
 		return "", err
 	}
 	output, err := p.docker(
-		ctx, "build", "--pull",
+		ctx, "build",
 		"--build-arg", "HERMES_VERSION="+payload.TargetVersion,
 		"--build-arg", "HERMES_REF="+payload.TargetSource,
 		"--build-arg", "RUNTIME_BUILD_ID="+runtimeassets.BuildID(),
@@ -3771,15 +3845,20 @@ func (p *Provisioner) verifyAlreadyUpdated(ctx context.Context, payload domain.H
 	if err != nil {
 		return err
 	}
-	images, err := p.compose(ctx, managedPath, payload.ProjectName, "config", "--images")
-	if err != nil {
-		return err
-	}
-	refs := nonEmptyLines(images)
-	if len(refs) != 2 || refs[0] != payload.TargetImage || refs[1] != payload.TargetImage {
+	if !p.composeUsesImage(ctx, managedPath, payload.ProjectName, payload.TargetImage) {
 		return errors.New("managed Compose services do not use the target image")
 	}
 	return p.verifyStoppedUpgradeTarget(ctx, payload, targetImageID)
+}
+
+// composeUsesImage memeriksa apakah kedua layanan Compose memakai referensi image yang sama.
+func (p *Provisioner) composeUsesImage(ctx context.Context, managedPath, project, image string) bool {
+	images, err := p.compose(ctx, managedPath, project, "config", "--images")
+	if err != nil {
+		return false
+	}
+	refs := nonEmptyLines(images)
+	return len(refs) == 2 && refs[0] == image && refs[1] == image
 }
 
 func (p *Provisioner) validateHermesUpgradePayload(payload domain.HermesUpgradePayload) error {
@@ -5296,18 +5375,18 @@ func (p *Provisioner) Observe(ctx context.Context, target domain.ObservationTarg
 		} else {
 			builder.add("health_endpoint", domain.ObservationCheckOK, "Hermes /health returned a successful response")
 		}
-		if target.Provider == "openai-codex" {
-			p.observeCodexModelCatalog(ctx, services["hermes"], builder)
-			p.observeCodexAuth(ctx, services["hermes"], builder)
+		for _, slug := range providers.InstanceOAuthSlugs() {
+			p.observeProviderModelCatalog(ctx, slug, services["hermes"], builder)
+			p.observeProviderAuth(ctx, slug, services["hermes"], builder, slug == target.Provider)
 		}
-		if ownershipOK && target.Provider == "openai-codex" {
+		if ownershipOK && providers.IsInstanceOAuth(target.Provider) {
 			switch {
 			case target.CodexConfigured && target.Model != "":
 				p.observeRuntimeConfiguration(ctx, target, services["hermes"], builder)
 			case !target.CodexConfigured:
-				builder.add("runtime_configuration", domain.ObservationCheckDrift, "Codex configuration has not been saved in Hermes Fleet")
+				builder.add("runtime_configuration", domain.ObservationCheckDrift, providerRuntimeUnsetDetail(target.Provider))
 			default:
-				builder.add("runtime_configuration", domain.ObservationCheckDrift, "Saved Codex configuration is incomplete")
+				builder.add("runtime_configuration", domain.ObservationCheckDrift, providerRuntimeIncompleteDetail(target.Provider))
 			}
 		} else if ownershipOK && target.Model != "" {
 			p.observeRuntimeConfiguration(ctx, target, services["hermes"], builder)
@@ -5317,10 +5396,14 @@ func (p *Provisioner) Observe(ctx context.Context, target domain.ObservationTarg
 }
 
 func (p *Provisioner) observeCodexModelCatalog(ctx context.Context, hermes observedContainer, builder *observationBuilder) {
-	if !containerIDPattern.MatchString(hermes.ID) {
+	p.observeProviderModelCatalog(ctx, "openai-codex", hermes, builder)
+}
+
+func (p *Provisioner) observeProviderModelCatalog(ctx context.Context, provider string, hermes observedContainer, builder *observationBuilder) {
+	if !containerIDPattern.MatchString(hermes.ID) || !providers.IsInstanceOAuth(provider) {
 		return
 	}
-	output, err := p.docker(ctx, "exec", hermes.ID, "/opt/hermes-agent/.venv/bin/python", "-c", codexModelCatalogProbe)
+	output, err := p.docker(ctx, "exec", hermes.ID, "/opt/hermes-agent/.venv/bin/python", "-c", providerModelCatalogProbe, provider)
 	if err != nil {
 		return
 	}
@@ -5332,21 +5415,29 @@ func (p *Provisioner) observeCodexModelCatalog(ctx context.Context, hermes obser
 		return
 	}
 	seen := make(map[string]bool, len(catalog.Models))
+	var models []string
 	for _, model := range catalog.Models {
 		model = strings.TrimSpace(model)
-		if seen[model] || providers.ValidateRuntime("openai-codex", model, "medium", "normal") != nil {
+		if seen[model] || providers.ValidateRuntime(provider, model, "medium", "normal") != nil {
 			continue
 		}
-		builder.modelCatalog = append(builder.modelCatalog, model)
+		models = append(models, model)
 		seen[model] = true
-		if len(builder.modelCatalog) == 64 {
+		if len(models) == 64 {
 			break
 		}
 	}
 	catalog.Recommended = strings.TrimSpace(catalog.Recommended)
+	recommended := ""
 	if seen[catalog.Recommended] {
-		builder.recommendedModel = catalog.Recommended
+		recommended = catalog.Recommended
 	}
+	if builder.providerCatalogs == nil {
+		builder.providerCatalogs = map[string]domain.ProviderModelCatalog{}
+	}
+	builder.providerCatalogs[provider] = domain.ProviderModelCatalog{Models: models, Recommended: recommended}
+	builder.modelCatalog = models
+	builder.recommendedModel = recommended
 }
 
 func (p *Provisioner) observeInstalledHermesVersion(ctx context.Context, hermes observedContainer, builder *observationBuilder) {
@@ -5386,25 +5477,68 @@ func (p *Provisioner) observeRuntimeConfiguration(ctx context.Context, target do
 }
 
 func (p *Provisioner) observeCodexAuth(ctx context.Context, hermes observedContainer, builder *observationBuilder) bool {
+	return p.observeProviderAuth(ctx, "openai-codex", hermes, builder, true)
+}
+
+func (p *Provisioner) observeProviderAuth(ctx context.Context, provider string, hermes observedContainer, builder *observationBuilder, required bool) bool {
+	checkName := providers.ObservationAuthCheckName(provider)
+	label := providerObservationLabel(provider)
 	if !containerIDPattern.MatchString(hermes.ID) {
-		builder.add("codex_auth", domain.ObservationCheckUnknown, "Codex authentication could not be checked")
+		if required {
+			builder.add(checkName, domain.ObservationCheckUnknown, label+" authentication could not be checked")
+		} else {
+			builder.addInformational(checkName, domain.ObservationCheckUnknown, label+" authentication could not be checked")
+		}
 		return false
 	}
-	output, err := p.docker(ctx, "exec", hermes.ID, "hermes", "auth", "status", "openai-codex")
+	output, err := p.docker(ctx, "exec", hermes.ID, "hermes", "auth", "status", provider)
 	if err != nil {
-		builder.add("codex_auth", domain.ObservationCheckUnknown, "Codex authentication status is unavailable")
+		if required {
+			builder.add(checkName, domain.ObservationCheckUnknown, label+" authentication status is unavailable")
+		} else {
+			builder.addInformational(checkName, domain.ObservationCheckUnknown, label+" authentication status is unavailable")
+		}
 		return false
 	}
 	switch {
-	case strings.Contains(output, "openai-codex: logged in"):
-		builder.add("codex_auth", domain.ObservationCheckOK, "Codex authentication is connected")
+	case strings.Contains(output, providers.AuthStatusLoggedIn(provider)):
+		builder.add(checkName, domain.ObservationCheckOK, label+" authentication is connected")
 		return true
-	case strings.Contains(output, "openai-codex: logged out"):
-		builder.add("codex_auth", domain.ObservationCheckDrift, "Codex authentication is required")
+	case strings.Contains(output, providers.AuthStatusLoggedOut(provider)):
+		if required {
+			builder.add(checkName, domain.ObservationCheckDrift, label+" authentication is required")
+		} else {
+			builder.addInformational(checkName, domain.ObservationCheckDrift, label+" authentication is not connected")
+		}
 	default:
-		builder.add("codex_auth", domain.ObservationCheckUnknown, "Codex authentication returned an unknown status")
+		if required {
+			builder.add(checkName, domain.ObservationCheckUnknown, label+" authentication returned an unknown status")
+		} else {
+			builder.addInformational(checkName, domain.ObservationCheckUnknown, label+" authentication returned an unknown status")
+		}
 	}
 	return false
+}
+
+func providerObservationLabel(provider string) string {
+	switch provider {
+	case "openai-codex":
+		return "Codex"
+	case "xai-oauth":
+		return "Grok"
+	}
+	if entry, ok := providers.Lookup(provider); ok {
+		return entry.Label
+	}
+	return provider
+}
+
+func providerRuntimeUnsetDetail(provider string) string {
+	return providerObservationLabel(provider) + " configuration has not been saved in Hermes Fleet"
+}
+
+func providerRuntimeIncompleteDetail(provider string) string {
+	return "Saved " + providerObservationLabel(provider) + " configuration is incomplete"
 }
 
 func (p *Provisioner) validateObservationTarget(target domain.ObservationTarget) (string, error) {

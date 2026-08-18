@@ -30,6 +30,10 @@ const leaseTokenHeader = "X-Fleet-Lease-Token"
 
 const recoveryCompletionTimeout = 2*time.Hour + 5*time.Minute
 
+// Batas singkat untuk laporan terakhir setelah lease eksekusi berakhir, supaya
+// mematikan Host Agent tidak tertahan lama.
+const detachedCompletionTimeout = 30 * time.Second
+
 const DefaultShutdownGracePeriod = 10 * time.Minute
 
 const (
@@ -739,6 +743,23 @@ func (c *Client) processNextWithExecutionContext(claimContext, executionParent c
 	if executionContext.Err() != nil {
 		cancelExecution(context.Canceled)
 		renewalErr := <-renewalDone
+		// Install Hermes yang sudah terverifikasi di host tidak boleh hilang hanya
+		// karena lease eksekusi berakhir. Laporan tetap dikirim lewat context
+		// terpisah dan control plane yang memutuskan, lewat fencing, apakah
+		// laporan itu masih sah.
+		if verifiedInstallNeedsReporting(job.Type, result) {
+			result.RecoveryArtifact = ""
+			result.RecoveryKey = nil
+			detachedContext, cancelDetached := context.WithTimeout(
+				context.WithoutCancel(executionParent), detachedCompletionTimeout,
+			)
+			completeErr := c.completeJob(detachedContext, job, result)
+			cancelDetached()
+			if completeErr == nil {
+				c.requestImmediateObservation()
+				return nil
+			}
+		}
 		if errors.Is(renewalErr, errJobLeaseLost) {
 			return renewalErr
 		}
@@ -772,6 +793,13 @@ func (c *Client) requestImmediateObservation() {
 	case c.observationWake <- struct{}{}:
 	default:
 	}
+}
+
+// verifiedInstallNeedsReporting menandai hasil update yang sudah memasang image
+// target di host. Tanpa laporan ini control plane tetap mencatat image lama
+// sementara disk sudah memakai image baru.
+func verifiedInstallNeedsReporting(jobType string, result domain.JobResult) bool {
+	return jobType == "instance.hermes.update" && result.ImageID != ""
 }
 
 func jobNeedsImmediateObservation(jobType string) bool {
@@ -853,14 +881,26 @@ func (c *Client) executeHermesUpdate(ctx context.Context, job domain.Job) domain
 		RecoveryPointID: payload.Backup.RecoveryPointID,
 		InstanceStatus:  payload.OriginalStatus,
 	}
+	// Lease yang ditolak control plane berarti pekerja lain berhak atas job ini.
+	// Setiap langkah Docker berikutnya harus berhenti agar dua pekerja tidak
+	// mengubah instance yang sama; menunggu pembatalan context tidak cukup
+	// karena goroutine perpanjangan lease berjalan terpisah.
+	leaseLost := false
 	report := func(stage string) bool {
 		if err := c.reportJobProgress(ctx, job, domain.JobProgress{Stage: stage}); err != nil {
 			result.Error = "Hermes update progress could not be recorded: " + err.Error()
+			if errors.Is(err, errJobLeaseLost) {
+				leaseLost = true
+			}
 			return false
 		}
 		return true
 	}
+	fenced := func() bool { return leaseLost || ctx.Err() != nil }
 	execute := func(jobType string, value any, inputArtifact string) domain.JobResult {
+		if leaseLost {
+			return domain.JobResult{Success: false, Error: errJobLeaseLost.Error()}
+		}
 		if err := ctx.Err(); err != nil {
 			return domain.JobResult{Success: false, Error: err.Error()}
 		}
@@ -888,6 +928,9 @@ func (c *Client) executeHermesUpdate(ctx context.Context, job domain.Job) domain
 		if payload.OriginalStatus != domain.InstanceRunning {
 			return domain.InstanceStopped
 		}
+		if fenced() {
+			return domain.InstanceStopped
+		}
 		started := execute("instance.start", action(payload.Upgrade.CurrentImage, payload.Upgrade.CurrentImageID), "")
 		if started.Success {
 			return domain.InstanceRunning
@@ -911,13 +954,13 @@ func (c *Client) executeHermesUpdate(ctx context.Context, job domain.Job) domain
 	if !report("STOPPING") {
 		return result
 	}
-	if payload.OriginalStatus == domain.InstanceRunning {
-		stopped := execute("instance.stop", action(payload.Upgrade.CurrentImage, payload.Upgrade.CurrentImageID), "")
-		if !stopped.Success {
-			result.Error = stopped.Error
-			result.InstanceStatus = restoreOriginalState()
-			return result
-		}
+	// Stop selalu dipanggil agar reclaim menemukan container yang diam, termasuk
+	// instance yang semula STOPPED tetapi sempat di-recreate di tengah upgrade.
+	stopped := execute("instance.stop", action(payload.Upgrade.CurrentImage, payload.Upgrade.CurrentImageID), "")
+	if !stopped.Success {
+		result.Error = stopped.Error
+		result.InstanceStatus = restoreOriginalState()
+		return result
 	}
 	result.InstanceStatus = domain.InstanceStopped
 
@@ -992,14 +1035,31 @@ func (c *Client) executeHermesUpdate(ctx context.Context, job domain.Job) domain
 		return result
 	}
 
-	if !report("RESTORING_STATE") {
-		result.InstanceStatus = domain.InstanceStopped
-		return result
-	}
+	// Install sudah terverifikasi di host. Image target harus tetap dilaporkan
+	// meskipun pencatatan progres atau restore state gagal setelah titik ini.
 	result.ImageID = installed.ImageID
+	result.InstanceStatus = domain.InstanceStopped
+	if !report("RESTORING_STATE") {
+		if fenced() {
+			result.Error = "Hermes update installed but the job lease was lost before restoring runtime state: " + result.Error
+			return result
+		}
+	}
 	if payload.OriginalStatus == domain.InstanceRunning {
+		if fenced() {
+			if result.Error == "" {
+				result.Error = "Hermes update installed but the job lease was lost before restoring runtime state"
+			} else {
+				result.Error = "Hermes update installed but the job lease was lost before restoring runtime state: " + result.Error
+			}
+			return result
+		}
 		started := execute("instance.start", action(payload.Upgrade.TargetImage, installed.ImageID), "")
 		if !started.Success {
+			if fenced() {
+				result.Error = "Hermes update installed but the job lease was lost before restoring runtime state: " + started.Error
+				return result
+			}
 			startError := started.Error
 			if startError == "" {
 				startError = "target runtime start failed without an executor error"
@@ -1058,12 +1118,16 @@ func (c *Client) executeHermesUpdate(ctx context.Context, job domain.Job) domain
 		result.InstanceStatus = domain.InstanceRunning
 	}
 
-	if !report("VERIFYING_VERSION") {
-		result.ImageID = ""
+	if !report("VERIFYING_VERSION") && fenced() && result.InstanceStatus != payload.OriginalStatus {
+		result.Error = "Hermes update installed but the job lease was lost before restoring runtime state: " + result.Error
 		return result
 	}
 	result.Success = true
 	result.Message = "Hermes " + payload.Upgrade.TargetVersion + " installed, verified, and restored to its original runtime state"
+	if result.Error != "" {
+		result.Message += "; update progress could not be confirmed"
+		result.Error = ""
+	}
 	return result
 }
 

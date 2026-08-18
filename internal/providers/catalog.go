@@ -26,10 +26,16 @@ type Entry struct {
 	CredentialEnv   string `json:"credential_env,omitempty"`
 	BaseURLEnv      string `json:"base_url_env,omitempty"`
 	BaseURLRequired bool   `json:"base_url_required"`
+	DeviceURL       string `json:"device_url,omitempty"`
+	AuthNote        string `json:"auth_note,omitempty"`
 }
 
 var catalog = []Entry{
-	{Slug: "openai-codex", Label: "OpenAI Codex", AuthType: AuthInstanceOAuth},
+	{Slug: "openai-codex", Label: "OpenAI Codex", AuthType: AuthInstanceOAuth, DeviceURL: "https://auth.openai.com/codex/device"},
+	{
+		Slug: "xai-oauth", Label: "xAI Grok", AuthType: AuthInstanceOAuth,
+		AuthNote: "Grok OAuth requires SuperGrok or X Premium+. Some accounts receive HTTP 403 until xAI enables that subscription tier.",
+	},
 	{Slug: "openrouter", Label: "OpenRouter", AuthType: AuthAPIKey, CredentialEnv: "OPENROUTER_API_KEY", BaseURLEnv: "OPENROUTER_BASE_URL"},
 	{Slug: "openai-api", Label: "OpenAI API", AuthType: AuthAPIKey, CredentialEnv: "OPENAI_API_KEY", BaseURLEnv: "OPENAI_BASE_URL"},
 	{Slug: "lmstudio", Label: "LM Studio", AuthType: AuthAPIKeyOptional, CredentialEnv: "LM_API_KEY", BaseURLEnv: "LM_BASE_URL", BaseURLRequired: true},
@@ -50,6 +56,54 @@ func Lookup(slug string) (Entry, bool) {
 		}
 	}
 	return Entry{}, false
+}
+
+func IsInstanceOAuth(slug string) bool {
+	entry, ok := Lookup(slug)
+	return ok && entry.AuthType == AuthInstanceOAuth
+}
+
+func InstanceOAuthSlugs() []string {
+	slugs := make([]string, 0, 2)
+	for _, entry := range catalog {
+		if entry.AuthType == AuthInstanceOAuth {
+			slugs = append(slugs, entry.Slug)
+		}
+	}
+	return slugs
+}
+
+func DeviceURL(slug string) (string, bool) {
+	entry, ok := Lookup(slug)
+	if !ok || entry.DeviceURL == "" {
+		return "", false
+	}
+	return entry.DeviceURL, true
+}
+
+func AllowedDeviceURL(uri string) bool {
+	for _, entry := range catalog {
+		if entry.DeviceURL != "" && entry.DeviceURL == uri {
+			return true
+		}
+	}
+	parsed, err := url.ParseRequestURI(uri)
+	return err == nil && parsed.Scheme == "https" && parsed.Host == "auth.x.ai" && parsed.User == nil && parsed.Path != ""
+}
+
+func ObservationAuthCheckName(slug string) string {
+	if slug == "openai-codex" {
+		return "codex_auth"
+	}
+	return "provider_auth"
+}
+
+func AuthStatusLoggedIn(slug string) string {
+	return slug + ": logged in"
+}
+
+func AuthStatusLoggedOut(slug string) string {
+	return slug + ": logged out"
 }
 
 func ManagedEnvironmentKeys() []string {
@@ -123,18 +177,64 @@ func ValidateRuntime(provider, model, reasoning, serviceTier string) error {
 	return nil
 }
 
-// ValidateRuntimeOrPending accepts an unconfigured Codex runtime during the
-// authentication-first setup flow. Any partially configured runtime remains
-// invalid so Fleet never provisions an ambiguous desired state.
+// ValidateRuntimeCapabilities rejects provider/model controls that Hermes does
+// not transmit to the upstream provider. This keeps Fleet's saved desired
+// state aligned with the effective request instead of presenting ignored
+// settings as applied.
+func ValidateRuntimeCapabilities(provider, model, reasoning, serviceTier string) error {
+	if provider != "xai-oauth" {
+		return nil
+	}
+	if serviceTier == "priority" && !isGrok46Family(model) {
+		return errors.New("priority service tier requires a Grok 4.6 model")
+	}
+	if reasoning == "none" {
+		return nil
+	}
+	if !grokSupportsReasoningEffort(model) {
+		return errors.New("this Grok model manages reasoning automatically; use reasoning none")
+	}
+	if reasoning != "low" && reasoning != "medium" && reasoning != "high" && !(reasoning == "xhigh" && isGrok46Family(model)) {
+		return errors.New("this Grok model does not support the selected reasoning effort")
+	}
+	return nil
+}
+
+func grokModelName(model string) string {
+	name := strings.ToLower(strings.TrimSpace(model))
+	if index := strings.LastIndex(name, "/"); index >= 0 {
+		name = name[index+1:]
+	}
+	return strings.ReplaceAll(name, "_", "-")
+}
+
+func isGrok46Family(model string) bool {
+	name := grokModelName(model)
+	return name == "grok-4.6" || strings.HasPrefix(name, "grok-4.6-")
+}
+
+func grokSupportsReasoningEffort(model string) bool {
+	name := grokModelName(model)
+	for _, prefix := range []string{"grok-3-mini", "grok-4.20-multi-agent", "grok-4.3", "grok-4.5", "grok-4.6"} {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateRuntimeOrPending accepts an unconfigured instance-OAuth runtime
+// during the authentication-first setup flow. Any partially configured
+// runtime remains invalid so Fleet never provisions an ambiguous desired state.
 func ValidateRuntimeOrPending(provider, model, reasoning, serviceTier string) error {
-	if provider == "openai-codex" && model == "" && reasoning == "" && serviceTier == "" {
+	if IsRuntimePending(provider, model, reasoning, serviceTier) {
 		return nil
 	}
 	return ValidateRuntime(provider, model, reasoning, serviceTier)
 }
 
 func IsRuntimePending(provider, model, reasoning, serviceTier string) bool {
-	return provider == "openai-codex" && model == "" && reasoning == "" && serviceTier == ""
+	return IsInstanceOAuth(provider) && model == "" && reasoning == "" && serviceTier == ""
 }
 
 func ValidateImageReference(image string) error {

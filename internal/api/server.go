@@ -1641,13 +1641,13 @@ func validateJobProgress(jobType string, progress domain.JobProgress, now time.T
 			return errors.New("this progress stage cannot contain an authentication code")
 		}
 	case "AWAITING_USER":
-		if progress.VerificationURI != codexDeviceURL {
-			return errors.New("unsupported Codex verification URL")
+		if !providers.AllowedDeviceURL(progress.VerificationURI) {
+			return errors.New("unsupported authentication verification URL")
 		}
 		if !codexUserCodePattern.MatchString(progress.UserCode) {
 			return errors.New("invalid Codex user code")
 		}
-		if !progress.ExpiresAt.After(now) || progress.ExpiresAt.After(now.Add(16*time.Minute)) {
+		if !progress.ExpiresAt.IsZero() && (!progress.ExpiresAt.After(now) || progress.ExpiresAt.After(now.Add(16*time.Minute))) {
 			return errors.New("invalid Codex authentication expiry")
 		}
 	default:
@@ -2045,18 +2045,31 @@ func recoveryPointPayloadMatchesMetadata(payload domain.RecoveryPointPayload, me
 		payload.AgentVersion == metadata.AgentVersion && payload.CreatedAt.Equal(metadata.CreatedAt)
 }
 
+type codexAuthRequest struct {
+	Provider string `json:"provider"`
+}
+
 func (s *Server) startCodexAuth(w http.ResponseWriter, r *http.Request) {
 	instance, err := s.store.GetInstance(r.Context(), r.PathValue("instanceID"))
 	if err != nil {
 		writeError(w, http.StatusNotFound, "instance not found")
 		return
 	}
-	if instance.Provider != "openai-codex" {
-		writeError(w, http.StatusConflict, "Codex authentication is only available for an openai-codex configuration")
+	var request codexAuthRequest
+	if err := decodeOptionalJSON(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	provider := strings.TrimSpace(request.Provider)
+	if provider == "" {
+		provider = instance.Provider
+	}
+	if !providers.IsInstanceOAuth(provider) {
+		writeError(w, http.StatusConflict, "provider authentication is only available for an instance OAuth configuration")
 		return
 	}
 	if instance.Status != domain.InstanceRunning {
-		writeError(w, http.StatusConflict, "start the instance before authenticating Codex")
+		writeError(w, http.StatusConflict, "start the instance before authenticating the provider")
 		return
 	}
 	if instance.ProjectName == "" || instance.ManagedPath == "" || instance.ImageID == "" {
@@ -2069,21 +2082,26 @@ func (s *Server) startCodexAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if host.AgentVersion != agentVersion {
-		writeError(w, http.StatusConflict, "Codex authentication requires Host Agent "+agentVersion)
+		writeError(w, http.StatusConflict, "provider authentication requires Host Agent "+agentVersion)
 		return
 	}
 	operationID, jobID, err := twoIDs()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not create Codex authentication identity")
+		writeError(w, http.StatusInternalServerError, "could not create provider authentication identity")
 		return
 	}
 	payload, _ := json.Marshal(domain.CodexAuthPayload{
 		InstanceID: instance.ID, Name: instance.Name, ProjectName: instance.ProjectName, ManagedPath: instance.ManagedPath,
+		Provider: provider,
 	})
 	now := time.Now().UTC()
+	providerLabel := provider
+	if entry, ok := providers.Lookup(provider); ok {
+		providerLabel = entry.Label
+	}
 	operation := domain.Operation{
 		ID: operationID, InstanceID: instance.ID, Type: "CODEX_AUTH", Status: domain.OperationPending,
-		Summary: "Authenticate Codex " + instance.Name, CreatedAt: now, UpdatedAt: now,
+		Summary: "Authenticate " + providerLabel + " " + instance.Name, CreatedAt: now, UpdatedAt: now,
 	}
 	job := domain.Job{
 		ID: jobID, OperationID: operation.ID, HostID: instance.HostID, InstanceID: instance.ID,
@@ -2094,7 +2112,7 @@ func (s *Server) startCodexAuth(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if errors.Is(err, store.ErrStateChanged) || errors.Is(err, store.ErrInstanceBusy) {
-			active, activeErr := s.store.GetActiveCodexAuthSession(r.Context(), instance.ID)
+			active, activeErr := s.store.GetActiveCodexAuthSession(r.Context(), instance.ID, provider)
 			if activeErr == nil {
 				w.Header().Set("Cache-Control", "no-store")
 				writeJSON(w, http.StatusAccepted, active)
@@ -2106,7 +2124,7 @@ func (s *Server) startCodexAuth(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusAccepted, domain.CodexAuthSession{
-		OperationID: operation.ID, InstanceID: instance.ID, Status: operation.Status,
+		OperationID: operation.ID, InstanceID: instance.ID, Provider: provider, Status: operation.Status,
 		CreatedAt: now, UpdatedAt: now,
 	})
 }
@@ -2145,6 +2163,7 @@ func (s *Server) cancelCodexAuth(w http.ResponseWriter, r *http.Request) {
 }
 
 type codexConfigurationRequest struct {
+	Provider    string `json:"provider"`
 	Model       string `json:"model"`
 	Reasoning   string `json:"reasoning"`
 	ServiceTier string `json:"service_tier"`
@@ -2156,10 +2175,6 @@ func (s *Server) configureCodex(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "instance not found")
 		return
 	}
-	if instance.Provider != "openai-codex" {
-		writeError(w, http.StatusConflict, "Codex configuration is only available for an openai-codex instance")
-		return
-	}
 	if instance.Status != domain.InstanceRunning && instance.Status != domain.InstanceStopped {
 		writeError(w, http.StatusConflict, "wait for the current instance operation to finish")
 		return
@@ -2169,20 +2184,32 @@ func (s *Server) configureCodex(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	request.Provider = strings.TrimSpace(request.Provider)
+	if request.Provider == "" {
+		request.Provider = instance.Provider
+	}
+	if !providers.IsInstanceOAuth(request.Provider) {
+		writeError(w, http.StatusConflict, "provider configuration is only available for an instance OAuth provider")
+		return
+	}
 	request.Model = strings.TrimSpace(request.Model)
 	request.Reasoning = strings.TrimSpace(request.Reasoning)
 	request.ServiceTier = strings.TrimSpace(request.ServiceTier)
-	if err := providers.ValidateRuntime(instance.Provider, request.Model, request.Reasoning, request.ServiceTier); err != nil {
+	if err := providers.ValidateRuntime(request.Provider, request.Model, request.Reasoning, request.ServiceTier); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	models, _, catalogErr := s.store.GetInstanceModelCatalog(r.Context(), instance.ID)
+	if err := providers.ValidateRuntimeCapabilities(request.Provider, request.Model, request.Reasoning, request.ServiceTier); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	models, _, catalogErr := s.store.GetInstanceProviderModelCatalog(r.Context(), instance.ID, request.Provider)
 	if catalogErr != nil && !errors.Is(catalogErr, store.ErrNotFound) {
 		writeError(w, http.StatusInternalServerError, "could not read the Hermes model catalog")
 		return
 	}
 	if len(models) == 0 {
-		writeError(w, http.StatusConflict, "refresh diagnostics before choosing a Codex model")
+		writeError(w, http.StatusConflict, "refresh diagnostics before choosing a provider model")
 		return
 	}
 	modelSupported := false
@@ -2197,15 +2224,15 @@ func (s *Server) configureCodex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	connected, observationErr := s.store.HasFreshObservationCheck(
-		r.Context(), instance.ID, "codex_auth", domain.ObservationCheckOK,
+		r.Context(), instance.ID, providers.ObservationAuthCheckName(request.Provider), domain.ObservationCheckOK,
 		time.Now().UTC().Add(-s.config.ObservationStaleAfter),
 	)
 	if observationErr != nil {
-		writeError(w, http.StatusInternalServerError, "could not verify Codex authentication")
+		writeError(w, http.StatusInternalServerError, "could not verify provider authentication")
 		return
 	}
 	if !connected {
-		writeError(w, http.StatusConflict, "authenticate Codex before choosing its model")
+		writeError(w, http.StatusConflict, "authenticate the provider before choosing its model")
 		return
 	}
 	refreshRequired, refreshErr := s.runtimeRefreshRequiredForInstance(r.Context(), instance)
@@ -2214,7 +2241,7 @@ func (s *Server) configureCodex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if refreshRequired {
-		writeError(w, http.StatusConflict, "refresh the managed runtime before applying Codex configuration")
+		writeError(w, http.StatusConflict, "refresh the managed runtime before applying provider configuration")
 		return
 	}
 	if instance.ImageID == "" || instance.ProjectName == "" || instance.DataVolume == "" || instance.ManagedPath == "" {
@@ -2233,14 +2260,18 @@ func (s *Server) configureCodex(w http.ResponseWriter, r *http.Request) {
 	}
 	payload, _ := json.Marshal(domain.RuntimeSyncPayload{
 		InstanceID: instance.ID, Name: instance.Name, Image: instance.Image, ImageID: instance.ImageID,
-		Provider: instance.Provider, Model: request.Model, Reasoning: request.Reasoning, ServiceTier: request.ServiceTier,
+		Provider: request.Provider, Model: request.Model, Reasoning: request.Reasoning, ServiceTier: request.ServiceTier,
 		ProjectName: instance.ProjectName, DataVolume: instance.DataVolume, ManagedPath: instance.ManagedPath,
 		DesiredStatus: instance.Status, DashboardPort: instance.DashboardPort,
 	})
 	now := time.Now().UTC()
+	providerLabel := request.Provider
+	if entry, ok := providers.Lookup(request.Provider); ok {
+		providerLabel = entry.Label
+	}
 	operation := domain.Operation{
 		ID: operationID, InstanceID: instance.ID, Type: "CONFIGURE_CODEX", Status: domain.OperationPending,
-		Summary: "Configure Codex " + instance.Name, CreatedAt: now, UpdatedAt: now,
+		Summary: "Configure " + providerLabel + " " + instance.Name, CreatedAt: now, UpdatedAt: now,
 	}
 	job := domain.Job{
 		ID: jobID, OperationID: operation.ID, HostID: instance.HostID, InstanceID: instance.ID,
@@ -3765,7 +3796,10 @@ func (s *Server) createInstance(w http.ResponseWriter, r *http.Request) {
 	}
 	request.HermesVersion = release.Version
 	request.Image = release.Image
-	request.Provider = "openai-codex"
+	request.Provider = strings.TrimSpace(request.Provider)
+	if request.Provider == "" {
+		request.Provider = "openai-codex"
+	}
 	request.Model = ""
 	request.Reasoning = ""
 	request.ServiceTier = ""
@@ -3976,8 +4010,7 @@ func (s *Server) hermesUpdateStatus(ctx context.Context, instance domain.Instanc
 	}
 	catalog, catalogErr := s.hermesCatalog(ctx)
 	targetGeneration := instance.UpdatedAt.UTC().Format(time.RFC3339Nano)
-	if instance.Observation != nil &&
-		(instance.Observation.TargetGeneration == "" || instance.Observation.TargetGeneration == targetGeneration) {
+	if instance.Observation != nil && instance.Observation.TargetGeneration == targetGeneration {
 		status.CurrentVersion = instance.Observation.HermesVersion
 		status.CurrentSource = instance.Observation.HermesSource
 	}
@@ -4129,25 +4162,11 @@ func (s *Server) runtimeRefreshRequired(ctx context.Context, instanceID string) 
 }
 
 func (s *Server) runtimeRefreshRequiredForInstance(ctx context.Context, instance domain.Instance) (bool, error) {
-	catalog, err := s.hermesCatalog(ctx)
+	status, err := s.hermesUpdateStatus(ctx, instance)
 	if err != nil {
 		return false, err
 	}
-	release, managedImage := releases.FindByRuntimeImage(catalog, instance.Image)
-	if !managedImage || release.Image == instance.Image {
-		return false, nil
-	}
-	if instance.Observation != nil {
-		if version := strings.TrimPrefix(strings.TrimSpace(instance.Observation.HermesVersion), "v"); version != "" &&
-			version != release.Version {
-			return false, nil
-		}
-		if source := strings.TrimSpace(instance.Observation.HermesSource); source != "" &&
-			!strings.EqualFold(source, release.Commit) {
-			return false, nil
-		}
-	}
-	return true, nil
+	return status.Available && status.UpdateKind == hermesUpdateKindRuntimeRefresh, nil
 }
 
 func (s *Server) attachOfficialHermesRelease(status *hermesUpdateResponse, catalog releases.Catalog) {
@@ -5030,6 +5049,9 @@ func validateCreateInstance(request *createInstanceRequest) error {
 	if err := providers.ValidateImageReference(request.Image); err != nil {
 		return err
 	}
+	if !providers.IsInstanceOAuth(request.Provider) {
+		return errors.New("instance creation requires an OAuth provider supported by this Fleet version")
+	}
 	if err := providers.ValidateRuntimeOrPending(request.Provider, request.Model, request.Reasoning, request.ServiceTier); err != nil {
 		return err
 	}
@@ -5051,7 +5073,7 @@ func validateObservations(observations []domain.InstanceObservation, now time.Ti
 	validCheckNames := map[string]bool{
 		"observation": true, "managed_path": true, "manifest": true, "environment": true,
 		"workspace": true, "docker_daemon": true, "data_volume": true, "containers": true,
-		"ownership": true, "image": true, "runtime": true, "health_endpoint": true, "runtime_configuration": true, "codex_auth": true,
+		"ownership": true, "image": true, "runtime": true, "health_endpoint": true, "runtime_configuration": true, "codex_auth": true, "provider_auth": true,
 	}
 	seenInstances := make(map[string]bool, len(observations))
 	for _, observation := range observations {
@@ -5077,18 +5099,19 @@ func validateObservations(observations []domain.InstanceObservation, now time.Ti
 		if observation.HermesSource != "" && !hermesSourcePattern.MatchString(observation.HermesSource) {
 			return errors.New("observation Hermes source is invalid")
 		}
-		if len(observation.ModelCatalog) > 64 {
-			return errors.New("observation model catalog exceeds 64 entries")
+		if err := validateObservationModelCatalog(observation.ModelCatalog, observation.RecommendedModel, "openai-codex"); err != nil {
+			return err
 		}
-		seenModels := make(map[string]bool, len(observation.ModelCatalog))
-		for _, model := range observation.ModelCatalog {
-			if seenModels[model] || providers.ValidateRuntime("openai-codex", model, "medium", "normal") != nil {
-				return errors.New("observation model catalog is invalid or duplicated")
+		if len(observation.ProviderModelCatalogs) > 8 {
+			return errors.New("observation provider model catalogs exceed 8 providers")
+		}
+		for provider, catalog := range observation.ProviderModelCatalogs {
+			if !providers.IsInstanceOAuth(provider) {
+				return errors.New("observation provider model catalog uses an unsupported provider")
 			}
-			seenModels[model] = true
-		}
-		if observation.RecommendedModel != "" && !seenModels[observation.RecommendedModel] {
-			return errors.New("observation recommended model is not in the model catalog")
+			if err := validateObservationModelCatalog(catalog.Models, catalog.Recommended, provider); err != nil {
+				return err
+			}
 		}
 		if staleAfter <= 0 {
 			staleAfter = 2 * time.Minute
@@ -5110,6 +5133,23 @@ func validateObservations(observations []domain.InstanceObservation, now time.Ti
 				return errors.New("observation check detail is required and must not exceed 512 bytes")
 			}
 		}
+	}
+	return nil
+}
+
+func validateObservationModelCatalog(models []string, recommended, provider string) error {
+	if len(models) > 64 {
+		return errors.New("observation model catalog exceeds 64 entries")
+	}
+	seenModels := make(map[string]bool, len(models))
+	for _, model := range models {
+		if seenModels[model] || providers.ValidateRuntime(provider, model, "medium", "normal") != nil {
+			return errors.New("observation model catalog is invalid or duplicated")
+		}
+		seenModels[model] = true
+	}
+	if recommended != "" && !seenModels[recommended] {
+		return errors.New("observation recommended model is not in the model catalog")
 	}
 	return nil
 }

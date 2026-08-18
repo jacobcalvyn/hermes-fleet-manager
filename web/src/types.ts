@@ -63,6 +63,11 @@ export type ObservationCheck = {
   detail: string
 }
 
+export type ProviderModelCatalog = {
+	models: string[]
+	recommended?: string
+}
+
 export type InstanceObservation = {
   instance_id: string
 	target_generation?: string
@@ -70,6 +75,7 @@ export type InstanceObservation = {
 	hermes_source?: string
 	model_catalog?: string[]
 	recommended_model?: string
+	provider_model_catalogs?: Record<string, ProviderModelCatalog>
   status: 'IN_SYNC' | 'DEGRADED' | 'MISSING' | 'UNKNOWN'
   summary: string
   checks: ObservationCheck[] | null
@@ -403,6 +409,7 @@ export type MCPDiscoveryResult = {
 export type CodexAuthSession = {
   operation_id: string
   instance_id: string
+  provider: string
   status: 'PENDING' | 'RUNNING' | 'SUCCEEDED' | 'FAILED'
   stage?: 'STARTING' | 'AWAITING_USER' | 'VERIFYING' | 'COMPLETED'
   verification_uri?: string

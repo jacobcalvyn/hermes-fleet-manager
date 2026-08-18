@@ -11,6 +11,7 @@ import {
   Check,
   ChevronRight,
   CircleStop,
+  Clock,
   Copy,
   Download,
   ExternalLink,
@@ -41,7 +42,7 @@ import type { LucideIcon } from 'lucide-react'
 import { ApiError, apiDownloadToFile, apiRequest, getOperations, getOperationsPage, getOverview, streamChatEvents, streamFleetEvents } from './api'
 import type { OptimisticChatMessage } from './FleetAssistantThread'
 import OutputsView from './OutputsView'
-import type { Backup, ChatEvent, ChatSession, ChatThread, CodexAuthSession, CredentialReveal, Credentials, FleetStateEvent, HermesProfileInventory, HermesReleaseCatalog, HermesUpdate, Host, Instance, MCPConfiguration, MCPDiscoveredTool, MCPDiscoveryResult, MCPServerConfiguration, MessagingConfiguration, ObservationCheck, Operation, Overview, RecoveryPoint, RemoteAccessConfiguration, RemoteAccessMode, RemoteAccessPublishedRoute, RuntimeHealth, SystemInfo } from './types'
+import type { Backup, ChatEvent, ChatSession, ChatThread, CodexAuthSession, CredentialReveal, Credentials, FleetStateEvent, HermesProfileInventory, HermesReleaseCatalog, HermesUpdate, Host, Instance, InstanceObservation, MCPConfiguration, MCPDiscoveredTool, MCPDiscoveryResult, MCPServerConfiguration, MessagingConfiguration, ObservationCheck, Operation, Overview, RecoveryPoint, RemoteAccessConfiguration, RemoteAccessMode, RemoteAccessPublishedRoute, RuntimeHealth, SystemInfo } from './types'
 
 const FleetAssistantThread = lazy(() => import('./FleetAssistantThread'))
 
@@ -61,6 +62,8 @@ type HermesUpdateFlow = {
 	targetVersion: string
 	detail: string
 	resumeAfterUpdate: boolean
+	startedAt: string
+	updatedAt: string
 }
 
 type OperationGroup = {
@@ -87,10 +90,14 @@ type FleetAlertRecord = {
 	action: { label: string; view: View; instanceID?: string; systemSection?: SystemSection }
 }
 
-type CodexFormState = {
+type RuntimeFormState = {
 	model: string
 	reasoning: string
 	service_tier: string
+}
+
+type CodexFormState = RuntimeFormState & {
+	provider: string
 }
 
 const focusableSelector = [
@@ -104,16 +111,117 @@ const focusableSelector = [
 
 const hermesReservedProfileNames = new Set(['hermes', 'root', 'sudo', 'test', 'tmp'])
 
+const instanceOAuthProviders = [
+	{ slug: 'openai-codex', label: 'OpenAI Codex', shortLabel: 'Codex', signInHost: 'OpenAI', authCheckName: 'codex_auth', authNote: '' },
+	{ slug: 'xai-oauth', label: 'xAI Grok', shortLabel: 'Grok', signInHost: 'xAI', authCheckName: 'provider_auth', authNote: 'Grok OAuth requires SuperGrok or X Premium+. Some accounts receive HTTP 403 until xAI enables that subscription tier.' },
+] as const
+
+function providerCopy(slug: string) {
+	return instanceOAuthProviders.find((entry) => entry.slug === slug) ?? {
+		slug,
+		label: slug,
+		shortLabel: slug,
+		signInHost: 'the provider',
+		authCheckName: 'provider_auth',
+		authNote: '',
+	}
+}
+
+function isInstanceOAuth(slug: string) {
+	return instanceOAuthProviders.some((entry) => entry.slug === slug)
+}
+
+function oauthAuthCheck(checks: ObservationCheck[], slug: string) {
+	return checks.find((check) => check.name === providerCopy(slug).authCheckName)
+}
+
+function oauthProviderConnected(checks: ObservationCheck[], slug: string) {
+	return oauthAuthCheck(checks, slug)?.status === 'OK'
+}
+
+function providerModelCatalog(observation: InstanceObservation | undefined, slug: string, instance: Instance) {
+	const entry = observation?.provider_model_catalogs?.[slug]
+	if (entry?.models?.length) {
+		return { models: entry.models, recommended: entry.recommended ?? '' }
+	}
+	if (slug === instance.provider) {
+		return { models: observation?.model_catalog ?? [], recommended: observation?.recommended_model ?? '' }
+	}
+	return { models: [] as string[], recommended: '' }
+}
+
+type RuntimeOption = { value: string; label: string }
+
+function grokModelName(model: string) {
+	return model.trim().toLowerCase().split('/').pop()?.replaceAll('_', '-') ?? ''
+}
+
+function isGrok46Family(model: string) {
+	const name = grokModelName(model)
+	return name === 'grok-4.6' || name.startsWith('grok-4.6-')
+}
+
+function grokSupportsReasoningEffort(model: string) {
+	const name = grokModelName(model)
+	return ['grok-3-mini', 'grok-4.20-multi-agent', 'grok-4.3', 'grok-4.5', 'grok-4.6'].some((prefix) => name.startsWith(prefix))
+}
+
+function providerReasoningOptions(provider: string, model: string): RuntimeOption[] {
+	if (provider !== 'xai-oauth') {
+		return [
+			{ value: 'low', label: 'Low' },
+			{ value: 'medium', label: 'Medium' },
+			{ value: 'high', label: 'High' },
+			{ value: 'xhigh', label: 'Xhigh' },
+		]
+	}
+	if (!grokSupportsReasoningEffort(model)) {
+		return [{ value: 'none', label: 'Automatic' }]
+	}
+	const options: RuntimeOption[] = [
+		{ value: 'low', label: 'Low' },
+		{ value: 'medium', label: 'Medium' },
+		{ value: 'high', label: 'High' },
+	]
+	if (isGrok46Family(model)) options.push({ value: 'xhigh', label: 'Xhigh' })
+	return options
+}
+
+function providerServiceTierOptions(provider: string, model: string): RuntimeOption[] {
+	const options: RuntimeOption[] = [{ value: 'normal', label: 'Normal' }]
+	if (provider !== 'xai-oauth' || isGrok46Family(model)) options.push({ value: 'priority', label: 'Priority' })
+	return options
+}
+
+function normalizedProviderRuntime(provider: string, model: string, current?: RuntimeFormState): RuntimeFormState {
+	const reasoningOptions = providerReasoningOptions(provider, model)
+	const serviceTierOptions = providerServiceTierOptions(provider, model)
+	return {
+		model,
+		reasoning: reasoningOptions.some((option) => option.value === current?.reasoning)
+			? current?.reasoning ?? reasoningOptions[0].value
+			: reasoningOptions.find((option) => option.value === 'medium')?.value ?? reasoningOptions[0].value,
+		service_tier: serviceTierOptions.some((option) => option.value === current?.service_tier)
+			? current?.service_tier ?? serviceTierOptions[0].value
+			: serviceTierOptions[0].value,
+	}
+}
+
 function codexFormFromInstance(instance: Instance): CodexFormState {
 	return {
+		provider: instance.provider,
 		model: instance.codex_configured ? instance.model : instance.observation?.recommended_model ?? '',
 		reasoning: instance.codex_configured ? instance.reasoning : 'medium',
 		service_tier: instance.codex_configured ? instance.service_tier : 'normal',
 	}
 }
 
-function codexFormsEqual(left: CodexFormState, right: CodexFormState) {
+function runtimeFormsEqual(left: RuntimeFormState, right: RuntimeFormState) {
 	return left.model === right.model && left.reasoning === right.reasoning && left.service_tier === right.service_tier
+}
+
+function codexFormsEqual(left: CodexFormState, right: CodexFormState) {
+	return left.provider === right.provider && runtimeFormsEqual(left, right)
 }
 
 function mergeOperations(current: Operation[] | null, operation: Operation) {
@@ -131,6 +239,19 @@ function mergeOperationLists(primary: Operation[], secondary: Operation[]) {
 		}
 	}
 	return [...merged.values()].sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime())
+}
+
+// Steady-state polling idles while the tab is hidden and resumes with an
+// immediate refresh, so a backgrounded dashboard stops calling the control
+// plane without ever showing the operator stale data on return.
+function useDocumentVisible() {
+	const [visible, setVisible] = useState(() => !document.hidden)
+	useEffect(() => {
+		const sync = () => setVisible(!document.hidden)
+		document.addEventListener('visibilitychange', sync)
+		return () => document.removeEventListener('visibilitychange', sync)
+	}, [])
+	return visible
 }
 
 function useDialogAccessibility(onClose: () => void, closeEnabled = true) {
@@ -274,7 +395,7 @@ const hermesUpdateSteps = (flow: HermesUpdateFlow) => flow.kind === 'RUNTIME_REF
 	]
 
 function persistentHermesUpdateFlow(operation?: Operation): HermesUpdateFlow {
-	const idle: HermesUpdateFlow = { status: 'idle', kind: 'NONE', step: 0, targetVersion: '', detail: '', resumeAfterUpdate: false }
+	const idle: HermesUpdateFlow = { status: 'idle', kind: 'NONE', step: 0, targetVersion: '', detail: '', resumeAfterUpdate: false, startedAt: '', updatedAt: '' }
 	if (!operation || operation.status === 'SUCCEEDED') return idle
 	const targetVersion = typeof operation.metadata?.to_version === 'string' ? operation.metadata.to_version : ''
 	const kind: HermesUpdate['update_kind'] = operation.metadata?.update_kind === 'RUNTIME_REFRESH' ? 'RUNTIME_REFRESH' : 'VERSION_UPDATE'
@@ -298,9 +419,20 @@ function persistentHermesUpdateFlow(operation?: Operation): HermesUpdateFlow {
 			targetVersion,
 			detail: operation.error || (refresh ? `Managed runtime maintenance for Hermes ${targetVersion} failed` : `Hermes ${targetVersion} update failed`),
 			resumeAfterUpdate,
+			startedAt: operation.created_at,
+			updatedAt: operation.updated_at,
 		}
 	}
-	return { status: 'running', kind, step: progress.step, targetVersion, detail: progress.detail, resumeAfterUpdate }
+	return {
+		status: 'running',
+		kind,
+		step: progress.step,
+		targetVersion,
+		detail: progress.detail,
+		resumeAfterUpdate,
+		startedAt: operation.created_at,
+		updatedAt: operation.updated_at,
+	}
 }
 
 const chatSidebarCollapsedStorageKey = 'fleet-chat-sidebar-collapsed'
@@ -359,6 +491,7 @@ function readStoredChatSidebarCollapsed(): boolean | null {
 }
 
 export default function App() {
+  const documentVisible = useDocumentVisible()
   const [token, setToken] = useState(() => sessionStorage.getItem('fleet-admin-token') ?? '')
   const [overview, setOverview] = useState<Overview>(emptyOverview)
   const [view, setView] = useState<View>(() => window.location.hash.startsWith('#system/') ? 'system' : readStoredNavigation()?.view ?? 'chat')
@@ -485,6 +618,7 @@ export default function App() {
   }, [])
 
   useEffect(() => {
+    if (!documentVisible) return
     let stopped = false
     let timer = 0
     const poll = async (showLoading = false) => {
@@ -499,7 +633,7 @@ export default function App() {
       refreshController.current?.abort()
       loadMoreController.current?.abort()
     }
-  }, [runRefresh])
+  }, [documentVisible, runRefresh])
 
 	useEffect(() => {
 		if (!token || view !== 'alerts') return
@@ -896,7 +1030,7 @@ function ChatView({ token, instances, refreshSignal, onOperation, initialSession
 	const [editingSessionConfiguration, setEditingSessionConfiguration] = useState(false)
 	const [savingSessionConfiguration, setSavingSessionConfiguration] = useState(false)
 	const [copiedSessionID, setCopiedSessionID] = useState('')
-	const [sessionConfiguration, setSessionConfiguration] = useState<CodexFormState>({ model: '', reasoning: '', service_tier: '' })
+	const [sessionConfiguration, setSessionConfiguration] = useState<RuntimeFormState>({ model: '', reasoning: '', service_tier: '' })
 	const [deleteConfirmationID, setDeleteConfirmationID] = useState('')
 	const [deletingID, setDeletingID] = useState('')
 	const [streamState, setStreamState] = useState<'CONNECTING' | 'LIVE' | 'RECONNECTING'>('CONNECTING')
@@ -1191,7 +1325,7 @@ function ChatView({ token, instances, refreshSignal, onOperation, initialSession
 		threadInstance?.model,
 		...(threadInstance?.observation?.model_catalog ?? []),
 	].filter((model): model is string => Boolean(model)))]
-	const sessionConfigurationChanged = thread ? !codexFormsEqual(sessionConfiguration, {
+	const sessionConfigurationChanged = thread ? !runtimeFormsEqual(sessionConfiguration, {
 		model: thread.session.model,
 		reasoning: thread.session.reasoning,
 		service_tier: thread.session.service_tier,
@@ -1394,6 +1528,7 @@ function InstancesTable({ instances, remoteRoutes, publicationAttentionInstanceI
     if (busyInstancesRef.current.has(instance.id)) return
     if (name === 'delete' && !window.confirm(`Delete ${instance.name}? Its data volume will be preserved.`)) return
     if (name === 'repair-runtime' && !window.confirm(`Repair and verify ${instance.name}? Fleet will preserve its data, repair the managed services, and confirm Hermes and dashboard health.`)) return
+    if (name === 'stop' && !window.confirm(`Stop ${instance.name}? Its dashboard goes offline and any Hermes response in progress is interrupted.`)) return
     busyInstancesRef.current.add(instance.id)
     setBusyInstances(new Set(busyInstancesRef.current))
     setRowErrors((current) => ({ ...current, [instance.id]: '' }))
@@ -1477,7 +1612,7 @@ function InstancesTable({ instances, remoteRoutes, publicationAttentionInstanceI
               <td data-label="Instance"><button className="instance-link" onClick={() => onSelect(instance.id)}>{instance.name}</button></td>
 			  <td data-label="Dashboard">{dashboardURL ? <a className="instance-dashboard-link" href={dashboardURL} target="_blank" rel="noreferrer">{dashboardHostname || dashboardURL}<ExternalLink size={13} /></a> : <span className="instance-dashboard-empty">{dashboardHostname || 'Not configured'}</span>}</td>
 			  <td data-label="Hermes" title={installedHermesVersion(instance)}><strong>{installedHermesVersion(instance)}</strong>{!installedHermesVersionVerified(instance) && installedHermesVersion(instance) !== 'Detecting' && <span className="secondary-text">Verifying</span>}</td>
-	              <td data-label="Status"><InstanceStatusSummary instanceName={instance.name} items={statusItems} summaryValue={statusSummary.value} summaryLabel={statusSummary.label} />{rowError && <span className="error-text">Action needs review</span>}{instance.last_error && instanceOperationalHealthStatus(instance) !== 'IN_SYNC' && <span className="error-text" title={instance.last_error}>Previous action failed</span>}</td>
+	              <td data-label="Status"><InstanceStatusSummary instanceName={instance.name} items={statusItems} summaryValue={statusSummary.value} summaryLabel={statusSummary.label} />{rowError && <span className="error-text" title={rowError}>{rowError}</span>}{instance.last_error && instanceOperationalHealthStatus(instance) !== 'IN_SYNC' && <span className="error-text" title={instance.last_error}>Previous action failed</span>}</td>
               <td data-label="Actions">
                 <div className="row-actions">
                   {instance.status === 'RUNNING' && runtimeDrift && (!instance.runtime_remediation || ['CANCELED', 'EXHAUSTED'].includes(instance.runtime_remediation.status)) && <button className="icon-button repair-button" onClick={() => void action(instance, 'repair-runtime')} disabled={busy} title="Repair and verify runtime"><RefreshCw size={17} className={busy ? 'spin' : ''} /></button>}
@@ -1511,13 +1646,14 @@ function InstanceProfile({
 	onOperation: (operation: Operation) => void
 	refreshSignal: number
 }) {
+  const documentVisible = useDocumentVisible()
   const [credentials, setCredentials] = useState<Credentials | null>(null)
   const [expiresAt, setExpiresAt] = useState('')
   const [revealing, setRevealing] = useState(false)
   const [credentialOperation, setCredentialOperation] = useState<Operation | null>(null)
   const credentialPoll = useRef<AbortController | null>(null)
   const [error, setError] = useState('')
-  const [codexAuthOpen, setCodexAuthOpen] = useState(false)
+  const [authProvider, setAuthProvider] = useState<string | null>(null)
   const [selectedTab, setSelectedTab] = useState<InstanceTab>(() => readStoredInstanceTab(instance.id))
   const [showPassedDiagnostics, setShowPassedDiagnostics] = useState(false)
   const [refreshingObservation, setRefreshingObservation] = useState(false)
@@ -1568,41 +1704,50 @@ function InstanceProfile({
 	)
 	const runtimeConfigCheck = observationChecks.find((check) => check.name === 'runtime_configuration')
 	const runtimeConfigDrift = observation?.status === 'DEGRADED' && runtimeConfigCheck?.status === 'DRIFT'
-	const codexAuthCheck = observationChecks.find((check) => check.name === 'codex_auth')
-	const codexConnected = codexAuthCheck?.status === 'OK'
-	const codexModelCatalog = observation?.model_catalog ?? []
-	const recommendedCodexModel = observation?.recommended_model ?? ''
+	const provider = providerCopy(instance.provider)
+	const oauthProvider = isInstanceOAuth(instance.provider)
+	const providerAuthCheck = oauthAuthCheck(observationChecks, instance.provider)
+	const providerConnected = oauthProviderConnected(observationChecks, instance.provider)
 	const savedCodexForm = codexFormFromInstance(instance)
 	const codexForm = codexDraft ?? savedCodexForm
+	const formProvider = providerCopy(codexForm.provider)
+	const formProviderConnected = oauthProviderConnected(observationChecks, codexForm.provider)
+	const hasProviderConfiguration = Boolean(instance.codex_configured && instance.model && instance.reasoning && instance.service_tier)
+	const formHasSavedConfig = hasProviderConfiguration && codexForm.provider === instance.provider
+	const formCatalog = providerModelCatalog(observation, codexForm.provider, instance)
+	const recommendedCodexModel = formCatalog.recommended
 	const codexDirty = codexDraft !== null
-	const codexModelOptions = instance.model && !codexModelCatalog.includes(instance.model)
+	const codexModelCatalog = formCatalog.models
+	const codexModelOptions = instance.model && instance.provider === codexForm.provider && !codexModelCatalog.includes(instance.model)
 		? [instance.model, ...codexModelCatalog]
 		: codexModelCatalog
-	const hasCodexConfiguration = Boolean(instance.codex_configured && instance.model && instance.reasoning && instance.service_tier)
+	const codexReasoningOptions = providerReasoningOptions(codexForm.provider, codexForm.model)
+	const codexServiceTierOptions = providerServiceTierOptions(codexForm.provider, codexForm.model)
 	const codexFormValid = Boolean(
 		codexForm.model &&
-		codexForm.reasoning &&
-		codexForm.service_tier &&
+		codexReasoningOptions.some((option) => option.value === codexForm.reasoning) &&
+		codexServiceTierOptions.some((option) => option.value === codexForm.service_tier) &&
 		codexModelOptions.includes(codexForm.model),
 	)
 	const canFixImageDrift = imageDrift && ['RUNNING', 'STOPPED'].includes(instance.status)
 	const runtimeRemediation = instance.runtime_remediation
 	const automaticRuntimeRecoveryActive = Boolean(runtimeRemediation && !['CANCELED', 'EXHAUSTED'].includes(runtimeRemediation.status))
 	const canRepairRuntime = runtimeDrift && instance.status === 'RUNNING' && !automaticRuntimeRecoveryActive
-	const codexConfigurationActive = codexConnected && hasCodexConfiguration && runtimeConfigCheck?.status === 'OK'
+	const providerConfigurationActive = providerConnected && hasProviderConfiguration && runtimeConfigCheck?.status === 'OK'
+	const formConfigurationActive = formProviderConnected && formHasSavedConfig && runtimeConfigCheck?.status === 'OK'
 	const imageRepairing = instance.status === 'RECONCILING'
 	const runtimeSyncInProgress = instance.status === 'UPDATING'
-	const codexSetupIssue = codexSetupDiagnostic(instance.provider, codexAuthCheck, runtimeConfigCheck, codexConnected, hasCodexConfiguration)
-	const issueChecks = observationChecks.filter((check) => check.status !== 'OK' && check.name !== 'codex_auth' && check.name !== 'runtime_configuration')
+	const providerSetupIssue = providerSetupDiagnostic(instance.provider, providerAuthCheck, runtimeConfigCheck, providerConnected, hasProviderConfiguration)
+	const issueChecks = observationChecks.filter((check) => check.status !== 'OK' && check.name !== 'codex_auth' && check.name !== 'provider_auth' && check.name !== 'runtime_configuration')
 	const summarizedIssueChecks = runtimeCheck && ['DRIFT', 'MISSING'].includes(runtimeCheck.status)
 		? issueChecks.filter((check) => check.name === 'runtime' || check.name !== 'containers')
 		: issueChecks
 	const operationalIssueChecks = summarizedIssueChecks
-	const setupItems = codexSetupIssue ? [codexSetupIssue] : []
+	const setupItems = providerSetupIssue ? [providerSetupIssue] : []
 	const diagnosticChecks = [...setupItems, ...operationalIssueChecks]
 	const passedChecks = observationChecks.filter((check) => check.status === 'OK')
 	const visibleDiagnostics = showPassedDiagnostics ? [...diagnosticChecks, ...passedChecks] : diagnosticChecks
-	const codexSetupTitle = codexSetupIssueTitle(codexConnected, hasCodexConfiguration, runtimeConfigDrift)
+	const providerSetupTitle = providerSetupIssueTitle(provider.shortLabel, providerConnected, hasProviderConfiguration, runtimeConfigDrift)
 	const effectiveOperationalHealth = instanceOperationalHealthStatus(instance)
 	const effectiveOperationalSummary = operationalHealthSummary(instance)
 	const effectiveInstalledVersion = installedHermesVersion(instance)
@@ -1644,9 +1789,15 @@ function InstanceProfile({
 		instance.status === 'FAILED' &&
 		instance.last_error?.includes('manual recovery is required'),
 	)
+	const failedHermesVersionUpdate = Boolean(
+		instance.status === 'FAILED' &&
+		latestHermesUpdateOperation?.status === 'FAILED' &&
+		latestHermesUpdateOperation.metadata?.update_kind !== 'RUNTIME_REFRESH',
+	)
 	const failedProvisioningRetryAvailable = Boolean(
 		instance.status === 'FAILED' &&
 		!manualRuntimeRecoveryRequired &&
+		!failedHermesVersionUpdate &&
 		hermesUpdate !== null &&
 		!runtimeRefreshRequired,
 	)
@@ -1658,7 +1809,7 @@ function InstanceProfile({
 			failedRuntimeRecoveryAvailable
 		),
 	)
-	const canSyncRuntime = runtimeConfigDrift && hasCodexConfiguration && !runtimeRefreshRequired &&
+	const canSyncRuntime = runtimeConfigDrift && hasProviderConfiguration && !runtimeRefreshRequired &&
 		['RUNNING', 'STOPPED'].includes(instance.status)
 	const updatePanelRuntimeRefresh = hermesUpdateFlow.status !== 'idle'
 		? hermesUpdateFlow.kind === 'RUNTIME_REFRESH'
@@ -1680,13 +1831,13 @@ function InstanceProfile({
 		: updatePanelRuntimeRefresh
 			? hermesUpdateFlow.status === 'error' ? 'Retry maintenance' : 'Refresh managed runtime'
 			: `Update to ${updatePanelTargetVersion}`
-	const effectiveCodexSetupTitle = runtimeRefreshRequired && runtimeConfigDrift
-		? 'Refresh managed runtime before applying Codex'
-		: codexSetupTitle
+	const effectiveProviderSetupTitle = runtimeRefreshRequired && runtimeConfigDrift
+		? `Refresh managed runtime before applying ${provider.shortLabel}`
+		: providerSetupTitle
 	const instanceTabs: { id: InstanceTab; label: string }[] = [
 		{ id: 'overview', label: 'Overview' },
 		{ id: 'access', label: 'Access' },
-		{ id: 'configuration', label: 'Codex' },
+		{ id: 'configuration', label: 'Provider' },
 		{ id: 'profiles', label: 'Profiles' },
 		{ id: 'messaging', label: 'Messaging' },
 		{ id: 'mcp', label: 'MCP' },
@@ -1710,8 +1861,19 @@ function InstanceProfile({
 	const effectivePublishingHostname = publishedHostname || generatedPublicHostname
 
 	const updateCodexForm = (key: keyof CodexFormState, value: string) => {
-		const next = { ...codexForm, [key]: value }
+		const next = key === 'model'
+			? { ...codexForm, ...normalizedProviderRuntime(codexForm.provider, value, codexForm) }
+			: { ...codexForm, [key]: value }
 		setCodexDraft(codexFormsEqual(next, savedCodexForm) ? null : next)
+	}
+
+	const selectFormProvider = (slug: string) => {
+		if (slug === savedCodexForm.provider) {
+			setCodexDraft(null)
+			return
+		}
+		const catalog = providerModelCatalog(observation, slug, instance)
+		setCodexDraft({ provider: slug, ...normalizedProviderRuntime(slug, catalog.recommended) })
 	}
 
 	const loadRecoveryPoints = useCallback(async () => {
@@ -1805,6 +1967,7 @@ function InstanceProfile({
 	}, [loadRemoteAccessConfiguration, refreshSignal, selectedTab])
 
 	useEffect(() => {
+		if (!documentVisible) return
 		let stopped = false
 		let timer = 0
 		const poll = async () => {
@@ -1818,9 +1981,10 @@ function InstanceProfile({
 			window.clearTimeout(timer)
 			recoveryLoadController.current?.abort()
 		}
-	}, [loadRecoveryPoints, refreshSignal])
+	}, [documentVisible, loadRecoveryPoints, refreshSignal])
 
 	useEffect(() => {
+		if (!documentVisible) return
 		let stopped = false
 		let timer = 0
 		const poll = async () => {
@@ -1834,7 +1998,7 @@ function InstanceProfile({
 			window.clearTimeout(timer)
 			hermesUpdateLoadController.current?.abort()
 		}
-	}, [loadHermesUpdate, refreshSignal])
+	}, [documentVisible, loadHermesUpdate, refreshSignal])
 
   useEffect(() => () => {
 			credentialPoll.current?.abort()
@@ -2256,7 +2420,7 @@ function InstanceProfile({
         <div className="overview-grid">
           <section className="overview-card"><span>Runtime</span><div><Status value={instance.status} label={hermesUpdateFlow.status === 'running' ? updatePanelRuntimeRefresh ? 'Refreshing managed runtime' : 'Updating Hermes' : runtimeStatusLabel(instance.status)} /></div><small>{instance.host_name}</small></section>
 	          <section className="overview-card"><span>Hermes version</span><strong title={effectiveInstalledVersion}>{effectiveInstalledVersion}</strong><small>{installedVersionVerified && observation?.received_at ? `Verified by Host Agent ${relativeTime(observation.received_at)}` : effectiveInstalledVersion === 'Detecting' ? 'Waiting for Host Agent observation' : 'Recorded version · verification pending'}</small><small>{hermesUpdateStatusLabel(hermesUpdate, hermesUpdateError)}</small>{hermesUpdate?.latest_release && hermesUpdate.official_checked_at && <a className="release-source" href={hermesUpdate.latest_release.url} target="_blank" rel="noreferrer">GitHub Releases · checked {relativeTime(hermesUpdate.official_checked_at)}<ExternalLink size={12} /></a>}</section>
-          {instance.provider === 'openai-codex' ? <section className="overview-card"><span>Codex sign-in</span><div><Status value={codexConnected ? 'CONNECTED' : codexAuthCheck?.status ?? 'UNKNOWN'} label={codexConnected ? 'Signed in' : codexAuthCheck?.status === 'DRIFT' ? 'Sign in required' : 'Checking'} /></div><small>{codexSignInDetail(codexConnected, hasCodexConfiguration, codexConfigurationActive)}</small></section> : <section className="overview-card"><span>Provider</span><strong>{instance.provider}</strong><small>Managed by Hermes Fleet</small></section>}
+          <section className="overview-card"><span>Provider</span>{oauthProvider ? <><strong>{provider.label}</strong><div><Status value={providerConnected ? 'CONNECTED' : providerAuthCheck?.status ?? 'UNKNOWN'} label={providerConnected ? 'Signed in' : providerAuthCheck?.status === 'DRIFT' ? 'Sign in required' : 'Checking'} /></div><small>{providerSignInDetail(providerConnected, hasProviderConfiguration, providerConfigurationActive)}</small>{instanceOAuthProviders.map((entry) => { const check = oauthAuthCheck(observationChecks, entry.slug); return <small key={entry.slug}>{entry.shortLabel}: {check?.status === 'OK' ? 'Signed in' : check?.status === 'DRIFT' ? 'Not signed in' : 'Checking'}</small> })}</> : <><strong>{instance.provider}</strong><small>Managed by Hermes Fleet</small></>}</section>
         </div>
         {(versionUpdateAvailable || runtimeRefreshRequired || hermesUpdateFlow.status !== 'idle') && <section className={`hermes-update-panel ${hermesUpdateFlow.status}`}>
 				<div className="hermes-update-summary"><RefreshCw size={18} className={hermesUpdateFlow.status === 'running' ? 'spin' : ''} /><div><strong>{updatePanelTitle}</strong><span>{hermesUpdateFlow.status === 'idle' ? failedRuntimeRecoveryAvailable ? `Hermes ${effectiveInstalledVersion} remains installed. Fleet verified the retained artifacts and can recover them with a rollback backup, refreshed managed runtime, and a health-checked return to RUNNING.` : failedRuntimeRecoveryNeedsVerification ? hermesUpdate?.reason : updatePanelRuntimeRefresh ? `Hermes ${effectiveInstalledVersion} remains installed. Fleet will create and verify a rollback backup, refresh the Fleet-managed runtime, restore its current state, and verify Hermes health.` : `Installed version: ${effectiveInstalledVersion}. Fleet will prepare the release, create and verify a fresh backup, update Hermes, and restore the current runtime state.` : hermesUpdateFlow.detail}</span></div>{hermesUpdateFlow.status === 'idle' && failedRuntimeRecoveryNeedsVerification ? <button className="primary-button compact-button" onClick={() => void requestObservation()} disabled={instanceActionBusy || !observationReady || refreshingObservation || Boolean(instance.observation_request)}><RefreshCw size={16} className={refreshingObservation ? 'spin' : ''} />{instance.observation_request ? 'Verification pending' : refreshingObservation ? 'Requesting verification' : 'Verify retained runtime'}</button> : hermesUpdateFlow.status === 'idle' || hermesUpdateFlow.status === 'error' ? <button className="primary-button compact-button" onClick={() => void runHermesUpdate()} disabled={instanceActionBusy || startingHermesUpdate || !canRunHermesMaintenance}><RefreshCw size={16} className={startingHermesUpdate ? 'spin' : ''} />{updatePanelActionLabel}</button> : <button className="secondary-button compact-button" disabled>{updatePanelRuntimeRefresh ? 'Refreshing' : 'Updating'}</button>}</div>
@@ -2266,11 +2430,11 @@ function InstanceProfile({
           <div className="runtime-remediation-summary"><RefreshCw size={18} className={['READY', 'QUEUED', 'VERIFYING'].includes(runtimeRemediation.status) || instance.status === 'RESTARTING' ? 'spin' : ''} /><div><strong>{runtimeRecoveryTitle(runtimeRemediation.status)}</strong><span>{runtimeRecoveryDetail(runtimeRemediation)}</span>{runtimeRemediation.last_error && <small>{runtimeRemediation.last_error}</small>}</div><Status value={runtimeRemediation.status} label={runtimeRecoveryStatusLabel(runtimeRemediation.status)} /></div>
           <div className="runtime-remediation-footer"><div><strong>Attempt {runtimeRemediation.total_attempts} of {runtimeRemediation.max_attempts}</strong><span>Phase {runtimeRemediation.phase} of {runtimeRemediation.max_phases} · {runtimeRecoveryPhaseLabel(runtimeRemediation.phase)}</span></div>{automaticRuntimeRecoveryActive && <button className="secondary-button compact-button danger-button" onClick={() => void cancelAutomaticRuntimeRecovery()} disabled={instanceActionBusy || cancelingRuntimeRecovery || instance.status === 'RESTARTING'}>{cancelingRuntimeRecovery ? 'Stopping' : instance.status === 'RESTARTING' ? 'Attempt in progress' : 'Stop automatic recovery'}</button>}{!automaticRuntimeRecoveryActive && <button className="primary-button compact-button" onClick={() => void repairRuntime()} disabled={instanceActionBusy || !canRepairRuntime || repairingRuntime}><RefreshCw size={16} />Repair and verify</button>}</div>
         </section>}
-		<section className={`attention-card ${operationalIssueChecks.length === 0 && !failedProvisioningRetryAvailable && !manualRuntimeRecoveryRequired ? 'attention-clear' : ''}`}>
-		  <div className="attention-heading"><div><span>{manualRuntimeRecoveryRequired ? 'Recovery issue' : failedProvisioningRetryAvailable ? 'Provisioning issue' : operationalIssueChecks.length > 0 ? 'Health issue' : 'Health'}</span><strong>{manualRuntimeRecoveryRequired ? 'Runtime state requires manual recovery' : failedProvisioningRetryAvailable ? 'Provisioning stopped before the managed runtime was ready' : runtimeDrift ? 'Managed runtime needs repair' : imageDrift ? 'Container image update needs review' : effectiveOperationalSummary}</strong><small>{manualRuntimeRecoveryRequired ? instance.last_error : failedProvisioningRetryAvailable ? 'Retry uses the current supported Fleet runtime wrapper.' : observationChecks.length > 0 ? `${passedChecks.length} checks passed · ${observationTimestamp(observation?.received_at)}` : observationTimestamp(observation?.received_at)}</small></div><Status value={manualRuntimeRecoveryRequired || failedProvisioningRetryAvailable ? 'FAILED' : effectiveOperationalHealth} label={manualRuntimeRecoveryRequired ? 'Recovery required' : failedProvisioningRetryAvailable ? 'Needs action' : healthStatusLabel(effectiveOperationalHealth)} /></div>
-		  {(operationalIssueChecks.length > 0 || failedProvisioningRetryAvailable || manualRuntimeRecoveryRequired) && <div className="attention-actions">{manualRuntimeRecoveryRequired && <button className="primary-button compact-button" onClick={() => setSelectedTab('operations')}>Review failed operation</button>}{failedProvisioningRetryAvailable && <button className="primary-button compact-button" onClick={() => void retryProvisioning()} disabled={instanceActionBusy}><RefreshCw size={16} className={activeAction === 'retry-provisioning' ? 'spin' : ''} />{activeAction === 'retry-provisioning' ? 'Retrying provisioning' : 'Retry provisioning'}</button>}{runtimeDrift && !runtimeRemediation && !manualRuntimeRecoveryRequired && <button className="primary-button compact-button" onClick={() => void repairRuntime()} disabled={instanceActionBusy || !canRepairRuntime || repairingRuntime || refreshingObservation}><RefreshCw size={16} className={repairingRuntime ? 'spin' : ''} />{repairingRuntime || instance.status === 'RESTARTING' ? 'Repairing and verifying' : 'Repair and verify'}</button>}{imageDrift && !manualRuntimeRecoveryRequired && <button className="primary-button compact-button" onClick={() => void fixImageDrift()} disabled={instanceActionBusy || !canFixImageDrift || fixingImage || refreshingObservation}><Wrench size={16} />{imageRepairing ? 'Fix in progress' : fixingImage ? 'Queuing fix' : 'Fix automatically'}</button>}{!manualRuntimeRecoveryRequired && <button className="secondary-button compact-button" onClick={() => setSelectedTab('diagnostics')}>Review diagnostics</button>}</div>}
+		<section className={`attention-card ${operationalIssueChecks.length === 0 && !failedProvisioningRetryAvailable && !manualRuntimeRecoveryRequired && !failedHermesVersionUpdate ? 'attention-clear' : ''}`}>
+		  <div className="attention-heading"><div><span>{manualRuntimeRecoveryRequired || failedHermesVersionUpdate ? 'Recovery issue' : failedProvisioningRetryAvailable ? 'Provisioning issue' : operationalIssueChecks.length > 0 ? 'Health issue' : 'Health'}</span><strong>{manualRuntimeRecoveryRequired ? 'Runtime state requires manual recovery' : failedHermesVersionUpdate ? 'Hermes update stopped before the instance was restored' : failedProvisioningRetryAvailable ? 'Provisioning stopped before the managed runtime was ready' : runtimeDrift ? 'Managed runtime needs repair' : imageDrift ? 'Container image update needs review' : effectiveOperationalSummary}</strong><small>{manualRuntimeRecoveryRequired || failedHermesVersionUpdate ? instance.last_error || latestHermesUpdateOperation?.error : failedProvisioningRetryAvailable ? 'Retry uses the current supported Fleet runtime wrapper.' : observationChecks.length > 0 ? `${passedChecks.length} checks passed · ${observationTimestamp(observation?.received_at)}` : observationTimestamp(observation?.received_at)}</small></div><Status value={manualRuntimeRecoveryRequired || failedProvisioningRetryAvailable || failedHermesVersionUpdate ? 'FAILED' : effectiveOperationalHealth} label={manualRuntimeRecoveryRequired ? 'Recovery required' : failedHermesVersionUpdate ? 'Update failed' : failedProvisioningRetryAvailable ? 'Needs action' : healthStatusLabel(effectiveOperationalHealth)} /></div>
+		  {(operationalIssueChecks.length > 0 || failedProvisioningRetryAvailable || manualRuntimeRecoveryRequired || failedHermesVersionUpdate) && <div className="attention-actions">{(manualRuntimeRecoveryRequired || failedHermesVersionUpdate) && <button className="primary-button compact-button" onClick={() => setSelectedTab('operations')}>Review failed operation</button>}{failedProvisioningRetryAvailable && <button className="primary-button compact-button" onClick={() => void retryProvisioning()} disabled={instanceActionBusy}><RefreshCw size={16} className={activeAction === 'retry-provisioning' ? 'spin' : ''} />{activeAction === 'retry-provisioning' ? 'Retrying provisioning' : 'Retry provisioning'}</button>}{runtimeDrift && !runtimeRemediation && !manualRuntimeRecoveryRequired && !failedHermesVersionUpdate && <button className="primary-button compact-button" onClick={() => void repairRuntime()} disabled={instanceActionBusy || !canRepairRuntime || repairingRuntime || refreshingObservation}><RefreshCw size={16} className={repairingRuntime ? 'spin' : ''} />{repairingRuntime || instance.status === 'RESTARTING' ? 'Repairing and verifying' : 'Repair and verify'}</button>}{imageDrift && !manualRuntimeRecoveryRequired && !failedHermesVersionUpdate && <button className="primary-button compact-button" onClick={() => void fixImageDrift()} disabled={instanceActionBusy || !canFixImageDrift || fixingImage || refreshingObservation}><Wrench size={16} />{imageRepairing ? 'Fix in progress' : fixingImage ? 'Queuing fix' : 'Fix automatically'}</button>}{!manualRuntimeRecoveryRequired && <button className="secondary-button compact-button" onClick={() => setSelectedTab('diagnostics')}>Review diagnostics</button>}</div>}
 		</section>
-		{codexSetupIssue && <section className="setup-card"><div><span>Codex setup</span><strong>{effectiveCodexSetupTitle}</strong><small>This setup is separate from runtime health.</small></div><Status value="UNKNOWN" label="Setup incomplete" /><div className="attention-actions">{!codexConnected ? <button className="primary-button compact-button" onClick={() => setCodexAuthOpen(true)} disabled={instanceActionBusy || instance.status !== 'RUNNING'}><KeyRound size={16} />Authenticate Codex</button> : !hasCodexConfiguration ? <button className="primary-button compact-button" onClick={() => setSelectedTab('configuration')} disabled={instanceActionBusy || !['RUNNING', 'STOPPED'].includes(instance.status)}><Settings size={16} />Configure Codex</button> : canSyncRuntime && <button className="primary-button compact-button" onClick={() => void syncRuntimeConfiguration()} disabled={instanceActionBusy || syncingRuntime || refreshingObservation}><Wrench size={16} />{runtimeSyncInProgress ? 'Setup in progress' : syncingRuntime ? 'Queuing setup' : 'Complete setup'}</button>}</div></section>}
+		{providerSetupIssue && <section className="setup-card"><div><span>{provider.shortLabel} setup</span><strong>{effectiveProviderSetupTitle}</strong><small>This setup is separate from runtime health.</small></div><Status value="UNKNOWN" label="Setup incomplete" /><div className="attention-actions">{!providerConnected ? <button className="primary-button compact-button" onClick={() => setAuthProvider(instance.provider)} disabled={instanceActionBusy || instance.status !== 'RUNNING'}><KeyRound size={16} />Authenticate {provider.shortLabel}</button> : !hasProviderConfiguration ? <button className="primary-button compact-button" onClick={() => setSelectedTab('configuration')} disabled={instanceActionBusy || !['RUNNING', 'STOPPED'].includes(instance.status)}><Settings size={16} />Configure {provider.shortLabel}</button> : canSyncRuntime && <button className="primary-button compact-button" onClick={() => void syncRuntimeConfiguration()} disabled={instanceActionBusy || syncingRuntime || refreshingObservation}><Wrench size={16} />{runtimeSyncInProgress ? 'Setup in progress' : syncingRuntime ? 'Queuing setup' : 'Complete setup'}</button>}</div></section>}
         {observationError && <div className="inline-error">{observationError}</div>}
         {hermesUpdateError && <div className="inline-error">{hermesUpdateError}</div>}
         {hermesUpdateStartError && <div className="inline-error">{hermesUpdateStartError}</div>}
@@ -2308,34 +2472,53 @@ function InstanceProfile({
       </div>}
 
       {selectedTab === 'configuration' && <div className="profile-tab-content">
-        <section className="section-block first-section profile-section">
-          {!codexConnected && !hasCodexConfiguration ? <>
-            <div className="section-heading"><div><h2>Codex configuration</h2><p>Configuration and authentication are tracked separately</p></div><Status value="UNKNOWN" label="Not configured" /></div>
+        {oauthProvider && <section className="section-block first-section profile-section">
+          <div className="section-heading"><div><h2>Providers</h2><p>OAuth logins and the default inference provider</p></div></div>
+          <div className="oauth-account-list">{instanceOAuthProviders.map((entry) => {
+            const connected = oauthProviderConnected(observationChecks, entry.slug)
+            const active = entry.slug === instance.provider
+            return <div className="oauth-account-row" key={entry.slug}>
+              <span>{entry.label}</span>
+              <div className="oauth-account-actions">
+                {connected ? <Status value="CONNECTED" label="Signed in" /> : oauthAuthCheck(observationChecks, entry.slug)?.status === 'DRIFT' ? <button className="primary-button compact-button" onClick={() => setAuthProvider(entry.slug)} disabled={instance.status !== 'RUNNING'}>Authenticate {entry.shortLabel}</button> : <Status value="UNKNOWN" label="Checking" />}
+                {active ? <small className="oauth-default-label">Default</small> : <button className="secondary-button compact-button" onClick={() => selectFormProvider(entry.slug)} disabled={instanceActionBusy || configuringCodex}>Configure as default</button>}
+              </div>
+            </div>
+          })}</div>
+        </section>}
+        <section className={`section-block profile-section${oauthProvider ? '' : ' first-section'}`}>
+          {!formProviderConnected && !formHasSavedConfig ? <>
+            <div className="section-heading"><div><h2>{formProvider.shortLabel} configuration</h2><p>Configuration and authentication are tracked separately</p></div><Status value="UNKNOWN" label="Not configured" /></div>
             <div className="detail-list">
+              <DetailRow label="Provider" value={formProvider.label} />
               <DetailRow label="Model" value="Not configured" />
               <DetailRow label="Reasoning" value="Not configured" />
               <DetailRow label="Service tier" value="Not configured" />
             </div>
-            <div className="backup-scope"><KeyRound size={18} /><div><strong>Codex is not connected</strong><span>Authenticate this instance before saving its model, reasoning level, and service tier.</span></div><button className="primary-button compact-button" onClick={() => setCodexAuthOpen(true)} disabled={instance.status !== 'RUNNING'}><KeyRound size={16} />Authenticate Codex</button></div>
-          </> : !codexConnected ? <>
-            <div className="section-heading"><div><h2>Codex configuration</h2><p>Configuration exists · authentication is separate</p></div><Status value="DRIFT" label="Sign in required" /></div>
+            {formProvider.authNote && <div className="inline-notice">{formProvider.authNote}</div>}
+            <div className="backup-scope"><KeyRound size={18} /><div><strong>{formProvider.shortLabel} is not connected</strong><span>Authenticate this instance before saving its model, reasoning level, and service tier.</span></div></div>
+          </> : !formProviderConnected ? <>
+            <div className="section-heading"><div><h2>{formProvider.shortLabel} configuration</h2><p>Configuration exists · authentication is separate</p></div><Status value="DRIFT" label="Sign in required" /></div>
             <div className="detail-list">
+              <DetailRow label="Provider" value={formProvider.label} />
               <DetailRow label="Model" value={instance.model} mono />
               <DetailRow label="Reasoning" value={sentenceCase(instance.reasoning)} />
               <DetailRow label="Service tier" value={sentenceCase(instance.service_tier)} />
             </div>
-            <div className="backup-scope"><KeyRound size={18} /><div><strong>Configuration saved, Codex not connected</strong><span>These values are already stored for this instance. Authenticate Codex to make the saved configuration usable.</span></div><button className="primary-button compact-button" onClick={() => setCodexAuthOpen(true)} disabled={instance.status !== 'RUNNING'}><KeyRound size={16} />Authenticate Codex</button></div>
+            {formProvider.authNote && <div className="inline-notice">{formProvider.authNote}</div>}
+            <div className="backup-scope"><KeyRound size={18} /><div><strong>Configuration saved, {formProvider.shortLabel} not connected</strong><span>These values are already stored for this instance. Authenticate {formProvider.shortLabel} to make the saved configuration usable.</span></div></div>
           </> : <>
-			<div className="section-heading"><div><h2>{codexConfigurationActive ? 'Codex configuration' : hasCodexConfiguration ? 'Review Codex configuration' : 'Configure Codex'}</h2><p>{codexConfigurationActive ? 'Saved settings are applied to this instance' : hasCodexConfiguration ? 'Saved settings need to be applied to this instance' : 'Choose settings for this instance'}</p></div><Status value="CONNECTED" label="Signed in" /></div>
+			<div className="section-heading"><div><h2>{formConfigurationActive ? `${formProvider.shortLabel} configuration` : formHasSavedConfig ? `Review ${formProvider.shortLabel} configuration` : `Configure ${formProvider.shortLabel}`}</h2><p>{formConfigurationActive ? 'Saved settings are applied to this instance' : formHasSavedConfig ? 'Saved settings need to be applied to this instance' : 'Choose settings for this instance'}</p></div><Status value="CONNECTED" label="Signed in" /></div>
             <form className="codex-configuration-form" onSubmit={(event) => void configureCodex(event)}>
               <div className="form-grid">
 				<label>Model<select value={codexForm.model} onChange={(event) => updateCodexForm('model', event.target.value)} required disabled={instanceActionBusy || configuringCodex || codexModelOptions.length === 0}><option value="">Select model</option>{codexModelOptions.map((model) => <option key={model} value={model}>{model}{model === recommendedCodexModel ? ' · recommended' : ''}</option>)}</select></label>
-                <label>Reasoning<select value={codexForm.reasoning} onChange={(event) => updateCodexForm('reasoning', event.target.value)} required disabled={instanceActionBusy || configuringCodex}><option value="">Select reasoning</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Xhigh</option></select></label>
-                <label>Service tier<select value={codexForm.service_tier} onChange={(event) => updateCodexForm('service_tier', event.target.value)} required disabled={instanceActionBusy || configuringCodex}><option value="">Select service tier</option><option value="normal">Normal</option><option value="priority">Priority</option></select></label>
+                <label>Reasoning<select value={codexForm.reasoning} onChange={(event) => updateCodexForm('reasoning', event.target.value)} required disabled={instanceActionBusy || configuringCodex}><option value="">Select reasoning</option>{codexReasoningOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+                <label>Service tier<select value={codexForm.service_tier} onChange={(event) => updateCodexForm('service_tier', event.target.value)} required disabled={instanceActionBusy || configuringCodex}>{codexServiceTierOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
               </div>
-			  {codexModelOptions.length === 0 && <div className="inline-error">Hermes model catalog is unavailable. Refresh diagnostics before configuring Codex.</div>}
+			  {formProvider.authNote && <div className="inline-notice">{formProvider.authNote}</div>}
+			  {codexModelOptions.length === 0 && <div className="inline-error">Hermes model catalog is unavailable. Refresh diagnostics before configuring {formProvider.shortLabel}.</div>}
               {codexConfigurationError && <div className="inline-error">{codexConfigurationError}</div>}
-              <div className="modal-actions"><button className="primary-button" type="submit" disabled={instanceActionBusy || configuringCodex || instance.status === 'UPDATING' || !codexDirty || !codexFormValid}><Settings size={16} />{configuringCodex ? 'Applying' : hasCodexConfiguration ? 'Save changes' : 'Save and apply'}</button></div>
+              <div className="modal-actions"><button className="primary-button" type="submit" disabled={instanceActionBusy || configuringCodex || instance.status === 'UPDATING' || !codexDirty || !codexFormValid}><Settings size={16} />{configuringCodex ? 'Applying' : formHasSavedConfig ? 'Save changes' : 'Save and apply'}</button></div>
             </form>
           </>}
         </section>
@@ -2350,7 +2533,7 @@ function InstanceProfile({
       {selectedTab === 'recovery' && <div className="profile-tab-content">
         <section className="section-block first-section profile-section recovery-section">
 		  <div className="section-heading"><div><h2>Backups</h2><p>Create and restore backups for {instance.name}</p></div><div className="section-actions">{instance.status === 'RUNNING' ? <button className="secondary-button" onClick={() => void stopForRecovery()} disabled={instanceActionBusy || recoveryBusy !== ''}><CircleStop size={16} />{recoveryBusy === 'stop' ? 'Stopping' : 'Stop instance'}</button> : <button className="primary-button" onClick={() => void createRecoveryPoint()} disabled={instanceActionBusy || instance.status !== 'STOPPED' || recoveryBusy !== ''}><Archive size={16} />{recoveryBusy === 'create' ? 'Creating' : 'Create backup'}</button>}</div></div>
-		  <div className="backup-scope"><ShieldCheck size={18} /><div><strong>{instance.status === 'STOPPED' ? 'Create the backup here' : 'Stop the instance before creating a backup'}</strong><span>This page creates an encrypted copy of this instance's managed workspace, data volume, and Codex sign-in state. It records the Hermes release identity but does not copy Docker image layers. Backups listed below can be restored from this page while the instance is stopped.</span></div></div>
+		  <div className="backup-scope"><ShieldCheck size={18} /><div><strong>{instance.status === 'STOPPED' ? 'Create the backup here' : 'Stop the instance before creating a backup'}</strong><span>This page creates an encrypted copy of this instance's managed workspace, data volume, and provider sign-in state. It records the Hermes release identity but does not copy Docker image layers. Backups listed below can be restored from this page while the instance is stopped.</span></div></div>
           {recoveryError && <div className="inline-error">{recoveryError}</div>}
 		  {recoveryPoints.length === 0 ? <div className="compact-empty"><Archive size={18} /><div><strong>No backups yet</strong><span>{instance.status === 'STOPPED' ? 'Create the first backup above.' : 'Stop the instance above, then create the first backup.'}</span></div></div> : <div className="table-wrap"><table className="provider-table recovery-table"><thead><tr><th>Backup</th><th>Size</th><th>Status</th><th>Last verified</th><th><span className="sr-only">Actions</span></th></tr></thead><tbody>{recoveryPoints.map((point) => <tr key={point.id}><td data-label="Backup"><strong>{point.filename}</strong><span className="secondary-text" title={point.sha256}>{point.sha256 ? `SHA-256 ${point.sha256.slice(0, 16)}…` : point.error || 'Encrypted backup is being prepared'} · {relativeTime(point.created_at)}</span></td><td data-label="Size">{point.size_bytes > 0 ? formatBytes(point.size_bytes) : 'Pending'}</td><td data-label="Status"><Status value={point.status} /></td><td data-label="Last verified">{point.verified_at ? relativeTime(point.verified_at) : 'Pending'}</td><td data-label="Actions"><div className="row-actions"><button className="icon-button" title="Restore this backup" onClick={() => void restoreRecoveryPoint(point)} disabled={instanceActionBusy || point.status !== 'READY' || instance.status !== 'STOPPED' || recoveryBusy !== ''}><History size={15} /></button><button className="icon-button" title="Verify backup" onClick={() => void verifyRecoveryPoint(point)} disabled={instanceActionBusy || point.status !== 'READY' || recoveryBusy !== ''}><ShieldCheck size={15} /></button><button className="icon-button" title="Download backup" onClick={() => void downloadRecoveryPoint(point)} disabled={point.status !== 'READY' || recoveryBusy !== ''}><Download size={15} /></button><button className="icon-button danger-button" title="Delete backup" onClick={() => void deleteRecoveryPoint(point)} disabled={instanceActionBusy || !['READY', 'FAILED'].includes(point.status) || recoveryBusy !== ''}><Trash2 size={15} /></button></div></td></tr>)}</tbody></table></div>}
         </section>
@@ -2363,8 +2546,8 @@ function InstanceProfile({
           {runtimeRefreshRequired && hermesUpdateFlow.status === 'idle' && <div className="repair-callout"><RefreshCw size={18} /><div><strong>{failedRuntimeRecoveryAvailable ? 'Managed runtime recovery' : failedRuntimeRecoveryNeedsVerification ? 'Verify retained runtime' : 'Managed runtime maintenance'}</strong><span>{failedRuntimeRecoveryAvailable ? `Hermes ${hermesUpdate?.current_version} remains installed. Fleet verified the retained artifacts and can recover the instance to RUNNING.` : failedRuntimeRecoveryNeedsVerification ? hermesUpdate?.reason : `Hermes ${hermesUpdate?.current_version} remains installed. Fleet will create and verify a rollback backup, refresh its managed runtime components, restore the current state, and verify Hermes health.`}</span></div>{failedRuntimeRecoveryNeedsVerification ? <button className="primary-button compact-button" onClick={() => void requestObservation()} disabled={instanceActionBusy || !observationReady || refreshingObservation || Boolean(instance.observation_request)}><RefreshCw size={16} className={refreshingObservation ? 'spin' : ''} />Verify runtime</button> : <button className="primary-button compact-button" onClick={() => void runHermesUpdate()} disabled={instanceActionBusy || startingHermesUpdate || !canRunHermesMaintenance}><RefreshCw size={16} className={startingHermesUpdate ? 'spin' : ''} />{startingHermesUpdate ? 'Queuing maintenance' : failedRuntimeRecoveryAvailable ? 'Recover runtime' : 'Run maintenance'}</button>}</div>}
           {runtimeDrift && <div className="repair-callout"><RefreshCw size={18} className={repairingRuntime || automaticRuntimeRecoveryActive ? 'spin' : ''} /><div><strong>{runtimeRemediation ? runtimeRecoveryTitle(runtimeRemediation.status) : repairingRuntime || instance.status === 'RESTARTING' ? 'Runtime repair and health verification in progress' : 'Managed repair available'}</strong><span>{runtimeRemediation ? runtimeRecoveryDetail(runtimeRemediation) : 'Fleet will repair the managed services, preserve instance data and configuration, then verify Hermes and dashboard health before reporting success.'}</span></div>{runtimeRemediation && automaticRuntimeRecoveryActive ? <button className="secondary-button compact-button danger-button" onClick={() => void cancelAutomaticRuntimeRecovery()} disabled={instanceActionBusy || cancelingRuntimeRecovery || instance.status === 'RESTARTING'}>{instance.status === 'RESTARTING' ? 'Attempt in progress' : cancelingRuntimeRecovery ? 'Stopping' : 'Stop automatic recovery'}</button> : <button className="primary-button compact-button" onClick={() => void repairRuntime()} disabled={instanceActionBusy || !canRepairRuntime || repairingRuntime}>{repairingRuntime || instance.status === 'RESTARTING' ? 'Repairing' : 'Repair and verify'}</button>}</div>}
           {imageDrift && <div className="repair-callout"><Wrench size={18} /><div><strong>{imageRepairing ? 'Automatic fix in progress' : 'Automatic fix available'}</strong><span>{instance.status === 'STOPPED' ? 'Fleet will verify ownership and the current image without starting this instance.' : 'Fleet will run safety checks, restart this instance briefly, and confirm Hermes is healthy.'}</span></div><button className="primary-button compact-button" onClick={() => void fixImageDrift()} disabled={instanceActionBusy || !canFixImageDrift || fixingImage}>{imageRepairing ? 'Fixing' : fixingImage ? 'Queuing' : 'Fix automatically'}</button></div>}
-		  {codexSetupIssue && !runtimeRefreshRequired && <div className="repair-callout"><Wrench size={18} /><div><strong>{codexSetupTitle}</strong><span>{codexSetupIssue.detail}</span></div>{!codexConnected ? <button className="primary-button compact-button" onClick={() => setCodexAuthOpen(true)} disabled={instanceActionBusy || instance.status !== 'RUNNING'}><KeyRound size={16} />Authenticate Codex</button> : !hasCodexConfiguration ? <button className="primary-button compact-button" onClick={() => setSelectedTab('configuration')} disabled={instanceActionBusy || !['RUNNING', 'STOPPED'].includes(instance.status)}><Settings size={16} />Configure Codex</button> : <button className="primary-button compact-button" onClick={() => void syncRuntimeConfiguration()} disabled={instanceActionBusy || !canSyncRuntime || syncingRuntime}>{runtimeSyncInProgress ? 'Applying' : syncingRuntime ? 'Queuing' : 'Complete setup'}</button>}</div>}
-          {observationChecks.length === 0 ? <div className="observation-empty">No diagnostics have been received.</div> : visibleDiagnostics.length > 0 ? <div className="table-wrap"><table className="provider-table observation-table"><thead><tr><th>Check</th><th>Result</th><th>Detail</th></tr></thead><tbody>{visibleDiagnostics.map((check) => <tr key={check.name}><td data-label="Check"><strong>{observationCheckLabel(check.name)}</strong></td><td data-label="Result">{check.name === 'codex_setup' ? <Status value="UNKNOWN" label="Setup incomplete" /> : <Status value={check.status} />}</td><td data-label="Detail">{check.detail}</td></tr>)}</tbody></table></div> : <div className="compact-empty"><ShieldCheck size={18} /><div><strong>No issues found</strong><span>All {passedChecks.length} diagnostics passed.</span></div></div>}
+		  {providerSetupIssue && !runtimeRefreshRequired && <div className="repair-callout"><Wrench size={18} /><div><strong>{providerSetupTitle}</strong><span>{providerSetupIssue.detail}</span></div>{!providerConnected ? <button className="primary-button compact-button" onClick={() => setAuthProvider(instance.provider)} disabled={instanceActionBusy || instance.status !== 'RUNNING'}><KeyRound size={16} />Authenticate {provider.shortLabel}</button> : !hasProviderConfiguration ? <button className="primary-button compact-button" onClick={() => setSelectedTab('configuration')} disabled={instanceActionBusy || !['RUNNING', 'STOPPED'].includes(instance.status)}><Settings size={16} />Configure {provider.shortLabel}</button> : <button className="primary-button compact-button" onClick={() => void syncRuntimeConfiguration()} disabled={instanceActionBusy || !canSyncRuntime || syncingRuntime}>{runtimeSyncInProgress ? 'Applying' : syncingRuntime ? 'Queuing' : 'Complete setup'}</button>}</div>}
+          {observationChecks.length === 0 ? <div className="observation-empty">No diagnostics have been received.</div> : visibleDiagnostics.length > 0 ? <div className="table-wrap"><table className="provider-table observation-table"><thead><tr><th>Check</th><th>Result</th><th>Detail</th></tr></thead><tbody>{visibleDiagnostics.map((check) => <tr key={check.name}><td data-label="Check"><strong>{observationCheckLabel(check.name)}</strong></td><td data-label="Result">{check.name === 'codex_setup' || check.name === 'provider_setup' ? <Status value="UNKNOWN" label="Setup incomplete" /> : <Status value={check.status} />}</td><td data-label="Detail">{check.detail}</td></tr>)}</tbody></table></div> : <div className="compact-empty"><ShieldCheck size={18} /><div><strong>No issues found</strong><span>All {passedChecks.length} diagnostics passed.</span></div></div>}
           {passedChecks.length > 0 && <div className="diagnostic-disclosure"><button className="text-button" onClick={() => setShowPassedDiagnostics((current) => !current)} aria-expanded={showPassedDiagnostics}>{showPassedDiagnostics ? 'Hide passed checks' : `Show ${passedChecks.length} passed ${plural(passedChecks.length, 'check')}`}</button></div>}
         </section>
       </div>}
@@ -2373,7 +2556,7 @@ function InstanceProfile({
 		<OperationsWorkspace operations={updateOperations} instances={[instance]} token={token} fixedInstanceID={instance.id} pageSize={5} onChanged={onChanged} />
       </div>}
 
-      {codexAuthOpen && <CodexAuthDialog instance={instance} token={token} onClose={() => setCodexAuthOpen(false)} onConnected={() => { void requestObservation(); onChanged() }} />}
+      {authProvider && <CodexAuthDialog instance={instance} token={token} provider={authProvider} onClose={() => setAuthProvider(null)} onConnected={() => { void requestObservation(); onChanged() }} />}
     </div>
   )
 }
@@ -3405,7 +3588,8 @@ function renderManagedList(value: string[] | null | undefined) {
 	return Array.isArray(value) ? value.join('\n') : ''
 }
 
-function CodexAuthDialog({ instance, token, onClose, onConnected }: { instance: Instance; token: string; onClose: () => void; onConnected: () => void }) {
+function CodexAuthDialog({ instance, token, provider: providerSlug, onClose, onConnected }: { instance: Instance; token: string; provider: string; onClose: () => void; onConnected: () => void }) {
+  const provider = providerCopy(providerSlug)
   const [session, setSession] = useState<CodexAuthSession | null>(null)
   const [error, setError] = useState('')
   const [copied, setCopied] = useState(false)
@@ -3423,10 +3607,11 @@ function CodexAuthDialog({ instance, token, onClose, onConnected }: { instance: 
       try {
         const started = await apiRequest<CodexAuthSession>(token, `/api/v1/instances/${instance.id}/codex-auth`, {
           method: 'POST',
-          body: '{}',
+          body: JSON.stringify({ provider: providerSlug }),
           signal: controller.signal,
         })
         if (controller.signal.aborted) return
+		if (started.provider !== providerSlug) throw new Error('Fleet resumed a different provider authentication session')
         setSession(started)
         for (let attempt = 0; attempt < 920 && !controller.signal.aborted; attempt += 1) {
           await sleep(1000, controller.signal)
@@ -3435,25 +3620,26 @@ function CodexAuthDialog({ instance, token, onClose, onConnected }: { instance: 
             signal: controller.signal,
           })
           if (controller.signal.aborted) return
+		  if (current.provider !== providerSlug) throw new Error('Fleet returned a different provider authentication session')
           setSession(current)
           if (current.status === 'SUCCEEDED') {
             onConnectedRef.current()
             return
           }
           if (current.status === 'FAILED') {
-            setError(current.error || 'Codex authentication failed')
+            setError(current.error || `${provider.shortLabel} authentication failed`)
             return
           }
         }
-        if (!controller.signal.aborted) setError('Codex authentication timed out')
+        if (!controller.signal.aborted) setError(`${provider.shortLabel} authentication timed out`)
       } catch (requestError) {
         if (requestError instanceof DOMException && requestError.name === 'AbortError') return
-        if (!controller.signal.aborted) setError(requestError instanceof Error ? requestError.message : 'Codex authentication could not be started')
+        if (!controller.signal.aborted) setError(requestError instanceof Error ? requestError.message : `${provider.shortLabel} authentication could not be started`)
       }
     }
     void run()
     return () => controller.abort()
-  }, [instance.id, token])
+  }, [instance.id, provider.shortLabel, providerSlug, token])
 
   const copyCode = async () => {
     if (!session?.user_code) return
@@ -3468,10 +3654,10 @@ function CodexAuthDialog({ instance, token, onClose, onConnected }: { instance: 
     setError('')
     try {
       await apiRequest<void>(token, `/api/v1/instances/${instance.id}/codex-auth/${session.operation_id}`, { method: 'DELETE' })
-      setSession({ ...session, status: 'FAILED', stage: undefined, error: 'Codex authentication canceled by administrator' })
-      setError('Codex authentication canceled')
+      setSession({ ...session, status: 'FAILED', stage: undefined, error: `${provider.shortLabel} authentication canceled by administrator` })
+      setError(`${provider.shortLabel} authentication canceled`)
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : 'Codex authentication could not be canceled')
+      setError(requestError instanceof Error ? requestError.message : `${provider.shortLabel} authentication could not be canceled`)
     } finally {
       setCanceling(false)
     }
@@ -3480,7 +3666,7 @@ function CodexAuthDialog({ instance, token, onClose, onConnected }: { instance: 
   const complete = session?.status === 'SUCCEEDED'
   const active = ['PENDING', 'RUNNING'].includes(session?.status ?? '')
   const awaitingUser = active && session?.stage === 'AWAITING_USER' && Boolean(session.user_code && session.verification_uri)
-  return <div className="modal-backdrop" role="presentation"><div ref={dialogRef} className="modal codex-auth-modal" role="dialog" aria-modal="true" aria-labelledby="codex-auth-title" tabIndex={-1} onKeyDown={onKeyDown}><div className="modal-header"><div><h2 id="codex-auth-title">Authenticate Codex</h2><p>{instance.name} · managed by Hermes Fleet</p></div><button className="icon-button" onClick={onClose} title="Close"><X size={18} /></button></div><div className="modal-body codex-auth-body">{complete ? <div className="auth-result auth-success"><ShieldCheck size={28} /><div><strong>Codex is connected</strong><span>New Hermes sessions can now use the configured Codex model.</span></div></div> : awaitingUser ? <><div className="auth-instruction"><span>1</span><div><strong>Open OpenAI sign-in</strong><p>Approve this instance in your browser. Fleet keeps the OAuth session isolated inside this Hermes instance.</p></div></div><a className="primary-button full-button" href={session?.verification_uri} target="_blank" rel="noreferrer"><ExternalLink size={17} />Open OpenAI sign-in</a><div className="auth-instruction"><span>2</span><div><strong>Enter this one-time code</strong><p>The code expires {session?.expires_at ? relativeTimeFuture(session.expires_at) : 'soon'}.</p></div></div><button className="device-code" onClick={() => void copyCode()}><code>{session?.user_code}</code><span><Copy size={16} />{copied ? 'Copied' : 'Copy code'}</span></button><div className="auth-waiting"><RefreshCw size={16} className="spin" />Waiting for OpenAI approval</div></> : <div className="auth-result"><RefreshCw size={24} className={error ? '' : 'spin'} /><div><strong>{error ? 'Authentication could not continue' : session?.stage === 'VERIFYING' ? 'Verifying Codex session' : 'Starting secure sign-in'}</strong><span>{error || 'Fleet is preparing a one-time OpenAI device code.'}</span></div></div>}{error && awaitingUser && <div className="inline-error">{error}</div>}<div className="modal-actions">{active && <button className="secondary-button danger-button" onClick={() => void cancelAuthentication()} disabled={canceling}>{canceling ? 'Canceling' : 'Cancel authentication'}</button>}<button className="secondary-button" onClick={onClose}>{complete ? 'Done' : 'Close'}</button></div></div></div></div>
+  return <div className="modal-backdrop" role="presentation"><div ref={dialogRef} className="modal codex-auth-modal" role="dialog" aria-modal="true" aria-labelledby="codex-auth-title" tabIndex={-1} onKeyDown={onKeyDown}><div className="modal-header"><div><h2 id="codex-auth-title">Authenticate {provider.shortLabel}</h2><p>{instance.name} · managed by Hermes Fleet</p></div><button className="icon-button" onClick={onClose} title="Close"><X size={18} /></button></div><div className="modal-body codex-auth-body">{complete ? <div className="auth-result auth-success"><ShieldCheck size={28} /><div><strong>{provider.shortLabel} is connected</strong><span>New Hermes sessions can now use the configured {provider.shortLabel} model.</span></div></div> : awaitingUser ? <><div className="auth-instruction"><span>1</span><div><strong>Open {provider.signInHost} sign-in</strong><p>Approve this instance in your browser. Fleet keeps the OAuth session isolated inside this Hermes instance.</p></div></div><a className="primary-button full-button" href={session?.verification_uri} target="_blank" rel="noreferrer"><ExternalLink size={17} />Open {provider.signInHost} sign-in</a>{provider.authNote && <div className="inline-notice">{provider.authNote}</div>}<div className="auth-instruction"><span>2</span><div><strong>Enter this one-time code</strong><p>The code expires {session?.expires_at ? relativeTimeFuture(session.expires_at) : 'soon'}.</p></div></div><button className="device-code" onClick={() => void copyCode()}><code>{session?.user_code}</code><span><Copy size={16} />{copied ? 'Copied' : 'Copy code'}</span></button><div className="auth-waiting"><RefreshCw size={16} className="spin" />Waiting for {provider.signInHost} approval</div></> : <div className="auth-result"><RefreshCw size={24} className={error ? '' : 'spin'} /><div><strong>{error ? 'Authentication could not continue' : session?.stage === 'VERIFYING' ? `Verifying ${provider.shortLabel} session` : 'Starting secure sign-in'}</strong><span>{error || `Fleet is preparing a one-time ${provider.signInHost} device code.`}</span></div></div>}{error && awaitingUser && <div className="inline-error">{error}</div>}<div className="modal-actions">{active && <button className="secondary-button danger-button" onClick={() => void cancelAuthentication()} disabled={canceling}>{canceling ? 'Canceling' : 'Cancel authentication'}</button>}<button className="secondary-button" onClick={onClose}>{complete ? 'Done' : 'Close'}</button></div></div></div></div>
 }
 
 function DetailRow({ label, value, mono = false, wide = false }: { label: string; value: string; mono?: boolean; wide?: boolean }) {
@@ -3489,6 +3675,16 @@ function DetailRow({ label, value, mono = false, wide = false }: { label: string
 
 function HermesUpdateProgress({ flow }: { flow: HermesUpdateFlow }) {
 	const steps = hermesUpdateSteps(flow)
+	const running = flow.status === 'running'
+	const [now, setNow] = useState(() => Date.now())
+	useEffect(() => {
+		if (!running) return
+		const timer = window.setInterval(() => setNow(Date.now()), 1000)
+		return () => window.clearInterval(timer)
+	}, [running])
+	const totalSeconds = elapsedSeconds(flow.startedAt, now)
+	const stageSeconds = elapsedSeconds(flow.updatedAt, now)
+	const stalled = stageSeconds >= hermesUpdateQuietSeconds
 	return <>
 		<p className="sr-only" role="status" aria-live="polite">Step {Math.min(flow.step + 1, steps.length)} of {steps.length}: {flow.detail}</p>
 		<ol className="hermes-update-steps" aria-label={flow.kind === 'RUNTIME_REFRESH' ? 'Managed runtime maintenance progress' : 'Hermes update progress'}>
@@ -3501,6 +3697,11 @@ function HermesUpdateProgress({ flow }: { flow: HermesUpdateFlow }) {
 				</li>
 			})}
 		</ol>
+		{running && totalSeconds >= 0 && <div className={`hermes-update-elapsed ${stalled ? 'quiet' : ''}`}>
+			<span><Clock size={13} aria-hidden="true" />Running for {durationLabel(totalSeconds)}</span>
+			{stageSeconds >= 0 && <span>Last progress update {durationLabel(stageSeconds)} ago</span>}
+			{flow.step === 0 && <small>Fleet builds the runtime image on the host before touching the instance. A cached build takes a few minutes; a full rebuild can take 45 minutes.</small>}
+		</div>}
 	</>
 }
 
@@ -3984,6 +4185,7 @@ function SystemView({ token, refreshSignal }: { token: string; refreshSignal: nu
 }
 
 function RuntimeHealthPanel({ token, info }: { token: string; info: SystemInfo | null }) {
+	const documentVisible = useDocumentVisible()
 	const [health, setHealth] = useState<RuntimeHealth | null>(null)
 	const [loading, setLoading] = useState(true)
 	const [error, setError] = useState('')
@@ -3999,13 +4201,14 @@ function RuntimeHealthPanel({ token, info }: { token: string; info: SystemInfo |
 		}
 	}, [token])
 	useEffect(() => {
+		if (!documentVisible) return
 		const initial = window.setTimeout(() => void load(), 0)
 		const timer = window.setInterval(() => void load(), 10000)
 		return () => {
 			window.clearTimeout(initial)
 			window.clearInterval(timer)
 		}
-	}, [load])
+	}, [documentVisible, load])
 	const manifest = info?.capabilities
 	const queue = health?.queue
 	const metrics = health?.metrics
@@ -4105,13 +4308,13 @@ function RemoteAccessPanel({ token, info, loading, reload }: { token: string; in
 		if (configured && replacingToken !== boundary) {
 			return <div className="remote-secret-field"><div className="messaging-secret-summary"><div><span>Tunnel token</span><code aria-label="Stored tunnel token">{fingerprint ? `ID ${fingerprint}` : 'Stored'}</code><small>Non-secret fingerprint · Stored encrypted by Fleet</small></div><button type="button" className="secondary-button" onClick={() => setReplacingToken(boundary)} disabled={syncing}>Replace token</button></div></div>
 		}
-		return <div className="remote-token-editor"><label>{configured ? 'New tunnel token' : 'Tunnel token'}<input type="text" required={!configured} autoComplete="off" autoCapitalize="none" spellCheck={false} value={form[field]} onChange={(event) => updateField(field, event.target.value)} /></label>{configured && <button type="button" className="text-button" onClick={() => { updateField(field, ''); setReplacingToken('') }} disabled={syncing}>Cancel replacement</button>}</div>
+		return <div className="remote-token-editor"><label>{configured ? 'New tunnel token' : 'Tunnel token'}<input type="password" required={!configured} autoComplete="new-password" autoCapitalize="none" spellCheck={false} value={form[field]} onChange={(event) => updateField(field, event.target.value)} /></label>{configured && <button type="button" className="text-button" onClick={() => { updateField(field, ''); setReplacingToken('') }} disabled={syncing}>Cancel replacement</button>}</div>
 	}
 	const publishingAPITokenField = () => {
 		if (configuration?.instance_publishing_configured && replacingToken !== 'api') {
 			return <div className="remote-secret-field"><div className="messaging-secret-summary"><div><span>Cloudflare API token</span><code aria-label="Stored Cloudflare API token">{configuration.instance_publishing_token_fingerprint ? `ID ${configuration.instance_publishing_token_fingerprint}` : 'Stored'}</code><small>Non-secret fingerprint · Stored encrypted by Fleet</small></div><button type="button" className="secondary-button" onClick={() => setReplacingToken('api')} disabled={syncing}>Replace token</button></div></div>
 		}
-		return <div className="remote-token-editor"><label>{configuration?.instance_publishing_configured ? 'New Cloudflare API token' : 'Cloudflare API token'}<input type="text" required={!configuration?.instance_publishing_configured} autoComplete="off" autoCapitalize="none" spellCheck={false} value={form.route_api_token} onChange={(event) => updateField('route_api_token', event.target.value)} /></label>{configuration?.instance_publishing_configured && <button type="button" className="text-button" onClick={() => { updateField('route_api_token', ''); setReplacingToken('') }} disabled={syncing}>Cancel replacement</button>}</div>
+		return <div className="remote-token-editor"><label>{configuration?.instance_publishing_configured ? 'New Cloudflare API token' : 'Cloudflare API token'}<input type="password" required={!configuration?.instance_publishing_configured} autoComplete="new-password" autoCapitalize="none" spellCheck={false} value={form.route_api_token} onChange={(event) => updateField('route_api_token', event.target.value)} /></label>{configuration?.instance_publishing_configured && <button type="button" className="text-button" onClick={() => { updateField('route_api_token', ''); setReplacingToken('') }} disabled={syncing}>Cancel replacement</button>}</div>
 	}
 	const adminHostnameField = () => {
 		const storedHostname = configuration?.admin_hostname?.trim() || ''
@@ -4546,7 +4749,7 @@ function CreateInstanceDialog({ hosts, token, onClose, onCreated, onOperation }:
 }) {
   const onlineHosts = hosts.filter((host) => host.status === 'ONLINE')
   const initialHostID = onlineHosts[0]?.id ?? ''
-	const [form, setForm] = useState({ name: '', host_id: initialHostID, hermes_version: '' })
+	const [form, setForm] = useState({ name: '', host_id: initialHostID, hermes_version: '', provider: 'openai-codex' })
 	const [releaseCatalog, setReleaseCatalog] = useState<HermesReleaseCatalog | null>(null)
 	const [releaseError, setReleaseError] = useState('')
   const [submitting, setSubmitting] = useState(false)
@@ -4557,7 +4760,7 @@ function CreateInstanceDialog({ hosts, token, onClose, onCreated, onOperation }:
 			if (controller.signal.aborted) return
 			setReleaseCatalog(catalog)
 			setReleaseError('')
-			setForm((current) => ({ ...current, hermes_version: current.hermes_version || catalog.releases[0]?.version || '' }))
+			setForm((current) => ({ ...current, hermes_version: current.hermes_version || catalog.releases[0]?.version || '', provider: current.provider || 'openai-codex' }))
 		}).catch((requestError) => {
 			if (requestError instanceof DOMException && requestError.name === 'AbortError') return
 			if (controller.signal.aborted) return
@@ -4581,7 +4784,7 @@ function CreateInstanceDialog({ hosts, token, onClose, onCreated, onOperation }:
   }
 	const close = () => { if (!submitting) onClose() }
 	const { dialogRef, onKeyDown } = useDialogAccessibility(close, !submitting)
-			return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) close() }}><div ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="create-title" aria-busy={submitting} tabIndex={-1} onKeyDown={onKeyDown}><div className="modal-header"><div><h2 id="create-title">Create instance</h2><p>Choose a Hermes release; Fleet prepares its image when needed</p></div><button className="icon-button" onClick={close} title="Close" disabled={submitting}><X size={18} /></button></div><form onSubmit={submit}><div className="form-grid"><label>Instance name<input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value.toLowerCase() })} pattern="[a-z](?:[a-z0-9]|-){2,31}" placeholder="fleet-test-01" required disabled={submitting} /></label><label>Host<select value={form.host_id} onChange={(event) => setForm({ ...form, host_id: event.target.value })} required disabled={submitting}>{onlineHosts.map((host) => <option key={host.id} value={host.id}>{host.name}</option>)}</select></label><label>Hermes version<select value={form.hermes_version} onChange={(event) => setForm({ ...form, hermes_version: event.target.value })} required disabled={submitting || !releaseCatalog}>{!releaseCatalog && <option value="">Loading versions</option>}{releaseCatalog?.releases.map((release, index) => <option key={release.version} value={release.version}>{release.version}{index === 0 ? ' · latest' : ''}</option>)}</select></label></div>{releaseCatalog?.stale && <div className="inline-notice">GitHub release check is unavailable. Fleet is using the last verified catalog from {relativeTime(releaseCatalog.checked_at)}.</div>}{releaseError && <div className="inline-error">{releaseError}</div>}{error && <div className="inline-error">{error}</div>}<div className="modal-actions"><button type="button" className="secondary-button" onClick={close} disabled={submitting}>Cancel</button><button type="submit" className="primary-button" disabled={submitting || !form.host_id || !form.hermes_version}>{submitting ? 'Creating' : 'Create instance'}<Plus size={17} /></button></div></form></div></div>
+			return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) close() }}><div ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="create-title" aria-busy={submitting} tabIndex={-1} onKeyDown={onKeyDown}><div className="modal-header"><div><h2 id="create-title">Create instance</h2><p>Choose a Hermes release and the initial active OAuth provider. Additional Hermes OAuth logins can be added after the instance is running.</p></div><button className="icon-button" onClick={close} title="Close" disabled={submitting}><X size={18} /></button></div><form onSubmit={submit}><div className="form-grid"><label>Instance name<input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value.toLowerCase() })} pattern="[a-z](?:[a-z0-9]|-){2,31}" placeholder="fleet-test-01" required disabled={submitting} /></label><label>Host<select value={form.host_id} onChange={(event) => setForm({ ...form, host_id: event.target.value })} required disabled={submitting}>{onlineHosts.map((host) => <option key={host.id} value={host.id}>{host.name}</option>)}</select></label><label>Provider<select value={form.provider} onChange={(event) => setForm({ ...form, provider: event.target.value })} required disabled={submitting}>{instanceOAuthProviders.map((entry) => <option key={entry.slug} value={entry.slug}>{entry.label}</option>)}</select></label><label>Hermes version<select value={form.hermes_version} onChange={(event) => setForm({ ...form, hermes_version: event.target.value })} required disabled={submitting || !releaseCatalog}>{!releaseCatalog && <option value="">Loading versions</option>}{releaseCatalog?.releases.map((release, index) => <option key={release.version} value={release.version}>{release.version}{index === 0 ? ' · latest' : ''}</option>)}</select></label></div>{form.provider === 'xai-oauth' && <div className="inline-notice">{providerCopy('xai-oauth').authNote}</div>}{releaseCatalog?.stale && <div className="inline-notice">GitHub release check is unavailable. Fleet is using the last verified catalog from {relativeTime(releaseCatalog.checked_at)}.</div>}{releaseError && <div className="inline-error">{releaseError}</div>}{error && <div className="inline-error">{error}</div>}<div className="modal-actions"><button type="button" className="secondary-button" onClick={close} disabled={submitting}>Cancel</button><button type="submit" className="primary-button" disabled={submitting || !form.host_id || !form.hermes_version}>{submitting ? 'Creating' : 'Create instance'}<Plus size={17} /></button></div></form></div></div>
 }
 
 function Status({ value, label = value }: { value: string; label?: string }) {
@@ -4767,35 +4970,36 @@ function hermesUpdateStatusLabel(update: HermesUpdate | null, error: string) {
 	return 'Update check failed'
 }
 
-function codexSignInDetail(connected: boolean, configured: boolean, active: boolean) {
+function providerSignInDetail(connected: boolean, configured: boolean, active: boolean) {
 	if (!connected) return configured ? 'Configuration saved separately' : 'Required before model setup'
 	if (!configured) return 'Model not configured'
 	return active ? 'Configured and ready' : 'Saved configuration needs applying'
 }
 
-function codexSetupIssueTitle(connected: boolean, configured: boolean, runtimeConfigurationDrift: boolean) {
-	if (!connected && !configured) return 'Complete Codex setup'
-	if (!connected) return 'Sign in to Codex'
-	if (!configured) return 'Choose a Codex model'
-	return runtimeConfigurationDrift ? 'Apply Codex configuration' : 'Review Codex setup'
+function providerSetupIssueTitle(shortLabel: string, connected: boolean, configured: boolean, runtimeConfigurationDrift: boolean) {
+	if (!connected && !configured) return `Complete ${shortLabel} setup`
+	if (!connected) return `Sign in to ${shortLabel}`
+	if (!configured) return `Choose a ${shortLabel} model`
+	return runtimeConfigurationDrift ? `Apply ${shortLabel} configuration` : `Review ${shortLabel} setup`
 }
 
-function codexSetupDiagnostic(
+function providerSetupDiagnostic(
 	provider: string,
 	authentication: ObservationCheck | undefined,
 	runtimeConfiguration: ObservationCheck | undefined,
 	connected: boolean,
 	configured: boolean,
 ): ObservationCheck | null {
-	if (provider !== 'openai-codex' || (!authentication && !runtimeConfiguration)) return null
+	if (!isInstanceOAuth(provider) || (!authentication && !runtimeConfiguration)) return null
+	const copy = providerCopy(provider)
 	const checks = [authentication, runtimeConfiguration].filter((check): check is ObservationCheck => Boolean(check))
 	if (checks.every((check) => check.status === 'OK')) return null
 	const status = checks.some((check) => check.status === 'MISSING') ? 'MISSING' : checks.some((check) => check.status === 'DRIFT') ? 'DRIFT' : 'UNKNOWN'
-	let detail = runtimeConfiguration?.detail ?? authentication?.detail ?? 'Codex setup needs attention'
-	if (!connected && !configured) detail = 'Sign in to Codex, then choose the model and runtime settings for this instance.'
-	else if (!connected) detail = 'The configuration is saved; sign in to Codex to make it usable.'
-	else if (!configured) detail = 'Codex is signed in; choose the model, reasoning level, and service tier for this instance.'
-	return { name: 'codex_setup', status, detail }
+	let detail = runtimeConfiguration?.detail ?? authentication?.detail ?? `${copy.shortLabel} setup needs attention`
+	if (!connected && !configured) detail = `Sign in to ${copy.shortLabel}, then choose the model and runtime settings for this instance.`
+	else if (!connected) detail = `The configuration is saved; sign in to ${copy.shortLabel} to make it usable.`
+	else if (!configured) detail = `${copy.shortLabel} is signed in; choose the model, reasoning level, and service tier for this instance.`
+	return { name: provider === 'openai-codex' ? 'codex_setup' : 'provider_setup', status, detail }
 }
 
 function buildFleetAlertRecords(hosts: Host[], instances: Instance[], operations: Operation[], health: RuntimeHealth | null, info: SystemInfo | null, backups: Backup[]) {
@@ -4886,7 +5090,8 @@ function isRepairableHermesProfileAccessError(value: unknown) {
 	return /Hermes dashboard (?:session token is unavailable|returned HTTP (?:401|403)|profile login was rejected with HTTP (?:401|403))|Hermes profile access (?:is unavailable|failed)/i.test(message)
 }
 
-const codexSetupCheckNames = new Set(['codex_auth', 'runtime_configuration', 'codex_setup'])
+const codexSetupCheckNames = new Set(['codex_auth', 'provider_auth', 'runtime_configuration', 'codex_setup', 'provider_setup'])
+const providerAuthenticationCheckNames = new Set(['codex_auth', 'provider_auth'])
 
 function instanceOperationalHealthStatus(instance: Instance) {
 	const observation = instance.observation
@@ -4901,9 +5106,11 @@ function instanceOperationalHealthStatus(instance: Instance) {
 function instanceReadinessStatus(instance: Instance) {
 	const operationalStatus = instanceOperationalHealthStatus(instance)
 	if (!['IN_SYNC', 'OK'].includes(operationalStatus)) return operationalStatus
-	const setupIncomplete = (instance.observation?.checks ?? []).some((check) =>
-		codexSetupCheckNames.has(check.name) && check.status !== 'OK',
-	)
+	const checks = instance.observation?.checks ?? []
+	const authenticationChecks = checks.filter((check) => providerAuthenticationCheckNames.has(check.name))
+	const authenticationIncomplete = authenticationChecks.length > 0 && !authenticationChecks.some((check) => check.status === 'OK')
+	const runtimeConfigurationIncomplete = checks.some((check) => check.name === 'runtime_configuration' && check.status !== 'OK')
+	const setupIncomplete = authenticationIncomplete || runtimeConfigurationIncomplete
 	return setupIncomplete ? 'INCOMPLETE' : operationalStatus
 }
 
@@ -5030,6 +5237,23 @@ function plural(count: number, singular: string, pluralForm = `${singular}s`) {
   return count === 1 ? singular : pluralForm
 }
 
+// Prepare release can stay silent for tens of minutes while Docker builds the
+// runtime image, so the panel reports how long the stage has been quiet.
+const hermesUpdateQuietSeconds = 300
+
+function elapsedSeconds(timestamp: string, now: number) {
+	const value = new Date(timestamp).getTime()
+	if (Number.isNaN(value)) return -1
+	return Math.max(0, Math.floor((now - value) / 1000))
+}
+
+function durationLabel(seconds: number) {
+	if (seconds < 60) return `${seconds}s`
+	const minutes = Math.floor(seconds / 60)
+	if (minutes < 60) return `${minutes}m`
+	return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
+}
+
 function relativeTime(timestamp: string) {
   const seconds = Math.max(0, Math.floor((Date.now() - new Date(timestamp).getTime()) / 1000))
   if (seconds < 60) return `${seconds}s ago`
@@ -5117,7 +5341,9 @@ function validObservationTimestamp(timestamp?: string) {
 
 function observationCheckLabel(name: string) {
 	if (name === 'codex_setup') return 'Codex setup'
+	if (name === 'provider_setup') return 'Provider setup'
   if (name === 'codex_auth') return 'Codex authentication'
+	if (name === 'provider_auth') return 'Grok authentication'
   if (name === 'runtime_configuration') return 'Hermes setup'
   return name.split('_').map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(' ')
 }

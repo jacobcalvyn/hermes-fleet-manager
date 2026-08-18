@@ -648,6 +648,12 @@ func (s *Server) queuePolicyTarget(ctx context.Context, rolloutID string, target
 		target.Status, target.Detail = domain.PolicyTargetBlocked, "Host Agent is unavailable"
 		return
 	}
+	if host.AgentVersion != agentVersion {
+		detail := "Host Agent must be upgraded to " + agentVersion
+		_ = s.store.UpdatePolicyRolloutTarget(ctx, rolloutID, target.InstanceID, "", domain.PolicyTargetBlocked, detail, now)
+		target.Status, target.Detail = domain.PolicyTargetBlocked, detail
+		return
+	}
 	status, err := s.pinnedPolicyUpdateStatus(ctx, instance, metadata)
 	if err == nil && !status.Available && status.OfficialStatus == "CURRENT" {
 		_ = s.store.UpdatePolicyRolloutTarget(ctx, rolloutID, target.InstanceID, "", domain.PolicyTargetSucceeded, "Already on frozen Hermes "+metadata.TargetVersion, now)
@@ -891,8 +897,7 @@ func (s *Server) pinnedPolicyUpdateStatus(ctx context.Context, instance domain.I
 	current := hermesUpdateResponse{CurrentImage: instance.Image, LatestRelease: &release, TargetVersion: release.Version,
 		TargetSource: release.Commit, TargetImage: release.Image, OfficialStatus: "UPDATE_AVAILABLE"}
 	targetGeneration := instance.UpdatedAt.UTC().Format(time.RFC3339Nano)
-	if instance.Observation != nil &&
-		(instance.Observation.TargetGeneration == "" || instance.Observation.TargetGeneration == targetGeneration) {
+	if instance.Observation != nil && instance.Observation.TargetGeneration == targetGeneration {
 		current.CurrentVersion, current.CurrentSource = instance.Observation.HermesVersion, instance.Observation.HermesSource
 	}
 	if current.CurrentVersion == "" || !hermesVersionPattern.MatchString(current.CurrentVersion) {

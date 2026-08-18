@@ -1,4 +1,6 @@
-FROM node:22-bookworm-slim
+# Pin by digest so Hermes version bumps reuse the apt/uv layers. Bump this
+# digest only when the OS/toolchain base must change.
+FROM node:22-bookworm-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436
 
 ARG HERMES_REPO=https://github.com/NousResearch/hermes-agent.git
 ARG HERMES_REF=f80f453ae0679347e38abc917c7f94f717bf96c5
@@ -55,8 +57,15 @@ RUN apt-get -o APT::Sandbox::User=root update \
         ripgrep \
         xfonts-scalable \
         xvfb \
-    && python3 -m pip install --break-system-packages --no-cache-dir uv \
     && rm -rf /var/lib/apt/lists/*
+
+# Keep uv off the apt layer so a truncated wheel does not rebuild apt.
+RUN n=0 \
+    && until python3 -m pip install --break-system-packages --no-cache-dir uv; do \
+         n=$((n + 1)); \
+         if [ "$n" -ge 3 ]; then exit 1; fi; \
+         sleep 5; \
+       done
 
 ENV HERMES_HOME=/data \
     API_SERVER_ENABLED=true \
@@ -66,10 +75,19 @@ ENV HERMES_HOME=/data \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     PATH=/opt/hermes-agent/.venv/bin:$PATH
 
-RUN git clone --depth 1 "${HERMES_REPO}" /opt/hermes-agent \
-    && cd /opt/hermes-agent \
-    && git fetch --depth 1 origin "${HERMES_REF}" \
-    && git checkout "${HERMES_REF}"
+# Ambil hanya commit rilis yang di-pin. Clone default branch menarik tip main
+# yang jauh lebih baru dan sering putus di tengah transfer TLS.
+RUN git init /opt/hermes-agent \
+    && git -C /opt/hermes-agent config http.version HTTP/1.1 \
+    && git -C /opt/hermes-agent remote add origin "${HERMES_REPO}" \
+    && n=0 \
+    && until GIT_TERMINAL_PROMPT=0 git -C /opt/hermes-agent fetch --depth 1 origin "${HERMES_REF}"; do \
+         n=$((n + 1)); \
+         if [ "$n" -ge 3 ]; then exit 1; fi; \
+         sleep 5; \
+       done \
+    && git -C /opt/hermes-agent checkout --detach FETCH_HEAD \
+    && test "$(git -C /opt/hermes-agent rev-parse HEAD)" = "${HERMES_REF}"
 
 RUN cd /opt/hermes-agent \
     && uv venv .venv --python python3 \

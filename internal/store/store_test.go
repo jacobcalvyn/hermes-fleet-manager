@@ -665,6 +665,86 @@ UPDATE jobs SET lease_expires_at=? WHERE id=?`, time.Now().UTC().Add(-time.Minut
 	}
 }
 
+func TestExpiredHermesUpdateLeaseRestoresOriginalStatus(t *testing.T) {
+	ctx, dataStore, host, instance := newFleetFixture(t, "hermes-lease")
+	now := time.Now().UTC()
+	completeTestProvisionForAction(t, ctx, dataStore, "hermes-lease", instance.ID, now)
+	currentImage := "local/hermes-fleet-runtime:0.18.2"
+	targetImage := "local/hermes-fleet-runtime:0.19.0"
+	currentImageID := "sha256:" + strings.Repeat("a", 64)
+	if _, err := dataStore.db.ExecContext(ctx, `
+UPDATE instances SET image=?, image_id=? WHERE id=?`, currentImage, currentImageID, instance.ID); err != nil {
+		t.Fatal(err)
+	}
+	job := queueTestHermesUpdate(t, ctx, dataStore, host, instance, currentImage, currentImageID, targetImage, domain.InstanceStopped)
+	var claimed *domain.Job
+	for attempt := 1; attempt <= jobLeaseMaxClaims; attempt++ {
+		if claimed != nil {
+			if _, err := dataStore.db.ExecContext(ctx, `
+UPDATE jobs SET lease_expires_at=? WHERE id=?`, time.Now().UTC().Add(-time.Minute), claimed.ID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var err error
+		claimed, err = dataStore.ClaimJob(ctx, host.ID, time.Minute)
+		if err != nil || claimed == nil || claimed.ID != job.ID {
+			t.Fatalf("ClaimJob() attempt=%d job=%v error=%v", attempt, claimed, err)
+		}
+	}
+	if _, err := dataStore.db.ExecContext(ctx, `
+UPDATE jobs SET lease_expires_at=? WHERE id=?`, time.Now().UTC().Add(-time.Minute), claimed.ID); err != nil {
+		t.Fatal(err)
+	}
+	next, err := dataStore.ClaimJob(ctx, host.ID, time.Minute)
+	if err != nil || next != nil {
+		t.Fatalf("ClaimJob() after Hermes update retry budget job=%v error=%v", next, err)
+	}
+	stored, err := dataStore.GetInstance(ctx, instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != domain.InstanceStopped || !strings.Contains(stored.LastError, "manual retry is required") {
+		t.Fatalf("exhausted Hermes update instance=%+v", stored)
+	}
+}
+
+func TestFailedHermesUpdateCompletionPersistsVerifiedTargetImage(t *testing.T) {
+	ctx, dataStore, host, instance := newFleetFixture(t, "hermes-image")
+	now := time.Now().UTC()
+	completeTestProvisionForAction(t, ctx, dataStore, "hermes-image", instance.ID, now)
+	currentImage := "local/hermes-fleet-runtime:0.18.2"
+	targetImage := "local/hermes-fleet-runtime:0.19.0"
+	currentImageID := "sha256:" + strings.Repeat("a", 64)
+	targetImageID := "sha256:" + strings.Repeat("b", 64)
+	if _, err := dataStore.db.ExecContext(ctx, `
+UPDATE instances SET image=?, image_id=? WHERE id=?`, currentImage, currentImageID, instance.ID); err != nil {
+		t.Fatal(err)
+	}
+	job := queueTestHermesUpdate(t, ctx, dataStore, host, instance, currentImage, currentImageID, targetImage, domain.InstanceRunning)
+	claimed, err := dataStore.ClaimJob(ctx, host.ID, time.Minute)
+	if err != nil || claimed == nil || claimed.ID != job.ID {
+		t.Fatalf("ClaimJob() job=%v error=%v", claimed, err)
+	}
+	if err := dataStore.AcknowledgeJob(ctx, host.ID, claimed.ID, claimed.LeaseToken, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	result := domain.JobResult{
+		Success: false, Error: "Hermes update installed but the job lease was lost before restoring runtime state",
+		RecoveryPointID: "recovery-" + strings.Repeat("c", 32),
+		ImageID:         targetImageID, InstanceStatus: domain.InstanceStopped,
+	}
+	if err := dataStore.CompleteJob(ctx, host.ID, claimed.ID, claimed.LeaseToken, result, nil); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := dataStore.GetInstance(ctx, instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != domain.InstanceStopped || stored.Image != targetImage || stored.ImageID != targetImageID {
+		t.Fatalf("failed Hermes update did not persist the installed image: %+v", stored)
+	}
+}
+
 func TestProvisionResultCannotRebindManagedIdentity(t *testing.T) {
 	ctx, dataStore, host, instance := newFleetFixture(t, "identity")
 	claimed, err := dataStore.ClaimJob(ctx, host.ID, time.Minute)
@@ -705,13 +785,16 @@ func TestCodexAuthProgressIsLeaseFencedAndDoesNotMutateInstanceLifecycle(t *test
 	}
 	now := time.Now().UTC()
 	operation := domain.Operation{ID: "operation-auth-session", InstanceID: instance.ID, Type: "CODEX_AUTH", Status: domain.OperationPending, Summary: "Authenticate Codex", CreatedAt: now, UpdatedAt: now}
-	job := domain.Job{ID: "job-auth-session", OperationID: operation.ID, HostID: host.ID, InstanceID: instance.ID, Type: "instance.auth.codex", Status: domain.JobPending, Payload: json.RawMessage(`{}`), CreatedAt: now, UpdatedAt: now}
+	job := domain.Job{ID: "job-auth-session", OperationID: operation.ID, HostID: host.ID, InstanceID: instance.ID, Type: "instance.auth.codex", Status: domain.JobPending, Payload: json.RawMessage(`{"provider":"openai-codex"}`), CreatedAt: now, UpdatedAt: now}
 	if err := dataStore.QueueCodexAuth(ctx, operation, job); err != nil {
 		t.Fatal(err)
 	}
-	active, err := dataStore.GetActiveCodexAuthSession(ctx, instance.ID)
-	if err != nil || active.OperationID != operation.ID {
+	active, err := dataStore.GetActiveCodexAuthSession(ctx, instance.ID, "openai-codex")
+	if err != nil || active.OperationID != operation.ID || active.Provider != "openai-codex" {
 		t.Fatalf("GetActiveCodexAuthSession() session=%+v error=%v", active, err)
+	}
+	if _, err := dataStore.GetActiveCodexAuthSession(ctx, instance.ID, "xai-oauth"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Grok authentication resumed Codex session: error=%v", err)
 	}
 	if err := dataStore.QueueCodexAuth(ctx, domain.Operation{ID: "operation-duplicate", InstanceID: instance.ID}, domain.Job{ID: "job-duplicate", InstanceID: instance.ID}); !errors.Is(err, ErrInstanceBusy) {
 		t.Fatalf("duplicate QueueCodexAuth() error=%v, want ErrInstanceBusy", err)
@@ -1427,6 +1510,10 @@ func TestObservationReportsAreHostGenerationAndTimeFenced(t *testing.T) {
 	current := domain.InstanceObservation{
 		InstanceID: instance.ID, TargetGeneration: target.Generation, HermesVersion: "0.18.2", HermesSource: "7acaff5ef2bc", Status: domain.ObservationInSync,
 		ModelCatalog: []string{"gpt-5.6-sol", "gpt-5.6-terra"}, RecommendedModel: "gpt-5.6-sol",
+		ProviderModelCatalogs: map[string]domain.ProviderModelCatalog{
+			"openai-codex": {Models: []string{"gpt-5.6-sol", "gpt-5.6-terra"}, Recommended: "gpt-5.6-sol"},
+			"xai-oauth":    {Models: []string{"grok-4.6"}, Recommended: "grok-4.6"},
+		},
 		Summary: "Runtime matches desired state", Checks: []domain.ObservationCheck{{Name: "runtime", Status: domain.ObservationCheckOK, Detail: "Both services are running"}},
 		ObservedAt: observedAt,
 	}
@@ -1454,8 +1541,16 @@ func TestObservationReportsAreHostGenerationAndTimeFenced(t *testing.T) {
 		t.Fatalf("ListInstances() instances=%+v error=%v", stored, err)
 	}
 	if stored[0].Observation.Status != domain.ObservationInSync || stored[0].Observation.HermesVersion != "0.18.2" || stored[0].Observation.HermesSource != "7acaff5ef2bc" ||
-		len(stored[0].Observation.ModelCatalog) != 2 || stored[0].Observation.RecommendedModel != "gpt-5.6-sol" {
+		len(stored[0].Observation.ModelCatalog) != 2 || stored[0].Observation.RecommendedModel != "gpt-5.6-sol" ||
+		len(stored[0].Observation.ProviderModelCatalogs["xai-oauth"].Models) != 1 {
 		t.Fatalf("older host observation replaced the current observation: %+v", stored[0].Observation)
+	}
+	grokModels, grokRecommended, err := dataStore.GetInstanceProviderModelCatalog(ctx, instance.ID, "xai-oauth")
+	if err != nil || len(grokModels) != 1 || grokModels[0] != "grok-4.6" || grokRecommended != "grok-4.6" {
+		t.Fatalf("GetInstanceProviderModelCatalog(xai-oauth)=%v %q error=%v", grokModels, grokRecommended, err)
+	}
+	if models, recommended, err := dataStore.GetInstanceProviderModelCatalog(ctx, instance.ID, "missing-oauth"); !errors.Is(err, ErrNotFound) || len(models) != 0 || recommended != "" {
+		t.Fatalf("missing provider catalog leaked active catalog: models=%v recommended=%q error=%v", models, recommended, err)
 	}
 	equalReplay := current
 	equalReplay.Status = domain.ObservationDegraded
@@ -2346,6 +2441,53 @@ func completeTestProvisionForAction(t *testing.T, ctx context.Context, dataStore
 		domain.InstanceStopped, now, instanceID); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func queueTestHermesUpdate(
+	t *testing.T,
+	ctx context.Context,
+	dataStore *Store,
+	host domain.Host,
+	instance domain.Instance,
+	currentImage, currentImageID, targetImage, originalStatus string,
+) domain.Job {
+	t.Helper()
+	now := time.Now().UTC()
+	backupID := "recovery-" + strings.Repeat("c", 32)
+	payload, err := json.Marshal(domain.HermesUpdatePayload{
+		OriginalStatus: originalStatus,
+		Backup: domain.RecoveryPointPayload{
+			RecoveryPointID: backupID, InstanceID: instance.ID, Name: instance.Name,
+			Image: currentImage, ImageID: currentImageID,
+		},
+		Upgrade: domain.HermesUpgradePayload{
+			InstanceID: instance.ID, Name: instance.Name,
+			CurrentImage: currentImage, CurrentImageID: currentImageID,
+			TargetImage: targetImage, TargetVersion: "0.19.0",
+			RecoveryPointID: backupID, ProjectName: "hermes-fleet-" + instance.Name,
+			DataVolume: "hermes-fleet-" + instance.Name + "-data", ManagedPath: "/managed/" + instance.Name,
+			Rollback: domain.RecoveryRestorePayload{
+				RecoveryPointID: backupID, InstanceID: instance.ID, Name: instance.Name,
+				Image: currentImage, ImageID: currentImageID, RequireImageID: true,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := domain.Operation{
+		ID: "operation-hermes-" + instance.ID, InstanceID: instance.ID, Type: "UPGRADE_HERMES",
+		Status: domain.OperationPending, Summary: "Update Hermes", CreatedAt: now, UpdatedAt: now,
+		Metadata: json.RawMessage(`{"original_status":"` + originalStatus + `","update_kind":"VERSION_UPDATE"}`),
+	}
+	job := domain.Job{
+		ID: "job-hermes-" + instance.ID, OperationID: operation.ID, HostID: host.ID, InstanceID: instance.ID,
+		Type: "instance.hermes.update", Status: domain.JobPending, Payload: payload, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := dataStore.QueueAction(ctx, domain.InstanceStopped, domain.InstanceUpdating, operation, job); err != nil {
+		t.Fatal(err)
+	}
+	return job
 }
 
 func successfulProvisionResult(instance domain.Instance) domain.JobResult {

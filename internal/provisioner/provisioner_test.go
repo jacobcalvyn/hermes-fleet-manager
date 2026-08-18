@@ -436,7 +436,9 @@ func TestPrepareHermesImageBuildsOnlyWhenCanonicalTagIsAbsent(t *testing.T) {
 		switch {
 		case args[0] == "image" && args[1] == "inspect":
 			inspectCalls++
-			if inspectCalls == 1 {
+			// Pemeriksaan pertama berjalan sebelum kunci build, yang kedua di
+			// dalamnya; keduanya harus gagal sebelum Fleet membangun image.
+			if inspectCalls <= 2 {
 				return "No such image", errors.New("not found")
 			}
 			return imageID + "\n" + payload.TargetVersion + "\n" + payload.TargetSource + "\n" + runtimeassets.BuildID() + "\n", nil
@@ -444,6 +446,11 @@ func TestPrepareHermesImageBuildsOnlyWhenCanonicalTagIsAbsent(t *testing.T) {
 			return "", nil
 		case args[0] == "build":
 			buildCalls++
+			for _, arg := range args[1:] {
+				if arg == "--pull" || arg == "--pull=true" {
+					t.Fatalf("prepareHermesImage() pulled a moving base tag: %v", args)
+				}
+			}
 			return "built", nil
 		default:
 			return "", fmt.Errorf("unexpected Docker command: %v", args)
@@ -454,8 +461,55 @@ func TestPrepareHermesImageBuildsOnlyWhenCanonicalTagIsAbsent(t *testing.T) {
 	if err != nil || actualImageID != imageID {
 		t.Fatalf("prepareHermesImage() imageID=%q error=%v", actualImageID, err)
 	}
-	if buildCalls != 1 || inspectCalls != 2 {
+	if buildCalls != 1 || inspectCalls != 3 {
 		t.Fatalf("prepareHermesImage() inspectCalls=%d buildCalls=%d", inspectCalls, buildCalls)
+	}
+}
+
+func TestPrepareHermesImageSkipsTheBuildLockWhenTheReleaseIsAlreadyVerified(t *testing.T) {
+	p, err := New(t.TempDir(), "docker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetSource := "8bcdef6ef2bcbaa22bd23b72efe60906123a4f66"
+	payload := domain.HermesUpgradePayload{
+		TargetVersion: "0.19.0",
+		TargetSource:  targetSource,
+		TargetImage:   runtimeassets.ImageReference("0.19.0", targetSource),
+	}
+	imageID := "sha256:" + strings.Repeat("c", 64)
+	inspectCalls := 0
+	p.dockerRun = func(_ context.Context, args ...string) (string, error) {
+		switch {
+		case args[0] == "image" && args[1] == "inspect":
+			inspectCalls++
+			return imageID + "\n" + payload.TargetVersion + "\n" + payload.TargetSource + "\n" + runtimeassets.BuildID() + "\n", nil
+		default:
+			return "", fmt.Errorf("unexpected Docker command: %v", args)
+		}
+	}
+
+	// Kunci build ditahan seolah instance lain sedang membangun rilis berbeda.
+	p.imageBuildMu.Lock()
+	defer p.imageBuildMu.Unlock()
+
+	done := make(chan struct{})
+	var actualImageID string
+	var prepareErr error
+	go func() {
+		actualImageID, prepareErr = p.prepareHermesImage(context.Background(), payload)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("prepareHermesImage() queued behind an unrelated runtime build")
+	}
+	if prepareErr != nil || actualImageID != imageID {
+		t.Fatalf("prepareHermesImage() imageID=%q error=%v", actualImageID, prepareErr)
+	}
+	if inspectCalls != 1 {
+		t.Fatalf("prepareHermesImage() inspectCalls=%d, want a single verification", inspectCalls)
 	}
 }
 
@@ -472,7 +526,7 @@ func TestProvisionPreparesSelectedHermesReleaseOnDemand(t *testing.T) {
 		switch {
 		case args[0] == "image" && args[1] == "inspect":
 			inspectCalls++
-			if inspectCalls == 1 {
+			if inspectCalls <= 2 {
 				return "not found", errors.New("not found")
 			}
 			return imageID + "\n0.19.0\n" + source + "\n" + runtimeassets.BuildID() + "\n", nil
@@ -494,7 +548,7 @@ func TestProvisionPreparesSelectedHermesReleaseOnDemand(t *testing.T) {
 	if result.Success || !strings.Contains(result.Error, "Docker Compose provisioning failed") {
 		t.Fatalf("provision() result=%+v", result)
 	}
-	if buildCalls != 1 || inspectCalls != 2 {
+	if buildCalls != 1 || inspectCalls != 3 {
 		t.Fatalf("on-demand preparation inspectCalls=%d buildCalls=%d", inspectCalls, buildCalls)
 	}
 }
@@ -607,6 +661,120 @@ func TestUpgradeHermesVerifiesPinnedTargetAndReturnsInstanceStopped(t *testing.T
 	manifest, err := os.ReadFile(filepath.Join(managedPath, "compose.yaml"))
 	if err != nil || !strings.Contains(string(manifest), `image: "`+targetImage+`"`) {
 		t.Fatalf("updated manifest error=%v contents=%s", err, manifest)
+	}
+}
+
+func TestUpgradeHermesContinuesWhenComposeAlreadyUsesTarget(t *testing.T) {
+	root := t.TempDir()
+	managedPath := filepath.Join(root, "fleet-test-01-00000000")
+	if err := os.MkdirAll(filepath.Join(managedPath, "workspace"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(root, "rollback.tar")
+	artifactData := []byte("verified rollback artifact")
+	if err := os.WriteFile(artifact, artifactData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(artifactData)
+	currentImageID := "sha256:" + strings.Repeat("a", 64)
+	targetImageID := "sha256:" + strings.Repeat("b", 64)
+	targetImage := "local/hermes-fleet-runtime:0.19.0"
+	targetSource := "8bcdef6ef2bcbaa22bd23b72efe60906123a4f66"
+	createdAt := time.Now().UTC()
+	payload := domain.HermesUpgradePayload{
+		InstanceID: "00000000-0000-4000-8000-000000000001", Name: "fleet-test-01",
+		CurrentImage: "local/hermes-fleet-runtime:0.18.2", CurrentImageID: currentImageID,
+		TargetImage: targetImage, TargetVersion: "0.19.0", TargetSource: targetSource,
+		RecoveryPointID: "recovery-" + strings.Repeat("c", 32), Provider: "openai-codex",
+		ProjectName: "hermes-fleet-fleet-test-01-00000000", DataVolume: "hermes-fleet-fleet-test-01-00000000-data",
+		ManagedPath: managedPath, APIPort: 28650, DashboardPort: 29130,
+	}
+	payload.Rollback = domain.RecoveryRestorePayload{
+		RecoveryPointID: payload.RecoveryPointID, InstanceID: payload.InstanceID, Name: payload.Name,
+		Image: payload.CurrentImage, ImageID: currentImageID, RequireImageID: true, Provider: payload.Provider,
+		ProjectName: payload.ProjectName, DataVolume: payload.DataVolume, ManagedPath: managedPath,
+		AgentVersion: "0.10.0", CreatedAt: createdAt, RecoverySHA256: hex.EncodeToString(digest[:]),
+		RecoverySizeBytes: int64(len(artifactData)), MaxBytes: 1 << 20,
+	}
+	targetManifest := renderCompose(domain.ProvisionPayload{
+		InstanceID: payload.InstanceID, Name: payload.Name, Image: targetImage, Provider: payload.Provider,
+		APIPort: payload.APIPort, DashboardPort: payload.DashboardPort,
+	}, payload.ProjectName, payload.DataVolume)
+	for _, name := range []string{".env"} {
+		if err := os.WriteFile(filepath.Join(managedPath, name), []byte("current\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(managedPath, "compose.yaml"), []byte(targetManifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	provisioner, err := New(root, "docker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provisioner.httpClient = &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("ok"))}, nil
+	})}
+	running, upgraded := false, false
+	var commands [][]string
+	provisioner.dockerRun = func(_ context.Context, args ...string) (string, error) {
+		commands = append(commands, append([]string(nil), args...))
+		switch args[0] {
+		case "compose":
+			if argumentsContain(args, "config") && argumentsContain(args, "--images") {
+				return payload.TargetImage + "\n" + payload.TargetImage + "\n", nil
+			}
+			if argumentsContain(args, "up") {
+				upgraded, running = true, true
+				return "", nil
+			}
+			if argumentsContain(args, "stop") {
+				running = false
+				return "", nil
+			}
+		case "ps":
+			return "aaaaaaaaaaaa\nbbbbbbbbbbbb\n", nil
+		case "inspect":
+			status := "exited"
+			if running {
+				status = "running"
+			}
+			imageID := currentImageID
+			if upgraded {
+				imageID = targetImageID
+			}
+			containers := []map[string]any{
+				upgradeTestContainer("aaaaaaaaaaaa", "hermes", imageID, status, payload),
+				upgradeTestContainer("bbbbbbbbbbbb", "dashboard", imageID, status, payload),
+			}
+			encoded, marshalErr := json.Marshal(containers)
+			return string(encoded), marshalErr
+		case "volume":
+			return payload.ProjectName + "\n", nil
+		case "image":
+			if args[len(args)-1] == currentImageID {
+				return currentImageID + "\n", nil
+			}
+			if args[len(args)-1] == payload.CurrentImage {
+				return currentImageID + "\n", nil
+			}
+			if args[len(args)-1] == targetImage {
+				return targetImageID + "\n" + payload.TargetVersion + "\n" + payload.TargetSource + "\n" + runtimeassets.BuildID() + "\n", nil
+			}
+		}
+		return "", fmt.Errorf("unexpected Docker command: %v", args)
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := provisioner.Execute(context.Background(), domain.Job{Type: "instance.hermes.upgrade", Payload: encoded, InputArtifact: artifact})
+	if !result.Success || result.ImageID != targetImageID || result.InstanceStatus != domain.InstanceStopped {
+		t.Fatalf("partial Hermes update result=%+v", result)
+	}
+	if running || !upgraded || !hasComposeAction(commands, "stop") {
+		t.Fatalf("partial Hermes update did not recreate the target runtime: commands=%v", commands)
 	}
 }
 

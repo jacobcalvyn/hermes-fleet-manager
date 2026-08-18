@@ -300,6 +300,12 @@ func TestValidateCreateInstance(t *testing.T) {
 		{name: "pending Codex setup", request: withCreateRequest(valid, func(request *createInstanceRequest) {
 			request.Model, request.Reasoning, request.ServiceTier = "", "", ""
 		})},
+		{name: "pending Grok setup", request: withCreateRequest(valid, func(request *createInstanceRequest) {
+			request.Provider, request.Model, request.Reasoning, request.ServiceTier = "xai-oauth", "", "", ""
+		})},
+		{name: "api-key provider cannot be created", request: withCreateRequest(valid, func(request *createInstanceRequest) {
+			request.Provider = "openrouter"
+		}), wantErr: true},
 		{name: "partial Codex setup", request: withCreateRequest(valid, func(request *createInstanceRequest) {
 			request.Model, request.Reasoning, request.ServiceTier = "", "medium", ""
 		}), wantErr: true},
@@ -369,6 +375,10 @@ func TestValidateJobProgressRejectsUntrustedDeviceFlowData(t *testing.T) {
 	if err := validateJobProgress("instance.auth.codex", valid, now); err != nil {
 		t.Fatalf("validateJobProgress(valid) error=%v", err)
 	}
+	grok := domain.JobProgress{Stage: "AWAITING_USER", VerificationURI: "https://auth.x.ai/oauth2/device?user_code=ABCD-EFGH", UserCode: "ABCD-EFGH"}
+	if err := validateJobProgress("instance.auth.codex", grok, now); err != nil {
+		t.Fatalf("validateJobProgress(grok) error=%v", err)
+	}
 	for name, progress := range map[string]domain.JobProgress{
 		"foreign URL":   {Stage: "AWAITING_USER", VerificationURI: "https://attacker.invalid/device", UserCode: "ABCD-EFGH", ExpiresAt: now.Add(15 * time.Minute)},
 		"unsafe code":   {Stage: "AWAITING_USER", VerificationURI: codexDeviceURL, UserCode: "<script>", ExpiresAt: now.Add(15 * time.Minute)},
@@ -419,12 +429,23 @@ func TestJSONDecodersAcceptBodiesAtOneMiBBoundary(t *testing.T) {
 	}
 }
 
-func TestCreateInstanceLeavesCodexConfigurationPending(t *testing.T) {
+func TestCreateInstanceLeavesOAuthConfigurationPending(t *testing.T) {
 	environment := newAPITestEnvironment(t)
 	hostID, _ := environment.enrollHost(t)
 	response := environment.request(t, http.MethodPost, "/api/v1/instances", map[string]any{
 		"name": "fleet-defaults-01", "host_id": hostID,
 		"provider": "openrouter", "model": "untrusted-model", "reasoning": "high", "service_tier": "priority",
+	}, environment.adminToken, nil)
+	if response.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(response.Body)
+		response.Body.Close()
+		t.Fatalf("create instance with API-key provider status=%d body=%s", response.StatusCode, body)
+	}
+	response.Body.Close()
+
+	response = environment.request(t, http.MethodPost, "/api/v1/instances", map[string]any{
+		"name": "fleet-defaults-01", "host_id": hostID,
+		"model": "untrusted-model", "reasoning": "high", "service_tier": "priority",
 	}, environment.adminToken, nil)
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusAccepted {
@@ -782,6 +803,12 @@ func TestCodexConfigurationFailureRecordsManualRecoveryStateWithoutPersistingSet
 		"observations": []domain.InstanceObservation{report},
 	}, hostToken, map[string]string{"X-Fleet-Host-ID": hostID})
 	assertStatus(t, response, http.StatusNoContent)
+
+	response = environment.request(t, http.MethodPut, "/api/v1/instances/"+instance.ID+"/codex-configuration", map[string]string{
+		"provider": "xai-oauth", "model": "grok-4.6", "reasoning": "minimal", "service_tier": "normal",
+	}, environment.adminToken, nil)
+	assertStatus(t, response, http.StatusBadRequest)
+	response.Body.Close()
 
 	response = environment.request(t, http.MethodPut, "/api/v1/instances/"+instance.ID+"/codex-configuration", map[string]string{
 		"model": "gpt-5.6-sol", "reasoning": "medium", "service_tier": "normal",
@@ -2074,6 +2101,7 @@ func TestHermesUpdateStatusRejectsUnavailableFeedOrReusedTarget(t *testing.T) {
 		Image: "local/hermes-fleet-runtime:0.18.2", Status: domain.InstanceStopped,
 		Observation: &domain.InstanceObservation{
 			HermesVersion: "0.18.2", HermesSource: "7acaff5ef2bcbaa22bd23b72efe60906123a4f55",
+			TargetGeneration: time.Time{}.UTC().Format(time.RFC3339Nano),
 		},
 	}
 	server := &Server{config: Config{}}
@@ -2205,7 +2233,9 @@ func TestHermesOfficialUpdateStatusUsesReleaseFeed(t *testing.T) {
 	}}
 	instance := domain.Instance{
 		Image: "local/hermes-fleet-runtime:0.18.2", Status: domain.InstanceRunning,
-		Observation: &domain.InstanceObservation{HermesVersion: "0.18.2"},
+		Observation: &domain.InstanceObservation{
+			HermesVersion: "0.18.2", TargetGeneration: time.Time{}.UTC().Format(time.RFC3339Nano),
+		},
 	}
 	status, err := server.hermesUpdateStatus(context.Background(), instance)
 	if err != nil || status.OfficialStatus != "UPDATE_AVAILABLE" || status.LatestRelease == nil || status.LatestRelease.Version != "0.19.0" {
@@ -2259,6 +2289,32 @@ func TestHermesUpdateStatusIgnoresAnObservationForAnOlderGeneration(t *testing.T
 	}
 	if status.CurrentVersion != latest.Version || status.OfficialStatus != "CURRENT" || status.Available {
 		t.Fatalf("stale observation overrode the installed release: status=%+v", status)
+	}
+}
+
+func TestHermesUpdateStatusIgnoresAnObservationWithoutGeneration(t *testing.T) {
+	catalog := testHermesCatalog()
+	latest := catalog.Releases[0]
+	previous := catalog.Releases[1]
+	server := &Server{config: Config{
+		HermesCatalog:       catalog,
+		HermesReleaseSource: staticReleaseSource{catalog: catalog},
+	}}
+	instance := domain.Instance{
+		Image:  latest.Image,
+		Status: domain.InstanceRunning,
+		Observation: &domain.InstanceObservation{
+			HermesVersion: previous.Version,
+			HermesSource:  previous.Commit,
+		},
+	}
+
+	status, err := server.hermesUpdateStatus(context.Background(), instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.CurrentVersion != latest.Version || status.OfficialStatus != "CURRENT" || status.Available {
+		t.Fatalf("unfenced observation overrode the installed release: status=%+v", status)
 	}
 }
 
@@ -2316,6 +2372,7 @@ func TestHermesUpdateStatusSeparatesRuntimeWrapperMaintenance(t *testing.T) {
 	}
 
 	instance.Image = oldWrapperImage
+	instance.Observation.TargetGeneration = instance.UpdatedAt.UTC().Format(time.RFC3339Nano)
 	instance.Observation.HermesSource = catalog.Releases[1].Commit
 	status, err = server.hermesUpdateStatus(context.Background(), instance)
 	if err != nil || status.OfficialStatus != "CURRENT" ||
@@ -2335,6 +2392,32 @@ func TestHermesUpdateStatusSeparatesRuntimeWrapperMaintenance(t *testing.T) {
 	if err != nil || status.OfficialStatus != "UNKNOWN" ||
 		status.UpdateKind != hermesUpdateKindNone || status.Available || status.Eligible {
 		t.Fatalf("unqualified image identity was trusted: status=%+v err=%v", status, err)
+	}
+}
+
+func TestRuntimeRefreshPreflightDoesNotBlockOlderHermesVersion(t *testing.T) {
+	catalog := testHermesCatalog()
+	older := catalog.Releases[1]
+	staleWrapper := older.Image + "-111111111111"
+	catalog.Releases[1].Image = older.Image + "-222222222222"
+	server := &Server{config: Config{
+		HermesCatalog: catalog, HermesReleaseSource: staticReleaseSource{catalog: catalog},
+	}}
+	instance := domain.Instance{
+		Image: staleWrapper, ImageID: "sha256:" + strings.Repeat("a", 64),
+		Status: domain.InstanceRunning,
+		Observation: &domain.InstanceObservation{
+			HermesVersion: older.Version, HermesSource: older.Commit,
+		},
+	}
+	status, err := server.hermesUpdateStatus(context.Background(), instance)
+	if err != nil || status.OfficialStatus != "UPDATE_AVAILABLE" ||
+		status.UpdateKind != hermesUpdateKindVersionUpdate || !status.Available {
+		t.Fatalf("older Hermes status=%+v err=%v", status, err)
+	}
+	refreshRequired, err := server.runtimeRefreshRequiredForInstance(context.Background(), instance)
+	if err != nil || refreshRequired {
+		t.Fatalf("version update must not block provider configuration: required=%v err=%v", refreshRequired, err)
 	}
 }
 
@@ -2709,13 +2792,19 @@ func TestCodexAuthenticationFlowIsFleetManagedAndLeaseFenced(t *testing.T) {
 	var session domain.CodexAuthSession
 	decodeResponse(t, response, &session)
 	response.Body.Close()
+	if session.Provider != "openai-codex" {
+		t.Fatalf("started auth provider=%q", session.Provider)
+	}
 	response = environment.request(t, http.MethodPost, "/api/v1/instances/"+instance.ID+"/codex-auth", map[string]any{}, environment.adminToken, nil)
 	var resumed domain.CodexAuthSession
 	decodeResponse(t, response, &resumed)
 	response.Body.Close()
-	if response.StatusCode != http.StatusAccepted || resumed.OperationID != session.OperationID {
+	if response.StatusCode != http.StatusAccepted || resumed.OperationID != session.OperationID || resumed.Provider != "openai-codex" {
 		t.Fatalf("duplicate auth did not resume active session: status=%d session=%+v", response.StatusCode, resumed)
 	}
+	response = environment.request(t, http.MethodPost, "/api/v1/instances/"+instance.ID+"/codex-auth", map[string]any{"provider": "xai-oauth"}, environment.adminToken, nil)
+	assertStatus(t, response, http.StatusConflict)
+	response.Body.Close()
 	authJob := environment.claimAndAcknowledge(t, hostID, hostToken)
 	if authJob.Type != "instance.auth.codex" {
 		t.Fatalf("auth job type=%q", authJob.Type)
@@ -2761,6 +2850,144 @@ func TestCodexAuthenticationFlowIsFleetManagedAndLeaseFenced(t *testing.T) {
 	stored := environment.overviewInstance(t, instance.ID)
 	if stored.Status != domain.InstanceRunning || stored.LastError != "" {
 		t.Fatalf("Codex auth changed instance lifecycle: %+v", stored)
+	}
+}
+
+func TestGrokOAuthInstanceUsesSharedProviderAuthJob(t *testing.T) {
+	environment := newAPITestEnvironment(t)
+	hostID, hostToken := environment.enrollHost(t)
+	create := createInstanceRequest{
+		Name: "fleet-grok-01", HostID: hostID, Image: "local/hermes-fleet-runtime:0.18.2",
+		Provider: "xai-oauth", APIPort: 58650, DashboardPort: 59130,
+	}
+	response := environment.request(t, http.MethodPost, "/api/v1/instances", create, environment.adminToken, nil)
+	if response.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(response.Body)
+		response.Body.Close()
+		t.Fatalf("create Grok instance status=%d body=%s", response.StatusCode, body)
+	}
+	var instance domain.Instance
+	decodeResponse(t, response, &instance)
+	response.Body.Close()
+	if instance.Provider != "xai-oauth" || instance.Model != "" {
+		t.Fatalf("created instance=%+v", instance)
+	}
+	job := environment.claimAndAcknowledge(t, hostID, hostToken)
+	shortID := strings.ReplaceAll(instance.ID, "-", "")[:8]
+	projectName := "hermes-fleet-" + instance.Name + "-" + shortID
+	response = environment.request(t, http.MethodPost, "/api/v1/agent/jobs/"+job.ID+"/complete", domain.JobResult{
+		Success: true, ProjectName: projectName, DataVolume: projectName + "-data",
+		ManagedPath: "/managed/" + instance.Name + "-" + shortID, ImageID: "sha256:" + strings.Repeat("a", 64),
+	}, hostToken, map[string]string{"X-Fleet-Host-ID": hostID, leaseTokenHeader: job.LeaseToken})
+	assertStatus(t, response, http.StatusNoContent)
+
+	response = environment.request(t, http.MethodPost, "/api/v1/instances/"+instance.ID+"/codex-auth", map[string]any{}, environment.adminToken, nil)
+	assertStatus(t, response, http.StatusAccepted)
+	authJob := environment.claimAndAcknowledge(t, hostID, hostToken)
+	var payload domain.CodexAuthPayload
+	if err := json.Unmarshal(authJob.Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if authJob.Type != "instance.auth.codex" || payload.Provider != "xai-oauth" {
+		t.Fatalf("Grok auth job=%+v payload=%+v", authJob, payload)
+	}
+	headers := map[string]string{"X-Fleet-Host-ID": hostID, leaseTokenHeader: authJob.LeaseToken}
+	progress := domain.JobProgress{
+		Stage: "AWAITING_USER", VerificationURI: "https://auth.x.ai/oauth2/device?user_code=WXYZ-1234",
+		UserCode: "WXYZ-1234",
+	}
+	response = environment.request(t, http.MethodPost, "/api/v1/agent/jobs/"+authJob.ID+"/progress", progress, hostToken, headers)
+	assertStatus(t, response, http.StatusNoContent)
+}
+
+func TestCodexInstanceCanAuthenticateAndActivateGrok(t *testing.T) {
+	environment := newAPITestEnvironment(t)
+	hostID, hostToken := environment.enrollHost(t)
+	create := createInstanceRequest{
+		Name: "fleet-multi-oauth-01", HostID: hostID, Image: "local/hermes-fleet-runtime:0.18.2",
+		Provider: "openai-codex", APIPort: 61650, DashboardPort: 62130,
+	}
+	response := environment.request(t, http.MethodPost, "/api/v1/instances", create, environment.adminToken, nil)
+	if response.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(response.Body)
+		response.Body.Close()
+		t.Fatalf("create instance status=%d body=%s", response.StatusCode, body)
+	}
+	var instance domain.Instance
+	decodeResponse(t, response, &instance)
+	response.Body.Close()
+	job := environment.claimAndAcknowledge(t, hostID, hostToken)
+	shortID := strings.ReplaceAll(instance.ID, "-", "")[:8]
+	projectName := "hermes-fleet-" + instance.Name + "-" + shortID
+	response = environment.request(t, http.MethodPost, "/api/v1/agent/jobs/"+job.ID+"/complete", domain.JobResult{
+		Success: true, ProjectName: projectName, DataVolume: projectName + "-data",
+		ManagedPath: "/managed/" + instance.Name + "-" + shortID, ImageID: "sha256:" + strings.Repeat("a", 64),
+	}, hostToken, map[string]string{"X-Fleet-Host-ID": hostID, leaseTokenHeader: job.LeaseToken})
+	assertStatus(t, response, http.StatusNoContent)
+
+	response = environment.request(t, http.MethodPost, "/api/v1/instances/"+instance.ID+"/codex-auth", map[string]any{
+		"provider": "xai-oauth",
+	}, environment.adminToken, nil)
+	assertStatus(t, response, http.StatusAccepted)
+	authJob := environment.claimAndAcknowledge(t, hostID, hostToken)
+	var authPayload domain.CodexAuthPayload
+	if err := json.Unmarshal(authJob.Payload, &authPayload); err != nil {
+		t.Fatal(err)
+	}
+	if authJob.Type != "instance.auth.codex" || authPayload.Provider != "xai-oauth" {
+		t.Fatalf("Grok auth on Codex instance job=%+v payload=%+v", authJob, authPayload)
+	}
+	headers := map[string]string{"X-Fleet-Host-ID": hostID, leaseTokenHeader: authJob.LeaseToken}
+	response = environment.request(t, http.MethodPost, "/api/v1/agent/jobs/"+authJob.ID+"/complete", domain.JobResult{Success: true}, hostToken, headers)
+	assertStatus(t, response, http.StatusNoContent)
+
+	targets, err := environment.dataStore.ListObservationTargets(context.Background(), hostID)
+	if err != nil || len(targets) != 1 {
+		t.Fatalf("observation targets=%+v error=%v", targets, err)
+	}
+	report := domain.InstanceObservation{
+		InstanceID: instance.ID, TargetGeneration: targets[0].Generation, Status: domain.ObservationDegraded,
+		Summary: "Grok configuration is required", ModelCatalog: []string{"gpt-5.6-sol"}, RecommendedModel: "gpt-5.6-sol",
+		ProviderModelCatalogs: map[string]domain.ProviderModelCatalog{
+			"openai-codex": {Models: []string{"gpt-5.6-sol"}, Recommended: "gpt-5.6-sol"},
+			"xai-oauth":    {Models: []string{"grok-4.6"}, Recommended: "grok-4.6"},
+		},
+		Checks: []domain.ObservationCheck{
+			{Name: "codex_auth", Status: domain.ObservationCheckOK, Detail: "Codex authentication is connected"},
+			{Name: "provider_auth", Status: domain.ObservationCheckOK, Detail: "Grok authentication is connected"},
+			{Name: "runtime_configuration", Status: domain.ObservationCheckDrift, Detail: "Choose a Grok model in Hermes Fleet"},
+		},
+		ObservedAt: time.Now().UTC(),
+	}
+	response = environment.request(t, http.MethodPost, "/api/v1/agent/observations", map[string]any{
+		"observations": []domain.InstanceObservation{report},
+	}, hostToken, map[string]string{"X-Fleet-Host-ID": hostID})
+	assertStatus(t, response, http.StatusNoContent)
+
+	response = environment.request(t, http.MethodPut, "/api/v1/instances/"+instance.ID+"/codex-configuration", map[string]string{
+		"provider": "xai-oauth", "model": "grok-4.6", "reasoning": "medium", "service_tier": "normal",
+	}, environment.adminToken, nil)
+	if response.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(response.Body)
+		response.Body.Close()
+		t.Fatalf("configure Grok on Codex instance status=%d body=%s", response.StatusCode, body)
+	}
+	response.Body.Close()
+	job = environment.claimAndAcknowledge(t, hostID, hostToken)
+	var payload domain.RuntimeSyncPayload
+	if err := json.Unmarshal(job.Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if job.Type != "instance.runtime.configure" || payload.Provider != "xai-oauth" || payload.Model != "grok-4.6" {
+		t.Fatalf("active provider switch job=%+v payload=%+v", job, payload)
+	}
+	response = environment.request(t, http.MethodPost, "/api/v1/agent/jobs/"+job.ID+"/complete", domain.JobResult{
+		Success: true, InstanceStatus: domain.InstanceRunning,
+	}, hostToken, map[string]string{"X-Fleet-Host-ID": hostID, leaseTokenHeader: job.LeaseToken})
+	assertStatus(t, response, http.StatusNoContent)
+	stored := environment.overviewInstance(t, instance.ID)
+	if stored.Provider != "xai-oauth" || stored.Model != "grok-4.6" || !stored.CodexConfigured {
+		t.Fatalf("active provider was not switched to Grok: %+v", stored)
 	}
 }
 

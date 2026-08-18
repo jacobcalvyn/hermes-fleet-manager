@@ -1091,7 +1091,8 @@ test('Cloudflare remote access is configured only through the Fleet web flow', a
 	const adminCard = cards.nth(0)
 	const instancesCard = cards.nth(1)
 	await adminCard.getByLabel('Tunnel token').fill(adminConnectorToken)
-	expect(await adminCard.getByLabel('Tunnel token').getAttribute('type')).toBe('text')
+	expect(await adminCard.getByLabel('Tunnel token').getAttribute('type')).toBe('password')
+	expect(await instancesCard.getByLabel('Cloudflare API token').getAttribute('type')).toBe('password')
 	await expect(adminCard.getByLabel('Tunnel token')).toHaveValue(adminConnectorToken)
 	expect(await adminCard.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true)
 	await adminCard.getByLabel('Public hostname').fill('admin.example.com')
@@ -1346,7 +1347,7 @@ test('Codex recommendation fills an untouched form but never overwrites a dirty 
   await page.goto('/')
   await navigateToInstances(page)
   await page.getByRole('button', { name: 'fleet-codex-sync' }).click()
-  await page.getByRole('button', { name: 'Codex', exact: true }).click()
+  await page.getByRole('button', { name: 'Provider', exact: true }).click()
   const model = page.getByLabel('Model')
   const reasoning = page.getByLabel('Reasoning')
   const serviceTier = page.getByLabel('Service tier')
@@ -1498,6 +1499,116 @@ test('Hosts summarizes readiness and opens an operational host detail drawer', a
   await opener.click()
   await drawer.getByRole('button', { name: new RegExp(instance.name) }).click()
   await expect(page.getByRole('heading', { name: instance.name, level: 1 })).toBeVisible()
+})
+
+test('Grok OAuth instances use the Provider tab and overview sign-in card', async ({ page }) => {
+  const instance = {
+    ...codexInstance(),
+    id: 'instance-grok',
+    name: 'fleet-grok-01',
+    provider: 'xai-oauth',
+    observation: {
+      instance_id: 'instance-grok',
+      hermes_version: '0.19.0',
+      model_catalog: ['grok-4.6'],
+      recommended_model: 'grok-4.6',
+      status: 'DEGRADED',
+      summary: 'Grok sign-in required',
+      received_at: now,
+	      checks: [
+	        { name: 'codex_auth', status: 'DRIFT', detail: 'Codex authentication is not connected' },
+	        { name: 'provider_auth', status: 'DRIFT', detail: 'Grok authentication is required' },
+        { name: 'runtime_configuration', status: 'DRIFT', detail: 'Grok configuration has not been saved in Hermes Fleet' },
+      ],
+    },
+  }
+  await openFleet(page, { hosts: [host], instances: [instance], operations: [] })
+  await page.getByRole('button', { name: instance.name }).click()
+  await expect(page.getByText('xAI Grok', { exact: true })).toBeVisible()
+  await expect(page.getByText('Sign in required')).toBeVisible()
+  await expect(page.getByText('Complete Grok setup')).toBeVisible()
+  await page.getByRole('button', { name: 'Provider', exact: true }).click()
+  await expect(page.getByRole('heading', { name: 'Providers', exact: true })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Grok configuration' })).toBeVisible()
+  await expect(page.getByText(/SuperGrok or X Premium\+/)).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Authenticate Grok' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Authenticate Codex' })).toBeVisible()
+	  await expect(page.getByRole('button', { name: 'Configure as default' })).toHaveCount(1)
+})
+
+test('one connected OAuth provider keeps a configured instance healthy', async ({ page }) => {
+  const instance = {
+    ...codexInstance('gpt-5.6-sol', ['gpt-5.6-sol']),
+    id: 'instance-single-oauth',
+    name: 'fleet-single-oauth',
+    provider: 'openai-codex',
+    model: 'gpt-5.6-sol',
+    reasoning: 'medium',
+    service_tier: 'normal',
+    codex_configured: true,
+    observation: {
+      instance_id: 'instance-single-oauth',
+      hermes_version: '0.20.1',
+      model_catalog: ['gpt-5.6-sol'],
+      recommended_model: 'gpt-5.6-sol',
+      status: 'DEGRADED',
+      summary: 'Grok authentication is not connected',
+      received_at: now,
+      checks: [
+        { name: 'codex_auth', status: 'OK', detail: 'Codex authentication is connected' },
+        { name: 'provider_auth', status: 'DRIFT', detail: 'Grok authentication is not connected' },
+        { name: 'runtime_configuration', status: 'OK', detail: 'Codex configuration matches Fleet' },
+      ],
+    },
+  }
+
+  await openFleet(page, { hosts: [host], instances: [instance], operations: [] })
+
+  await expect(page.getByRole('button', { name: 'View status details: Healthy' })).toBeVisible()
+  await expect(page.getByText('Setup incomplete', { exact: true })).toHaveCount(0)
+  await expect(page.getByLabel('Instance summary')).toContainText('Needs attention0')
+})
+
+test('Grok provider controls follow the selected Hermes model capabilities', async ({ page }) => {
+  const instance = {
+    ...codexInstance(),
+    id: 'instance-grok-capabilities',
+    name: 'fleet-grok-capabilities',
+    provider: 'xai-oauth',
+    model: 'grok-4.6',
+    codex_configured: false,
+    observation: {
+      instance_id: 'instance-grok-capabilities',
+      hermes_version: '0.20.1',
+      model_catalog: ['grok-4.6', 'grok-4'],
+      recommended_model: 'grok-4.6',
+      provider_model_catalogs: {
+        'xai-oauth': { models: ['grok-4.6', 'grok-4'], recommended: 'grok-4.6' },
+      },
+      status: 'DEGRADED',
+      summary: 'Grok configuration required',
+      received_at: now,
+      checks: [
+        { name: 'codex_auth', status: 'DRIFT', detail: 'Codex authentication is not connected' },
+        { name: 'provider_auth', status: 'OK', detail: 'Grok authentication is connected' },
+        { name: 'runtime_configuration', status: 'DRIFT', detail: 'Choose a Grok model in Hermes Fleet' },
+      ],
+    },
+  }
+  await openFleet(page, { hosts: [host], instances: [instance], operations: [] })
+  await page.getByRole('button', { name: instance.name }).click()
+  await page.getByRole('button', { name: 'Provider', exact: true }).click()
+
+  await expect(page.getByLabel('Model')).toHaveValue('grok-4.6')
+  await expect(page.getByLabel('Reasoning')).toHaveValue('medium')
+  await expect(page.getByLabel('Reasoning').locator('option')).toHaveCount(5)
+  await expect(page.getByLabel('Service tier').locator('option')).toHaveCount(2)
+
+  await page.getByLabel('Model').selectOption('grok-4')
+  await expect(page.getByLabel('Reasoning')).toHaveValue('none')
+  await expect(page.getByLabel('Reasoning').locator('option')).toHaveText(['Select reasoning', 'Automatic'])
+  await expect(page.getByLabel('Service tier')).toHaveValue('normal')
+  await expect(page.getByLabel('Service tier').locator('option')).toHaveText(['Normal'])
 })
 
 test('Escape closes the create dialog and restores focus to its opener', async ({ page }) => {
@@ -1689,6 +1800,138 @@ test('failed legacy runtime uses verified recovery instead of provisioning retry
   expect(recoveryRequest?.workflow_id).toMatch(/^[0-9a-f-]{36}$/)
 })
 
+test('failed Hermes version update does not offer provisioning retry', async ({ page }) => {
+  const instance = {
+    ...codexInstance('model-alpha'),
+    id: 'instance-update-failed',
+    name: 'fleet-update-failed',
+    status: 'FAILED',
+    image: 'local/hermes-fleet-runtime:0.18.2',
+    last_error: 'Hermes update failed; automatic backup restore failed',
+    model: 'model-alpha',
+    reasoning: 'medium',
+    service_tier: 'normal',
+    codex_configured: true,
+    observation: {
+      instance_id: 'instance-update-failed',
+      target_generation: now,
+      hermes_version: '0.18.2',
+      hermes_source: '7acaff5ef2bcbaa22bd23b72efe60906123a4f55',
+      status: 'UNKNOWN',
+      summary: 'Desired state is changing; awaiting a stable lifecycle state',
+      received_at: now,
+      checks: [],
+    },
+  }
+  const failedUpdate = operation(1, {
+    instance_id: instance.id,
+    type: 'UPGRADE_HERMES',
+    status: 'FAILED',
+    summary: 'Update Hermes fleet-update-failed to 0.19.0',
+    error: 'Hermes update failed; automatic backup restore failed',
+    metadata: { from_version: '0.18.2', to_version: '0.19.0', update_kind: 'VERSION_UPDATE', original_status: 'RUNNING' },
+  })
+  await installBaseRoutes(page, { operations: [failedUpdate] })
+  await page.route('**/api/v1/overview', async (route) => {
+    await route.fulfill({ json: { hosts: [host], instances: [instance], operations: [failedUpdate] } })
+  })
+  await page.route('**/api/v1/instances/instance-update-failed/recovery-points', async (route) => {
+    await route.fulfill({ json: [] })
+  })
+  await page.route('**/api/v1/instances/instance-update-failed/hermes-update', async (route) => {
+    await route.fulfill({
+      json: {
+        current_version: '0.18.2',
+        current_image: instance.image,
+        target_version: '0.19.0',
+        target_source: releases[0].commit,
+        target_image: releases[0].image,
+        official_status: 'UPDATE_AVAILABLE',
+        update_kind: 'VERSION_UPDATE',
+        official_source: releaseSource,
+        official_checked_at: now,
+        latest_release: releases[0],
+        available: true,
+        eligible: false,
+        reason: 'Wait until the instance reaches a stable running or stopped state',
+      },
+    })
+  })
+
+  await page.goto('/')
+  await navigateToInstances(page)
+  await page.getByRole('button', { name: instance.name }).click()
+  await expect(page.getByRole('button', { name: 'Retry provisioning' })).toHaveCount(0)
+  await expect(page.getByText('Hermes update stopped before the instance was restored')).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Review failed operation' })).toBeVisible()
+})
+
+test('a long Hermes release build reports elapsed time instead of looking hung', async ({ page }) => {
+  const instance = {
+    ...codexInstance('model-alpha'),
+    id: 'instance-update-slow',
+    name: 'fleet-update-slow',
+    status: 'RUNNING',
+    image: 'local/hermes-fleet-runtime:0.18.2',
+    observation: {
+      instance_id: 'instance-update-slow',
+      hermes_version: '0.18.2',
+      status: 'IN_SYNC',
+      summary: 'Running',
+      received_at: now,
+      checks: [],
+    },
+  }
+  const startedAt = new Date(Date.now() - 22 * 60_000).toISOString()
+  const runningUpdate = operation(1, {
+    instance_id: instance.id,
+    type: 'UPGRADE_HERMES',
+    status: 'RUNNING',
+    summary: 'Update Hermes fleet-update-slow to 0.19.0',
+    progress: { stage: 'PREPARING_RELEASE' },
+    metadata: { from_version: '0.18.2', to_version: '0.19.0', update_kind: 'VERSION_UPDATE', original_status: 'RUNNING' },
+    created_at: startedAt,
+    updated_at: startedAt,
+  })
+  await installBaseRoutes(page, { operations: [runningUpdate] })
+  await page.route('**/api/v1/overview', async (route) => {
+    await route.fulfill({ json: { hosts: [host], instances: [instance], operations: [runningUpdate] } })
+  })
+  await page.route('**/api/v1/instances/instance-update-slow/recovery-points', async (route) => {
+    await route.fulfill({ json: [] })
+  })
+  await page.route('**/api/v1/instances/instance-update-slow/hermes-update', async (route) => {
+    await route.fulfill({
+      json: {
+        current_version: '0.18.2',
+        current_image: instance.image,
+        target_version: '0.19.0',
+        target_source: releases[0].commit,
+        target_image: releases[0].image,
+        official_status: 'UPDATE_AVAILABLE',
+        update_kind: 'VERSION_UPDATE',
+        official_source: releaseSource,
+        official_checked_at: now,
+        latest_release: releases[0],
+        available: true,
+        eligible: false,
+        reason: 'A Hermes update is already running',
+      },
+    })
+  })
+
+  await page.goto('/')
+  await navigateToInstances(page)
+  await page.getByRole('button', { name: instance.name }).click()
+
+  const elapsed = page.locator('.hermes-update-elapsed')
+  await expect(elapsed).toBeVisible()
+  await expect(elapsed).toContainText('Running for 22m')
+  await expect(elapsed).toContainText('Last progress update 22m ago')
+  await expect(elapsed).toContainText('a full rebuild can take 45 minutes')
+  await expect(elapsed).toHaveClass(/quiet/)
+})
+
 test('parallel lifecycle actions on different instances keep independent polling', async ({ page }) => {
   const first = {
     ...codexInstance('model-alpha'),
@@ -1749,6 +1992,47 @@ test('parallel lifecycle actions on different instances keep independent polling
 
   await expect(firstRow.getByTitle('Start instance')).toBeEnabled({ timeout: 10_000 })
   await expect(secondRow.getByTitle('Start instance')).toBeEnabled({ timeout: 10_000 })
+})
+
+test('stopping an instance is confirmed and a failed action shows the reason', async ({ page }) => {
+  const instance = {
+    ...codexInstance('model-alpha'),
+    id: 'instance-stop-guard',
+    name: 'fleet-stop-guard',
+    status: 'RUNNING',
+    observation: {
+      instance_id: 'instance-stop-guard',
+      hermes_version: '0.19.0',
+      status: 'IN_SYNC',
+      summary: 'Running',
+      received_at: now,
+      checks: [],
+    },
+  }
+  await openFleet(page, { hosts: [host], instances: [instance], operations: [] })
+
+  let actionRequests = 0
+  const reason = 'The Host Agent is offline, so Fleet cannot stop this instance right now.'
+  await page.route('**/api/v1/instances/*/actions', async (route) => {
+    actionRequests += 1
+    await route.fulfill({ status: 503, json: { error: reason } })
+  })
+
+  const row = page.getByRole('row').filter({ hasText: instance.name })
+
+  // Playwright dismisses dialogs by default, so an unhandled confirm blocks the stop.
+  await row.getByTitle('Stop instance').click()
+  await page.waitForTimeout(500)
+  expect(actionRequests).toBe(0)
+
+  page.once('dialog', (dialog) => {
+    expect(dialog.message()).toContain(instance.name)
+    void dialog.accept()
+  })
+  await row.getByTitle('Stop instance').click()
+  await expect.poll(() => actionRequests).toBe(1)
+  await expect(row.getByText(reason)).toBeVisible()
+  await expect(row.getByText('Action needs review')).toHaveCount(0)
 })
 
 test('Messaging preserves a dirty draft and blocks stale or invalid saves', async ({ page }) => {
