@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1012,6 +1014,115 @@ func TestProfileCompletionPersistsInventoryAfterInstanceStops(t *testing.T) {
 	}
 	if jobStatus != domain.JobSucceeded {
 		t.Fatalf("job status=%q, want %q", jobStatus, domain.JobSucceeded)
+	}
+}
+
+func TestCapabilityCompletionPersistsSanitizedInventory(t *testing.T) {
+	ctx, dataStore, host, instance := newFleetFixture(t, "capability-completion")
+	provisionJob, err := dataStore.ClaimJob(ctx, host.ID, time.Minute)
+	if err != nil || provisionJob == nil {
+		t.Fatalf("ClaimJob() job=%v error=%v", provisionJob, err)
+	}
+	if err := dataStore.AcknowledgeJob(ctx, host.ID, provisionJob.ID, provisionJob.LeaseToken, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := dataStore.CompleteJob(ctx, host.ID, provisionJob.ID, provisionJob.LeaseToken, successfulProvisionResult(instance), nil); err != nil {
+		t.Fatal(err)
+	}
+	storedInstance, err := dataStore.GetInstance(ctx, instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	operation := domain.Operation{
+		ID: "operation-capability-refresh", InstanceID: instance.ID, Type: "REFRESH_HERMES_CAPABILITIES",
+		Status: domain.OperationPending, Summary: "Refresh capabilities", CreatedAt: now, UpdatedAt: now,
+	}
+	payload, _ := json.Marshal(domain.HermesCapabilityInspectPayload{
+		InstanceID: instance.ID, Name: instance.Name, ProjectName: storedInstance.ProjectName,
+		ManagedPath: storedInstance.ManagedPath, APIPort: storedInstance.APIPort,
+	})
+	job := domain.Job{
+		ID: "job-capability-refresh", OperationID: operation.ID, HostID: host.ID, InstanceID: instance.ID,
+		Type: domain.JobInspectHermesCapabilities, Status: domain.JobPending, Payload: payload,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := dataStore.QueueRunningInspection(ctx, operation, job); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := dataStore.ClaimJob(ctx, host.ID, time.Minute)
+	if err != nil || claimed == nil {
+		t.Fatalf("ClaimJob() capability job=%v error=%v", claimed, err)
+	}
+	if err := dataStore.AcknowledgeJob(ctx, host.ID, claimed.ID, claimed.LeaseToken, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	result := domain.JobResult{Success: true, HermesCapabilities: &domain.HermesCapabilityInventory{
+		InstanceID: instance.ID, Platform: "hermes-agent", RuntimeMode: "server_agent",
+		Features: map[string]bool{"skills_api": true},
+		Skills:   []domain.HermesSkillCapability{{Name: "browser-session"}},
+		Toolsets: []domain.HermesToolsetCapability{{Name: "browser", Enabled: true, Configured: true, Tools: []string{"browser_exec"}}},
+		Browser:  domain.HermesBrowserCapability{Available: true, Implementation: "playwright-chromium.v1"},
+	}}
+	if err := dataStore.CompleteJob(ctx, host.ID, claimed.ID, claimed.LeaseToken, result, nil); err != nil {
+		t.Fatal(err)
+	}
+	inventory, err := dataStore.HermesCapabilityInventory(ctx, instance.ID)
+	if err != nil || inventory.ObservedAt.IsZero() || !inventory.Browser.Available ||
+		len(inventory.Skills) != 1 || inventory.Skills[0].Name != "browser-session" {
+		t.Fatalf("inventory=%+v error=%v", inventory, err)
+	}
+}
+
+func TestSkillContentCompletionPersistsLeaseFencedSnapshot(t *testing.T) {
+	ctx, dataStore, host, instance := newFleetFixture(t, "skill-content-completion")
+	provisionJob, err := dataStore.ClaimJob(ctx, host.ID, time.Minute)
+	if err != nil || provisionJob == nil {
+		t.Fatalf("ClaimJob() job=%v error=%v", provisionJob, err)
+	}
+	if err := dataStore.AcknowledgeJob(ctx, host.ID, provisionJob.ID, provisionJob.LeaseToken, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := dataStore.CompleteJob(ctx, host.ID, provisionJob.ID, provisionJob.LeaseToken, successfulProvisionResult(instance), nil); err != nil {
+		t.Fatal(err)
+	}
+	storedInstance, err := dataStore.GetInstance(ctx, instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	payloadValue := domain.HermesSkillContentInspectPayload{
+		HermesProfileInspectPayload: domain.HermesProfileInspectPayload{
+			InstanceID: instance.ID, Name: instance.Name, ProjectName: storedInstance.ProjectName,
+			ManagedPath: storedInstance.ManagedPath, DashboardPort: storedInstance.DashboardPort,
+		},
+		SkillName: "browser-report", Profile: "default",
+	}
+	payload, _ := json.Marshal(payloadValue)
+	operation := domain.Operation{ID: "operation-skill-content", InstanceID: instance.ID, Type: "INSPECT_HERMES_SKILL", Status: domain.OperationPending, Summary: "Inspect skill", CreatedAt: now, UpdatedAt: now}
+	job := domain.Job{ID: "job-skill-content", OperationID: operation.ID, HostID: host.ID, InstanceID: instance.ID, Type: domain.JobInspectHermesSkillContent, Status: domain.JobPending, Payload: payload, CreatedAt: now, UpdatedAt: now}
+	if err := dataStore.QueueRunningInspection(ctx, operation, job); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := dataStore.ClaimJob(ctx, host.ID, time.Minute)
+	if err != nil || claimed == nil {
+		t.Fatalf("ClaimJob() skill job=%v error=%v", claimed, err)
+	}
+	if err := dataStore.AcknowledgeJob(ctx, host.ID, claimed.ID, claimed.LeaseToken, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	content := "---\nname: browser-report\ndescription: Browser report\n---\nUse Chromium."
+	digest := sha256.Sum256([]byte(content))
+	result := domain.JobResult{Success: true, HermesSkillContent: &domain.HermesSkillContentSnapshot{
+		InstanceID: instance.ID, SkillName: "browser-report", Profile: "default", Provenance: "agent",
+		Content: content, Revision: hex.EncodeToString(digest[:]),
+	}}
+	if err := dataStore.CompleteJob(ctx, host.ID, claimed.ID, claimed.LeaseToken, result, nil); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := dataStore.HermesSkillContentSnapshot(ctx, instance.ID, "default", "browser-report")
+	if err != nil || snapshot.Content != content || snapshot.Provenance != "agent" || snapshot.ObservedAt.IsZero() {
+		t.Fatalf("snapshot=%+v error=%v", snapshot, err)
 	}
 }
 

@@ -61,28 +61,48 @@ type PublishedRoute struct {
 }
 
 type ConfigurationView struct {
-	Mode                               string             `json:"mode"`
-	AdminTunnelID                      string             `json:"admin_tunnel_id"`
-	InstancesTunnelID                  string             `json:"instances_tunnel_id"`
-	AdminHostname                      string             `json:"admin_hostname"`
-	AdminCredentialAvailable           bool               `json:"admin_credential_available"`
-	InstancesCredentialAvailable       bool               `json:"instances_credential_available"`
-	AdminTunnelTokenConfigured         bool               `json:"admin_tunnel_token_configured"`
-	InstancesTunnelTokenConfigured     bool               `json:"instances_tunnel_token_configured"`
-	AdminTunnelTokenFingerprint        string             `json:"admin_tunnel_token_fingerprint,omitempty"`
-	InstancesTunnelTokenFingerprint    string             `json:"instances_tunnel_token_fingerprint,omitempty"`
-	LegacyProviderManaged              bool               `json:"legacy_provider_managed"`
-	InstancePublishingConfigured       bool               `json:"instance_publishing_configured"`
-	InstancePublishingAccountID        string             `json:"instance_publishing_account_id,omitempty"`
-	InstancePublishingZoneID           string             `json:"instance_publishing_zone_id,omitempty"`
-	InstancePublishingZone             string             `json:"instance_publishing_zone,omitempty"`
-	InstancePublishingFleetNamespace   string             `json:"instance_publishing_fleet_namespace,omitempty"`
-	InstancePublishingTunnelID         string             `json:"instance_publishing_tunnel_id,omitempty"`
-	InstancePublishingTokenFingerprint string             `json:"instance_publishing_token_fingerprint,omitempty"`
-	AdminURL                           string             `json:"admin_url"`
-	InstanceEndpoints                  []InstanceEndpoint `json:"instance_endpoints"`
-	AdminOriginService                 string             `json:"admin_origin_service"`
-	InstanceRoutes                     []PublishedRoute   `json:"instance_routes"`
+	Mode                               string               `json:"mode"`
+	AdminTunnelID                      string               `json:"admin_tunnel_id"`
+	InstancesTunnelID                  string               `json:"instances_tunnel_id"`
+	AdminHostname                      string               `json:"admin_hostname"`
+	AdminCredentialAvailable           bool                 `json:"admin_credential_available"`
+	InstancesCredentialAvailable       bool                 `json:"instances_credential_available"`
+	AdminTunnelTokenConfigured         bool                 `json:"admin_tunnel_token_configured"`
+	InstancesTunnelTokenConfigured     bool                 `json:"instances_tunnel_token_configured"`
+	AdminTunnelTokenFingerprint        string               `json:"admin_tunnel_token_fingerprint,omitempty"`
+	InstancesTunnelTokenFingerprint    string               `json:"instances_tunnel_token_fingerprint,omitempty"`
+	LegacyProviderManaged              bool                 `json:"legacy_provider_managed"`
+	InstancePublishingConfigured       bool                 `json:"instance_publishing_configured"`
+	InstancePublishingAccountID        string               `json:"instance_publishing_account_id,omitempty"`
+	InstancePublishingZoneID           string               `json:"instance_publishing_zone_id,omitempty"`
+	InstancePublishingZone             string               `json:"instance_publishing_zone,omitempty"`
+	InstancePublishingFleetNamespace   string               `json:"instance_publishing_fleet_namespace,omitempty"`
+	InstancePublishingTunnelID         string               `json:"instance_publishing_tunnel_id,omitempty"`
+	InstancePublishingTokenFingerprint string               `json:"instance_publishing_token_fingerprint,omitempty"`
+	CloudflareOAuthAvailable           bool                 `json:"cloudflare_oauth_available"`
+	CloudflareOAuthConnected           bool                 `json:"cloudflare_oauth_connected"`
+	CloudflareOAuthScope               string               `json:"cloudflare_oauth_scope,omitempty"`
+	CloudflareOAuthSetup               CloudflareOAuthSetup `json:"cloudflare_oauth_setup"`
+	AdminURL                           string               `json:"admin_url"`
+	InstanceEndpoints                  []InstanceEndpoint   `json:"instance_endpoints"`
+	AdminOriginService                 string               `json:"admin_origin_service"`
+	InstanceRoutes                     []PublishedRoute     `json:"instance_routes"`
+}
+
+type CloudflareOAuthSetup struct {
+	ClientConfigured  bool                   `json:"client_configured"`
+	ClientID          string                 `json:"client_id,omitempty"`
+	ManagedExternally bool                   `json:"managed_externally"`
+	RedirectURL       string                 `json:"redirect_url"`
+	OAuthClientsURL   string                 `json:"oauth_clients_url"`
+	DocumentationURL  string                 `json:"documentation_url"`
+	Scopes            []CloudflareOAuthScope `json:"scopes"`
+}
+
+type CloudflareOAuthScope struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Purpose string `json:"purpose"`
 }
 
 type BoundaryStatus struct {
@@ -282,6 +302,8 @@ func (manager *Manager) Configuration(ctx context.Context) ConfigurationView {
 			InstancePublishingFleetNamespace:   view.RouteAutomationFleetNamespace,
 			InstancePublishingTunnelID:         view.RouteAutomationTunnelID,
 			InstancePublishingTokenFingerprint: view.RouteAutomationTokenFingerprint,
+			CloudflareOAuthConnected:           view.OAuthConnected,
+			CloudflareOAuthScope:               view.OAuthScope,
 			AdminOriginService:                 AdminOriginService,
 			InstanceRoutes:                     routes,
 		}

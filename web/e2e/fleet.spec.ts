@@ -46,16 +46,47 @@ async function openFleet(page: Page, instances: unknown[] = [], operations: unkn
   await expect(page.getByRole('heading', { name: 'Instances', level: 1 })).toBeVisible()
 }
 
-test('create instance exposes only operator choices and locks while submitting', async ({ page }) => {
+test('create instance exposes only operator choices and stays open until provisioning finishes', async ({ page }) => {
   let requestBody: unknown
   let releaseRequest!: () => void
   const requestHeld = new Promise<void>((resolve) => { releaseRequest = resolve })
+  const createdInstance = {
+    id: 'instance-e2e',
+    name: 'fleet-e2e-01',
+    host_id: host.id,
+    host_name: host.name,
+    status: 'PROVISIONING',
+    image: releases[0].image,
+    provider: 'openai-codex',
+    model: '',
+    reasoning: '',
+    service_tier: '',
+    codex_configured: false,
+    api_port: 8650,
+    dashboard_port: 9130,
+    created_at: now,
+    updated_at: now,
+  }
+  let liveInstance: Record<string, unknown> | null = null
+  let liveOperations: unknown[] = []
   await page.route('**/api/v1/instances', async (route) => {
     requestBody = route.request().postDataJSON()
     await requestHeld
-    await route.fulfill({ status: 202, json: { id: 'operation-1' } })
+    liveInstance = {
+      ...createdInstance,
+      status: 'RUNNING',
+      managed_path: '/tmp/hermes-fleet-e2e-01',
+    }
+    liveOperations = [{
+      id: 'operation-1', instance_id: createdInstance.id, type: 'PROVISION', status: 'SUCCEEDED',
+      summary: 'Provision fleet-e2e-01', created_at: now, updated_at: now,
+    }]
+    await route.fulfill({ status: 202, json: createdInstance })
   })
   await openFleet(page)
+  await page.route('**/api/v1/overview', async (route) => {
+    await route.fulfill({ json: { hosts: [host], instances: liveInstance ? [liveInstance] : [], operations: liveOperations } })
+  })
 
   await page.getByRole('button', { name: 'Create instance' }).click()
   const dialog = page.getByRole('dialog', { name: 'Create instance' })
@@ -82,7 +113,10 @@ test('create instance exposes only operator choices and locks while submitting',
   await expect.poll(() => requestBody).toEqual({ name: 'fleet-e2e-01', host_id: 'host-1', hermes_version: '0.19.0', provider: 'openai-codex' })
 
   releaseRequest()
-  await expect(dialog).toBeHidden()
+  await expect(dialog).toBeVisible()
+  await expect(dialog.getByRole('button', { name: 'Open instance' })).toBeVisible()
+  await expect(dialog.getByRole('button', { name: 'Start chat' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Instances', level: 1 })).toBeVisible()
 })
 
 test('System keeps Fleet Manager settings, remote access, and backups outside instance configuration', async ({ page }) => {
@@ -481,6 +515,38 @@ test('backup restore requires exact instance-name confirmation', async ({ page }
 	await page.getByTitle('Restore this backup').click()
   await expect.poll(() => restoreBody).toEqual({ confirm_name: instance.name })
   await expect.poll(() => restoreReads).toBe(1)
+})
+
+test('backup restore rejects a mismatched instance-name confirmation before calling the API', async ({ page }) => {
+  const instance = {
+    id: 'instance-1', name: 'fleet-test-01', host_id: host.id, host_name: host.name, status: 'STOPPED',
+    image: 'hermes:test', image_id: `sha256:${'a'.repeat(64)}`, provider: 'openai-codex', model: 'gpt-5.6-sol',
+    reasoning: 'medium', service_tier: 'normal', codex_configured: true, api_port: 8650, dashboard_port: 9130,
+    project_name: 'hermes-fleet-test', data_volume: 'hermes-fleet-test-data', managed_path: '/tmp/hermes-fleet-test',
+    created_at: now, updated_at: now,
+  }
+  const point = {
+    id: 'recovery-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', instance_id: instance.id, instance_name: instance.name,
+    filename: 'hermes-fleet-test-01-20260720T000000Z-aaaaaaaa.tar', status: 'READY', size_bytes: 4096,
+    sha256: 'b'.repeat(64), image: instance.image, image_id: instance.image_id, provider: instance.provider,
+    model: instance.model, reasoning: instance.reasoning, service_tier: instance.service_tier, codex_configured: instance.codex_configured,
+    project_name: instance.project_name, data_volume: instance.data_volume, managed_path: instance.managed_path,
+    agent_version: host.agent_version, created_at: now, verified_at: now,
+  }
+  let restoreCalls = 0
+  await page.route('**/api/v1/instances/instance-1/recovery-points', async (route) => route.fulfill({ json: [point] }))
+  await page.route('**/api/v1/recovery-points/recovery-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/restore', async (route) => {
+    restoreCalls += 1
+    await route.fulfill({ status: 202, json: { id: 'restore-1', instance_id: instance.id, type: 'RESTORE', status: 'PENDING', summary: 'Restore from point', created_at: now, updated_at: now } })
+  })
+  page.on('dialog', async (dialog) => dialog.accept('wrong-name'))
+  await openFleet(page, [instance])
+
+  await page.getByRole('button', { name: instance.name }).click()
+  await page.getByRole('button', { name: 'Backups' }).click()
+  await page.getByTitle('Restore this backup').click()
+  await expect(page.getByText(`Type ${instance.name} exactly to restore this backup.`)).toBeVisible()
+  expect(restoreCalls).toBe(0)
 })
 
 test('incomplete Hermes setup exposes the Fleet-owned automatic fix', async ({ page }) => {

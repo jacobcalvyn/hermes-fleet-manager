@@ -3,6 +3,7 @@ package recovery
 import (
 	"archive/tar"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -23,6 +24,8 @@ import (
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/providers"
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/recoverycodec"
 )
+
+const recoveryKitAuthenticationDomain = "hermes-fleet/recovery-kit-manifest/v2"
 
 const (
 	StatusCreating = "CREATING"
@@ -163,6 +166,45 @@ func New(root, hexadecimalKey string, maxPerHost int, maxBytes int64) (*Manager,
 		return nil, err
 	}
 	return manager, nil
+}
+
+// AuthenticateRecoveryKitManifest creates a domain-separated authentication tag
+// without exposing the recovery encryption key outside this package.
+func (m *Manager) AuthenticateRecoveryKitManifest(payload []byte) string {
+	return authenticateRecoveryKitManifest(m.key, payload)
+}
+
+// VerifyRecoveryKitManifest authenticates a recovery kit manifest using the
+// separately retained recovery key required by clean-host import.
+func VerifyRecoveryKitManifest(hexadecimalKey string, payload []byte, tag string) error {
+	key, err := hex.DecodeString(strings.TrimSpace(hexadecimalKey))
+	if err != nil || len(key) != 32 {
+		return errors.New("recovery encryption key must contain exactly 64 hexadecimal characters")
+	}
+	expected, err := hex.DecodeString(strings.TrimSpace(tag))
+	if err != nil || len(expected) != sha256.Size {
+		return errors.New("recovery kit manifest authentication tag is invalid")
+	}
+	actual, err := hex.DecodeString(authenticateRecoveryKitManifest(key, payload))
+	if err != nil || !hmac.Equal(actual, expected) {
+		return errors.New("recovery kit manifest authentication failed")
+	}
+	return nil
+}
+
+func authenticateRecoveryKitManifest(key, payload []byte) string {
+	derivation := hmac.New(sha256.New, key)
+	_, _ = derivation.Write([]byte(recoveryKitAuthenticationDomain))
+	authenticationKey := derivation.Sum(nil)
+	mac := hmac.New(sha256.New, authenticationKey)
+	_, _ = mac.Write(payload)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// ValidateMetadata verifies the portable identity and integrity fields used by
+// recovery kit import before any filesystem path is derived from them.
+func ValidateMetadata(metadata Metadata) error {
+	return validateMetadata(metadata)
 }
 
 func (m *Manager) reconcileInterruptedPublications() error {

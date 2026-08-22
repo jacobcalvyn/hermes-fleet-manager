@@ -6,6 +6,21 @@ temporary="$(mktemp -d)"
 trap 'rm -rf "$temporary"' EXIT
 mkdir -p "$temporary/bin" "$temporary/data" "$temporary/python/hermes_cli"
 
+mkdir -p "$temporary/playwright/chromium-1234/chrome-linux"
+cat > "$temporary/playwright/chromium-1234/chrome-linux/chrome" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$temporary/playwright/chromium-1234/chrome-linux/chrome"
+
+cat > "$temporary/bin/assert-browser-runtime" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ -x "${AGENT_BROWSER_EXECUTABLE_PATH:?}" ]]
+[[ "$AGENT_BROWSER_EXECUTABLE_PATH" == "${EXPECTED_BROWSER_EXECUTABLE:?}" ]]
+EOF
+chmod +x "$temporary/bin/assert-browser-runtime"
+
 cat > "$temporary/bin/hermes-fleet-runtime-configure" <<'EOF'
 #!/usr/bin/env bash
 exec python3 "$FLEET_CONFIGURE_SCRIPT" "$@"
@@ -51,6 +66,45 @@ common_env=(
   HERMES_FLEET_RUNTIME_BUILD_ID="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
   FLEET_CONFIGURE_SCRIPT="$root/runtime/configure.py"
 )
+
+env -i \
+  PATH="$temporary/bin:$PATH" \
+  HERMES_HOME="$temporary/browser-data" \
+  HERMES_WORKSPACE="$temporary/browser-workspace" \
+  PLAYWRIGHT_BROWSERS_PATH="$temporary/playwright" \
+  HERMES_FLEET_BROWSER_REQUIRED=true \
+  EXPECTED_BROWSER_EXECUTABLE="$temporary/playwright/chromium-1234/chrome-linux/chrome" \
+  "$root/runtime/entrypoint.sh" assert-browser-runtime
+
+env -i \
+  PATH="$temporary/bin:$PATH" \
+  HERMES_HOME="$temporary/explicit-browser-data" \
+  HERMES_WORKSPACE="$temporary/explicit-browser-workspace" \
+  AGENT_BROWSER_EXECUTABLE_PATH="$temporary/playwright/chromium-1234/chrome-linux/chrome" \
+  HERMES_FLEET_BROWSER_REQUIRED=true \
+  EXPECTED_BROWSER_EXECUTABLE="$temporary/playwright/chromium-1234/chrome-linux/chrome" \
+  "$root/runtime/entrypoint.sh" assert-browser-runtime
+
+if env -i \
+  PATH="$temporary/bin:$PATH" \
+  HERMES_HOME="$temporary/missing-browser-data" \
+  HERMES_WORKSPACE="$temporary/missing-browser-workspace" \
+  PLAYWRIGHT_BROWSERS_PATH="$temporary/missing-playwright" \
+  HERMES_FLEET_BROWSER_REQUIRED=true \
+  "$root/runtime/entrypoint.sh" true 2>/dev/null; then
+  echo "Required Hermes browser runtime accepted a missing executable." >&2
+  exit 1
+fi
+
+if env -i \
+  PATH="$temporary/bin:$PATH" \
+  HERMES_HOME="$temporary/invalid-browser-data" \
+  HERMES_WORKSPACE="$temporary/invalid-browser-workspace" \
+  AGENT_BROWSER_EXECUTABLE_PATH="$temporary/missing-chrome" \
+  "$root/runtime/entrypoint.sh" true 2>/dev/null; then
+  echo "Hermes browser runtime accepted an invalid explicit executable." >&2
+  exit 1
+fi
 
 env "${common_env[@]}" HERMES_FLEET_CONFIG_OWNER=true \
   "$root/runtime/entrypoint.sh" true

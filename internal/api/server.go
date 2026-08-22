@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -25,6 +26,7 @@ import (
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/capacity"
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/chatartifacts"
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/cloudflare"
+	"github.com/jacobcalvyn/hermes-fleet-manager/internal/cloudflareoauth"
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/compatibility"
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/domain"
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/events"
@@ -67,27 +69,29 @@ var errObservationSequence = errors.New("observation is not newer than the store
 var errRuntimeRefreshRequired = errors.New("managed runtime refresh is required before runtime synchronization")
 
 type Config struct {
-	AdminToken            string
-	EnrollmentToken       string
-	Address               string
-	OperatorURL           string
-	DatabasePath          string
-	DataDirectory         string
-	ReleaseCatalogPath    string
-	BackupRetention       int
-	HermesCatalog         releases.Catalog
-	HermesReleaseSource   releases.Source
-	WebDir                string
-	OfflineAfter          time.Duration
-	ObservationStaleAfter time.Duration
-	Sealer                *security.Sealer
-	Backups               *backup.Manager
-	RecoveryPoints        *recovery.Manager
-	ChatArtifacts         *chatartifacts.Manager
-	MaxRecoveryPointBytes int64
-	RemoteAccess          *remoteaccess.Manager
-	CapacityPolicy        capacity.Policy
-	Reliability           *reliability.Manager
+	AdminToken                             string
+	EnrollmentToken                        string
+	Address                                string
+	OperatorURL                            string
+	DatabasePath                           string
+	DataDirectory                          string
+	ReleaseCatalogPath                     string
+	BackupRetention                        int
+	HermesCatalog                          releases.Catalog
+	HermesReleaseSource                    releases.Source
+	WebDir                                 string
+	OfflineAfter                           time.Duration
+	ObservationStaleAfter                  time.Duration
+	Sealer                                 *security.Sealer
+	Backups                                *backup.Manager
+	RecoveryPoints                         *recovery.Manager
+	ChatArtifacts                          *chatartifacts.Manager
+	MaxRecoveryPointBytes                  int64
+	RemoteAccess                           *remoteaccess.Manager
+	CloudflareOAuth                        *cloudflareoauth.Manager
+	CloudflareOAuthClientManagedExternally bool
+	CapacityPolicy                         capacity.Policy
+	Reliability                            *reliability.Manager
 }
 
 type Server struct {
@@ -333,6 +337,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("PUT /api/v1/system/remote-access/configuration", s.requireAdmin(s.configureRemoteAccess))
 	s.mux.HandleFunc("PUT /api/v1/system/remote-access/cloudflare/admin", s.requireAdmin(s.configureCloudflareAdminBoundary))
 	s.mux.HandleFunc("PUT /api/v1/system/remote-access/cloudflare/instance-publishing", s.requireAdmin(s.configureCloudflareInstancePublishing))
+	s.mux.HandleFunc("PUT /api/v1/system/remote-access/cloudflare/oauth/client", s.requireAdmin(s.configureCloudflareOAuthClient))
+	s.mux.HandleFunc("POST /api/v1/system/remote-access/cloudflare/oauth/start", s.requireAdmin(s.startCloudflareOAuth))
+	s.mux.HandleFunc("GET /api/v1/system/remote-access/cloudflare/oauth/callback", s.completeCloudflareOAuthCallback)
+	s.mux.HandleFunc("GET /api/v1/system/remote-access/cloudflare/oauth/session", s.requireAdmin(s.getCloudflareOAuthSession))
+	s.mux.HandleFunc("POST /api/v1/system/remote-access/cloudflare/oauth/complete", s.requireAdmin(s.completeCloudflareOAuthProvisioning))
 	s.mux.HandleFunc("DELETE /api/v1/system/remote-access/configuration", s.requireAdmin(s.disableRemoteAccess))
 	s.mux.HandleFunc("POST /api/v1/system/remote-access/reconcile", s.requireAdmin(s.reconcileRemoteAccess))
 	s.mux.HandleFunc("GET /api/v1/hosts", s.requireAdmin(s.listHosts))
@@ -369,6 +378,19 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/v1/instances/{instanceID}/profiles", s.requireAdmin(s.createHermesProfile))
 	s.mux.HandleFunc("POST /api/v1/instances/{instanceID}/profiles/{profileName}/active", s.requireAdmin(s.activateHermesProfile))
 	s.mux.HandleFunc("DELETE /api/v1/instances/{instanceID}/profiles/{profileName}", s.requireAdmin(s.deleteHermesProfile))
+	s.mux.HandleFunc("GET /api/v1/instances/{instanceID}/capabilities", s.requireAdmin(s.listHermesCapabilities))
+	s.mux.HandleFunc("POST /api/v1/instances/{instanceID}/capabilities/refresh", s.requireAdmin(s.refreshHermesCapabilities))
+	s.mux.HandleFunc("GET /api/v1/skills/catalog", s.requireAdmin(s.listFleetSkills))
+	s.mux.HandleFunc("POST /api/v1/skills/catalog", s.requireAdmin(s.createFleetSkill))
+	s.mux.HandleFunc("PUT /api/v1/skills/catalog/{skillName}", s.requireAdmin(s.updateFleetSkill))
+	s.mux.HandleFunc("DELETE /api/v1/skills/catalog/{skillName}", s.requireAdmin(s.deleteFleetSkill))
+	s.mux.HandleFunc("POST /api/v1/instances/{instanceID}/skills/{skillName}/sync", s.requireAdmin(s.syncFleetSkill))
+	s.mux.HandleFunc("DELETE /api/v1/instances/{instanceID}/skills/{skillName}", s.requireAdmin(s.removeFleetSkillFromInstance))
+	s.mux.HandleFunc("GET /api/v1/instances/{instanceID}/skills/{skillName}/content", s.requireAdmin(s.getHermesSkillContent))
+	s.mux.HandleFunc("POST /api/v1/instances/{instanceID}/skills/{skillName}/content/refresh", s.requireAdmin(s.refreshHermesSkillContent))
+	s.mux.HandleFunc("POST /api/v1/instances/{instanceID}/skills/{skillName}/copy-to-catalog", s.requireAdmin(s.copyHermesSkillToCatalog))
+	s.mux.HandleFunc("PUT /api/v1/instances/{instanceID}/skills/{skillName}/copy-to-catalog", s.requireAdmin(s.copyHermesSkillToCatalog))
+	s.mux.HandleFunc("POST /api/v1/instances/{instanceID}/toolsets/{toolsetName}", s.requireAdmin(s.setHermesToolset))
 	s.mux.HandleFunc("GET /api/v1/artifacts", s.requireAdmin(s.listArtifacts))
 	s.mux.HandleFunc("GET /api/v1/artifacts/usage", s.requireAdmin(s.artifactUsage))
 	s.mux.HandleFunc("DELETE /api/v1/artifacts/{artifactID}", s.requireAdmin(s.deleteArtifact))
@@ -761,7 +783,193 @@ func (s *Server) getRemoteAccessConfiguration(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusServiceUnavailable, "remote access runtime is unavailable")
 		return
 	}
-	writeJSON(w, http.StatusOK, s.config.RemoteAccess.Configuration(r.Context()))
+	view := s.config.RemoteAccess.Configuration(r.Context())
+	view.CloudflareOAuthAvailable = s.config.CloudflareOAuth != nil && s.config.CloudflareOAuth.Enabled()
+	if s.config.CloudflareOAuth != nil {
+		setup := s.config.CloudflareOAuth.Setup()
+		view.CloudflareOAuthSetup = remoteaccess.CloudflareOAuthSetup{
+			ClientConfigured:  setup.ClientConfigured,
+			ClientID:          setup.ClientID,
+			ManagedExternally: s.config.CloudflareOAuthClientManagedExternally,
+			RedirectURL:       setup.RedirectURL,
+			OAuthClientsURL:   setup.OAuthClientsURL,
+			DocumentationURL:  setup.DocumentationURL,
+			Scopes:            make([]remoteaccess.CloudflareOAuthScope, 0, len(setup.Scopes)),
+		}
+		for _, scope := range setup.Scopes {
+			view.CloudflareOAuthSetup.Scopes = append(view.CloudflareOAuthSetup.Scopes, remoteaccess.CloudflareOAuthScope{ID: scope.ID, Name: scope.Name, Purpose: scope.Purpose})
+		}
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+type cloudflareOAuthClientRequest struct {
+	ClientID string `json:"client_id"`
+}
+
+func (s *Server) configureCloudflareOAuthClient(w http.ResponseWriter, r *http.Request) {
+	if s.config.CloudflareOAuth == nil {
+		writeError(w, http.StatusServiceUnavailable, "Cloudflare OAuth runtime is unavailable")
+		return
+	}
+	if s.config.CloudflareOAuthClientManagedExternally {
+		writeError(w, http.StatusConflict, "Cloudflare OAuth client ID is managed by the Fleet environment")
+		return
+	}
+	var request cloudflareOAuthClientRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	request.ClientID = strings.TrimSpace(request.ClientID)
+	if err := cloudflareoauth.ValidateClientID(request.ClientID); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.store.PutCloudflareOAuthClient(r.Context(), store.CloudflareOAuthClientRecord{ClientID: request.ClientID, UpdatedAt: time.Now().UTC()}); err != nil {
+		writeError(w, http.StatusInternalServerError, "Cloudflare OAuth client ID could not be saved")
+		return
+	}
+	if err := s.config.CloudflareOAuth.ConfigureClient(request.ClientID); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, s.config.CloudflareOAuth.Setup())
+}
+
+type cloudflareOAuthProvisioningRequest struct {
+	SessionID      string `json:"session_id"`
+	AccountID      string `json:"account_id"`
+	ZoneID         string `json:"zone_id"`
+	FleetNamespace string `json:"fleet_namespace"`
+}
+
+func (s *Server) startCloudflareOAuth(w http.ResponseWriter, _ *http.Request) {
+	if s.config.CloudflareOAuth == nil || !s.config.CloudflareOAuth.Enabled() {
+		writeError(w, http.StatusServiceUnavailable, "Cloudflare sign-in is not enabled for this Fleet build")
+		return
+	}
+	authorizationURL, err := s.config.CloudflareOAuth.Begin()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]string{"authorization_url": authorizationURL})
+}
+
+func (s *Server) completeCloudflareOAuthCallback(w http.ResponseWriter, r *http.Request) {
+	redirect := strings.TrimRight(s.config.OperatorURL, "/") + "/?cloudflare_oauth=failed#system/remote-access"
+	if s.config.CloudflareOAuth == nil || !s.config.CloudflareOAuth.Enabled() {
+		http.Redirect(w, r, redirect, http.StatusFound)
+		return
+	}
+	if providerError := strings.TrimSpace(r.URL.Query().Get("error")); providerError != "" {
+		s.logger.Info("Cloudflare OAuth authorization was not completed", "reason", providerError)
+		http.Redirect(w, r, redirect, http.StatusFound)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	session, err := s.config.CloudflareOAuth.CompleteAuthorization(ctx, r.URL.Query().Get("state"), r.URL.Query().Get("code"))
+	if err != nil {
+		s.logger.Warn("complete Cloudflare OAuth callback", "error", err)
+		http.Redirect(w, r, redirect, http.StatusFound)
+		return
+	}
+	destination := strings.TrimRight(s.config.OperatorURL, "/") + "/?cloudflare_oauth=" + url.QueryEscape(session.ID) + "#system/remote-access"
+	http.Redirect(w, r, destination, http.StatusFound)
+}
+
+func (s *Server) getCloudflareOAuthSession(w http.ResponseWriter, r *http.Request) {
+	if s.config.CloudflareOAuth == nil || !s.config.CloudflareOAuth.Enabled() {
+		writeError(w, http.StatusServiceUnavailable, "Cloudflare sign-in is not enabled for this Fleet build")
+		return
+	}
+	session, err := s.config.CloudflareOAuth.Session(r.URL.Query().Get("id"))
+	if err != nil {
+		writeError(w, http.StatusGone, err.Error())
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, session)
+}
+
+func (s *Server) completeCloudflareOAuthProvisioning(w http.ResponseWriter, r *http.Request) {
+	if s.config.CloudflareOAuth == nil || !s.config.CloudflareOAuth.Enabled() || s.config.RemoteAccess == nil || s.config.Sealer == nil {
+		writeError(w, http.StatusServiceUnavailable, "Cloudflare sign-in is not enabled for this Fleet build")
+		return
+	}
+	var request cloudflareOAuthProvisioningRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_, previous, hadPrevious, err := s.readRemoteAccessConfiguration(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if hadPrevious {
+		writeError(w, http.StatusConflict, "disable the current remote access configuration before connecting another Cloudflare account")
+		return
+	}
+	if _, err := s.config.CloudflareOAuth.Session(request.SessionID); err != nil {
+		writeError(w, http.StatusGone, err.Error())
+		return
+	}
+	if _, err := cloudflare.NormalizeFleetNamespace(request.FleetNamespace); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	operationID, err := identity.New()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not create operation identity")
+		return
+	}
+	now := time.Now().UTC()
+	operation := domain.Operation{
+		ID: operationID, Type: "CONNECT_CLOUDFLARE_OAUTH", Status: domain.OperationPending,
+		Summary:   "Connect Cloudflare remote access",
+		Metadata:  operationMetadata(map[string]any{"scope": "system.remote_access.cloudflare_oauth"}),
+		Progress:  &domain.JobProgress{Stage: "PREPARING_CLOUDFLARE", Detail: "Preparing Fleet-owned tunnels and DNS"},
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.store.CreateControlPlaneOperation(r.Context(), operation); err != nil {
+		writeError(w, http.StatusInternalServerError, "Cloudflare connection operation could not be created")
+		return
+	}
+	go s.runCloudflareOAuthProvisioning(operation.ID, request, previous)
+	writeJSON(w, http.StatusAccepted, operation)
+}
+
+func (s *Server) runCloudflareOAuthProvisioning(operationID string, request cloudflareOAuthProvisioningRequest, previous remoteaccess.Config) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	update := func(status, stage, detail, operationError string) {
+		_ = s.store.UpdateControlPlaneOperation(ctx, operationID, status, domain.JobProgress{Stage: stage, Detail: detail}, operationError, time.Now().UTC())
+		s.events.Publish("operation.changed", operationID)
+	}
+	update(domain.OperationRunning, "PREPARING_CLOUDFLARE", "Creating or verifying Fleet-owned tunnels and DNS", "")
+	provisioned, err := s.config.CloudflareOAuth.Provision(ctx, cloudflareoauth.ProvisionRequest{
+		SessionID: request.SessionID, AccountID: request.AccountID, ZoneID: request.ZoneID, FleetNamespace: request.FleetNamespace,
+	})
+	if err != nil {
+		update(domain.OperationFailed, "PREPARING_CLOUDFLARE", err.Error(), err.Error())
+		return
+	}
+	candidate := remoteaccess.Config{Mode: remoteaccess.ModeManagedCloudflare, Cloudflare: provisioned.Cloudflare}
+	update(domain.OperationRunning, "STARTING_CONNECTORS", "Starting Fleet Manager and instance connectors", "")
+	if err := s.applyRemoteAccessConfiguration(ctx, candidate, previous, false); err != nil {
+		update(domain.OperationFailed, "STARTING_CONNECTORS", err.Error(), err.Error())
+		return
+	}
+	if err := s.config.RemoteAccess.Reconcile(ctx); err != nil {
+		update(domain.OperationFailed, "VERIFYING_CONNECTION", err.Error(), err.Error())
+		return
+	}
+	update(domain.OperationSucceeded, "READY", "Cloudflare is connected and Fleet-owned remote access is ready", "")
 }
 
 func (s *Server) configureCloudflareAdminBoundary(w http.ResponseWriter, r *http.Request) {
@@ -1018,6 +1226,36 @@ func (s *Server) applyRemoteAccessConfiguration(ctx context.Context, config, pre
 		_ = s.config.RemoteAccess.Disable(rollbackContext)
 	}
 	return errors.New("remote access configuration could not be saved")
+}
+
+// PersistCloudflareRuntimeConfig seals OAuth token rotations performed by the
+// Cloudflare reconciler. It deliberately updates only renewable OAuth state and
+// its mirrored route token; topology remains owned by the saved configuration.
+func (s *Server) PersistCloudflareRuntimeConfig(ctx context.Context, runtime cloudflare.Config) error {
+	if s.config.Sealer == nil {
+		return errors.New("remote access encryption is unavailable")
+	}
+	_, current, exists, err := s.readRemoteAccessConfiguration(ctx)
+	if err != nil {
+		return err
+	}
+	if !exists || current.Mode != remoteaccess.ModeManagedCloudflare {
+		return errors.New("stored managed Cloudflare configuration is unavailable")
+	}
+	if current.Cloudflare.OAuth.ClientID == "" || current.Cloudflare.OAuth.ClientID != runtime.OAuth.ClientID {
+		return errors.New("stored Cloudflare OAuth client does not match the runtime authorization")
+	}
+	current.Cloudflare.OAuth = runtime.OAuth
+	current.Cloudflare.RouteAutomation.APIToken = runtime.RouteAutomation.APIToken
+	payload, err := json.Marshal(current)
+	if err != nil {
+		return errors.New("rotated Cloudflare OAuth authorization could not be encoded")
+	}
+	ciphertext, err := s.config.Sealer.Seal(payload, remoteAccessSealContext)
+	if err != nil {
+		return errors.New("rotated Cloudflare OAuth authorization could not be encrypted")
+	}
+	return s.store.PutRemoteAccessConfig(ctx, store.RemoteAccessConfigRecord{Ciphertext: ciphertext, UpdatedAt: time.Now().UTC()})
 }
 
 func (s *Server) configureRemoteAccess(w http.ResponseWriter, r *http.Request) {

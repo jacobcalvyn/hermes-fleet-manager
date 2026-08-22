@@ -242,30 +242,43 @@ only in browser memory and never loads the complete `.env` file.
 
 ## Optional Remote Access
 
-Remote access is disabled by default. There are no `FLEET_CLOUDFLARE_*`
-environment variables and no separate Cloudflare setup script. The normal
-`./scripts/fleet-bootstrap.sh` installation includes two hardened connector
-supervisors; both remain idle until an operator enables the module from
-**System > Remote access**.
+Remote access is disabled by default. The normal `./scripts/fleet-bootstrap.sh`
+installation includes two hardened connector supervisors; both remain idle
+until an operator enables the module from **System > Remote access**.
+
+The primary Cloudflare flow uses a private OAuth client with Authorization Code
+and PKCE S256. **System > Remote access** shows the exact callback URL, client
+field values, and required scope IDs, then stores the public Client ID in the
+Fleet data volume. No Client Secret is used. The default scopes are
+`account-settings.read`, `zone.read`, `dns.write`, `argotunnel.write`, and
+`offline_access`.
+
+`FLEET_CLOUDFLARE_OAUTH_CLIENT_ID` remains an optional deployment-level
+override. When present it is authoritative and the browser cannot replace it.
+`FLEET_CLOUDFLARE_OAUTH_REDIRECT_URL` and
+`FLEET_CLOUDFLARE_OAUTH_SCOPES` optionally override the generated callback and
+default scopes. The callback defaults to `FLEET_CONTROL_PLANE_URL` plus
+`/api/v1/system/remote-access/cloudflare/oauth/callback`. Manual connector
+credentials remain under the closed **Advanced manual setup** fallback.
 
 The web flow is the only configuration surface and offers two explicit
 ownership modes:
 
-1. **Cloudflare tunnels** keeps two trust boundaries. The Fleet Manager admin
-   card accepts its pre-created tunnel token and public hostname; its published
-   route remains manual in Cloudflare. **Instance publishing** combines the
-   shared instance tunnel token, account ID, zone ID, and scoped API token in
-   one connect-and-verify flow. Fleet extracts the tunnel UUID from the
-   connector token instead of accepting a second tunnel identifier. It also
-   resolves and stores the verified zone name as non-secret publishing
-   metadata; there is no separate shared-domain input.
+1. **Cloudflare** keeps two trust boundaries. The operator signs in, selects an
+   authorized account and DNS zone, and chooses one Fleet hostname prefix.
+   Fleet creates or reuses only tunnels carrying its ownership metadata,
+   retrieves their connector tokens, configures the Fleet Manager route and
+   DNS, and retains renewable OAuth authorization for later instance route
+   reconciliation. The access and refresh tokens are stored only in the sealed
+   remote-access configuration and refresh-token rotation is persisted before
+   the new token is used.
 2. **Existing public endpoints** registers a Fleet Manager URL and any subset
    of managed instance dashboard URLs that are already published through
    Cloudflare, ngrok, Railway, or another provider. Fleet stores these mappings
    but never creates, verifies, changes, or removes resources at that provider.
 
 Changing ownership mode requires disabling the active mode first. Fleet
-encrypts both tunnel tokens and the Cloudflare API token in SQLite and never
+encrypts connector tokens and Cloudflare OAuth tokens in SQLite and never
 returns them through the API. Access identities and account-wide origin
 certificates remain outside Fleet.
 
@@ -277,25 +290,19 @@ Instances tunnel:  aksa.example.com -> hermes-fleet-instance-aksa-dashboard:9119
 Fallback:          every unmatched hostname -> HTTP 404
 ```
 
-For Cloudflare tunnel tokens, create two remotely managed tunnels outside
-Fleet. In Cloudflare, configure the admin tunnel's published application route
-to the exact Fleet Manager origin shown in its card
-(`http://control-plane:9180`). For instance dashboards, connect the shared
-tunnel and a least-privilege API token in **Instance publishing**, then assign
-the exact hostname from **Instance > Access > Public dashboard**. For an
-unconfigured instance, Fleet prefills an editable
+After Cloudflare sign-in, assign the exact hostname from **Instance > Access >
+Public dashboard**. For an unconfigured instance, Fleet prefills an editable
 `<instance-name>.<verified-zone>` suggestion but does not store or publish it
 until the operator selects **Publish dashboard**. Fleet creates
 or updates the owned CNAME and remotely managed tunnel ingress rule, verifies
 both, and probes the public endpoint. Service URLs are derived from Fleet
 topology and are read-only. Never publish an instance API endpoint.
 
-Copy each tunnel's connector token from Cloudflare and paste it into **System >
-Remote access**. Fleet encrypts the tokens in its database, writes only
-permission-`0600` runtime token files, and invokes `cloudflared` with
-`--token-file`, so tokens are not placed in process arguments. The API returns
-only configured flags and non-secret fingerprints; leaving a secret field
-blank preserves the stored value.
+Fleet writes connector tokens only to permission-`0600` runtime token files and
+invokes `cloudflared` with `--token-file`, so tokens are not placed in process
+arguments. The API returns only configured flags and non-secret fingerprints.
+The Advanced manual setup preserves the previous pre-created tunnel-token and
+scoped API-token workflow for installations without an OAuth client.
 
 The admin connector shares only the control-plane Compose network. The instance
 connector additionally joins the internal-only `hermes-fleet-edge` network;

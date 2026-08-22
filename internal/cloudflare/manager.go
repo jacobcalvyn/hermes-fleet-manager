@@ -24,13 +24,15 @@ import (
 	"time"
 
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/domain"
+	"github.com/jacobcalvyn/hermes-fleet-manager/internal/netpolicy"
 )
 
 const (
-	defaultAPIBaseURL   = "https://api.cloudflare.com/client/v4"
-	managedDNSComment   = "Managed by Hermes Fleet"
-	defaultSyncPeriod   = 30 * time.Second
-	connectorSyncPeriod = 2 * time.Second
+	defaultAPIBaseURL    = "https://api.cloudflare.com/client/v4"
+	defaultOAuthTokenURL = "https://dash.cloudflare.com/oauth2/token"
+	managedDNSComment    = "Managed by Hermes Fleet"
+	defaultSyncPeriod    = 30 * time.Second
+	connectorSyncPeriod  = 2 * time.Second
 )
 
 var canonicalTunnelID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
@@ -50,6 +52,7 @@ type Config struct {
 	InstancesAccessTeam          string                `json:"instances_access_team"`
 	InstancesAccessAudience      string                `json:"instances_access_audience"`
 	RouteAutomation              RouteAutomationConfig `json:"route_automation,omitempty"`
+	OAuth                        OAuthCredentials      `json:"oauth,omitempty"`
 	APIBaseURL                   string                `json:"-"`
 	SyncPeriod                   time.Duration         `json:"-"`
 	CredentialsDirectory         string                `json:"-"`
@@ -59,6 +62,18 @@ type Config struct {
 	InstancesConnectorTokenPath  string                `json:"-"`
 	AdminConnectorHealthURL      string                `json:"-"`
 	InstancesConnectorHealthURL  string                `json:"-"`
+}
+
+// OAuthCredentials contains the renewable Cloudflare authorization used by
+// Fleet-managed route automation. The containing remote-access configuration
+// is encrypted as one sealed record; these values are never returned by the
+// configuration API.
+type OAuthCredentials struct {
+	ClientID     string    `json:"client_id,omitempty"`
+	AccessToken  string    `json:"access_token,omitempty"`
+	RefreshToken string    `json:"refresh_token,omitempty"`
+	Scope        string    `json:"scope,omitempty"`
+	ExpiresAt    time.Time `json:"expires_at,omitempty"`
 }
 
 // RouteAutomationConfig authorizes Fleet to reconcile only the instance
@@ -91,6 +106,8 @@ type ConfigurationView struct {
 	RouteAutomationFleetNamespace   string `json:"route_automation_fleet_namespace,omitempty"`
 	RouteAutomationTunnelID         string `json:"route_automation_tunnel_id,omitempty"`
 	RouteAutomationTokenFingerprint string `json:"route_automation_token_fingerprint,omitempty"`
+	OAuthConnected                  bool   `json:"oauth_connected"`
+	OAuthScope                      string `json:"oauth_scope,omitempty"`
 }
 
 type RouteObservation struct {
@@ -142,19 +159,22 @@ type Status struct {
 }
 
 type Manager struct {
-	config         Config
-	source         InstanceSource
-	ownership      ResourceOwnership
-	client         *http.Client
-	endpointClient *http.Client
-	logger         *slog.Logger
-	reconcile      sync.Mutex
-	lifecycle      sync.Mutex
-	mu             sync.RWMutex
-	status         Status
-	routes         map[string]struct{}
-	observations   map[string]RouteObservation
-	trigger        chan struct{}
+	config            Config
+	source            InstanceSource
+	ownership         ResourceOwnership
+	client            *http.Client
+	endpointClient    *http.Client
+	endpointClientFor func(context.Context, string) (*http.Client, error)
+	logger            *slog.Logger
+	reconcile         sync.Mutex
+	lifecycle         sync.Mutex
+	oauthRefresh      sync.Mutex
+	mu                sync.RWMutex
+	status            Status
+	routes            map[string]struct{}
+	observations      map[string]RouteObservation
+	trigger           chan struct{}
+	persistConfig     func(context.Context, Config) error
 }
 
 func New(config Config, source InstanceSource, client *http.Client, logger *slog.Logger) (*Manager, error) {
@@ -173,8 +193,15 @@ func New(config Config, source InstanceSource, client *http.Client, logger *slog
 		logger = slog.Default()
 	}
 	manager := &Manager{
-		config: config, source: source, client: client, endpointClient: newPublicEndpointClient(client), logger: logger,
+		config: config, source: source, client: client, logger: logger,
 		routes: make(map[string]struct{}), observations: make(map[string]RouteObservation), trigger: make(chan struct{}, 1),
+	}
+	if _, standardTransport := client.Transport.(*http.Transport); client.Transport == nil || standardTransport {
+		manager.endpointClientFor = newPublicEndpointClientFactory(client)
+	} else {
+		// Explicitly injected transports are test/caller-owned and cannot be
+		// cloned into a DNS-pinned transport. Production uses http.Transport.
+		manager.endpointClient = client
 	}
 	manager.status = Status{
 		Configured: configured,
@@ -185,19 +212,7 @@ func New(config Config, source InstanceSource, client *http.Client, logger *slog
 	return manager, nil
 }
 
-func newPublicEndpointClient(base *http.Client) *http.Client {
-	client := *base
-	var transport *http.Transport
-	switch configured := base.Transport.(type) {
-	case nil:
-		transport = http.DefaultTransport.(*http.Transport).Clone()
-	case *http.Transport:
-		transport = configured.Clone()
-	default:
-		// Preserve injected transports used by callers and tests. Production uses
-		// an http.Transport and receives the dedicated public resolver below.
-		return &client
-	}
+func newPublicEndpointClientFactory(base *http.Client) func(context.Context, string) (*http.Client, error) {
 	resolver := &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
@@ -209,10 +224,11 @@ func newPublicEndpointClient(base *http.Client) *http.Client {
 			return dialer.DialContext(ctx, protocol, "1.1.1.1:53")
 		},
 	}
-	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second, Resolver: resolver}
-	transport.DialContext = dialer.DialContext
-	client.Transport = transport
-	return &client
+	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+	return func(ctx context.Context, hostname string) (*http.Client, error) {
+		_, client, err := netpolicy.NewPinnedHTTPSClient(ctx, "https://"+hostname, resolver, dialer, base)
+		return client, err
+	}
 }
 
 func normalizeConfig(config Config) Config {
@@ -239,6 +255,10 @@ func normalizeConfig(config Config) Config {
 	config.RouteAutomation.FleetNamespace = strings.ToLower(strings.TrimSpace(config.RouteAutomation.FleetNamespace))
 	config.RouteAutomation.TunnelID = strings.ToLower(strings.TrimSpace(config.RouteAutomation.TunnelID))
 	config.RouteAutomation.APIToken = strings.TrimSpace(config.RouteAutomation.APIToken)
+	config.OAuth.ClientID = strings.TrimSpace(config.OAuth.ClientID)
+	config.OAuth.AccessToken = strings.TrimSpace(config.OAuth.AccessToken)
+	config.OAuth.RefreshToken = strings.TrimSpace(config.OAuth.RefreshToken)
+	config.OAuth.Scope = strings.TrimSpace(config.OAuth.Scope)
 	config.APIBaseURL = strings.TrimRight(strings.TrimSpace(config.APIBaseURL), "/")
 	config.CredentialsDirectory = strings.TrimSpace(config.CredentialsDirectory)
 	config.AdminConnectorConfigPath = strings.TrimSpace(config.AdminConnectorConfigPath)
@@ -257,6 +277,16 @@ func normalizeConfig(config Config) Config {
 }
 
 func validateConfig(config Config) (bool, error) {
+	oauthValues := []string{config.OAuth.ClientID, config.OAuth.AccessToken, config.OAuth.RefreshToken}
+	oauthPopulated := 0
+	for _, value := range oauthValues {
+		if value != "" {
+			oauthPopulated++
+		}
+	}
+	if oauthPopulated != 0 && oauthPopulated != len(oauthValues) {
+		return false, errors.New("Cloudflare OAuth requires the client, access, and refresh token")
+	}
 	automationValues := []string{
 		config.RouteAutomation.AccountID,
 		config.RouteAutomation.ZoneID,
@@ -424,6 +454,15 @@ func (manager *Manager) SetOwnershipStore(ownership ResourceOwnership) {
 	manager.mu.Unlock()
 }
 
+// SetConfigPersister installs the encrypted persistence boundary used after an
+// OAuth refresh token rotation. The callback must not expose the configuration
+// through an API response.
+func (manager *Manager) SetConfigPersister(persist func(context.Context, Config) error) {
+	manager.mu.Lock()
+	manager.persistConfig = persist
+	manager.mu.Unlock()
+}
+
 func legacyProviderManaged(config Config) bool {
 	return config.AccountID != "" && config.ZoneID != "" &&
 		config.AdminAPIToken != "" && config.InstancesAPIToken != "" &&
@@ -500,7 +539,8 @@ func validDNSLabel(value string) bool {
 }
 
 func validHostname(value string) bool {
-	if value == "" || len(value) > 253 || strings.Contains(value, "*") {
+	if value == "" || len(value) > 253 || strings.Contains(value, "*") || !strings.Contains(value, ".") ||
+		net.ParseIP(value) != nil || value == "localhost" || strings.HasSuffix(value, ".localhost") || strings.HasSuffix(value, ".local") {
 		return false
 	}
 	for _, label := range strings.Split(value, ".") {
@@ -1112,6 +1152,8 @@ func (manager *Manager) Configuration() ConfigurationView {
 		RouteAutomationFleetNamespace:   config.RouteAutomation.FleetNamespace,
 		RouteAutomationTunnelID:         config.RouteAutomation.TunnelID,
 		RouteAutomationTokenFingerprint: tunnelTokenFingerprint(config.RouteAutomation.APIToken),
+		OAuthConnected:                  config.OAuth.ClientID != "" && config.OAuth.RefreshToken != "",
+		OAuthScope:                      config.OAuth.Scope,
 	}
 }
 
@@ -1713,6 +1755,17 @@ func (manager *Manager) api(ctx context.Context, token, method, path string, bod
 }
 
 func (manager *Manager) apiWithConfig(ctx context.Context, config Config, token, method, path string, body any, output any) error {
+	if config.OAuth.RefreshToken != "" && token == config.RouteAutomation.APIToken {
+		if config.OAuth.AccessToken != "" && time.Until(config.OAuth.ExpiresAt) > 2*time.Minute {
+			token = config.OAuth.AccessToken
+		} else {
+			resolved, err := manager.oauthAccessToken(ctx, config)
+			if err != nil {
+				return fmt.Errorf("refresh Cloudflare OAuth authorization: %w", err)
+			}
+			token = resolved
+		}
+	}
 	var reader io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
@@ -1756,4 +1809,96 @@ func (manager *Manager) apiWithConfig(ctx context.Context, config Config, token,
 		}
 	}
 	return nil
+}
+
+func (manager *Manager) oauthAccessToken(ctx context.Context, fallback Config) (string, error) {
+	manager.oauthRefresh.Lock()
+	defer manager.oauthRefresh.Unlock()
+
+	manager.mu.RLock()
+	current := manager.config
+	persist := manager.persistConfig
+	manager.mu.RUnlock()
+	if current.OAuth.ClientID == "" || current.OAuth.RefreshToken == "" {
+		current = fallback
+	}
+	if current.OAuth.AccessToken != "" && time.Until(current.OAuth.ExpiresAt) > 2*time.Minute {
+		return current.OAuth.AccessToken, nil
+	}
+	if current.OAuth.ClientID == "" || current.OAuth.RefreshToken == "" {
+		return "", errors.New("OAuth refresh credentials are unavailable")
+	}
+
+	form := url.Values{
+		"grant_type":    {"refresh_token"},
+		"client_id":     {current.OAuth.ClientID},
+		"refresh_token": {current.OAuth.RefreshToken},
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, defaultOAuthTokenURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response, err := manager.client.Do(request)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+	payload, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if err != nil {
+		return "", err
+	}
+	var result struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		TokenType    string `json:"token_type"`
+		Scope        string `json:"scope"`
+		ExpiresIn    int64  `json:"expires_in"`
+		Error        string `json:"error"`
+		Description  string `json:"error_description"`
+	}
+	if err := json.Unmarshal(payload, &result); err != nil {
+		return "", fmt.Errorf("Cloudflare OAuth returned HTTP %d with an invalid response", response.StatusCode)
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 || strings.TrimSpace(result.AccessToken) == "" {
+		detail := strings.TrimSpace(result.Description)
+		if detail == "" {
+			detail = strings.TrimSpace(result.Error)
+		}
+		if detail == "" {
+			detail = http.StatusText(response.StatusCode)
+		}
+		return "", fmt.Errorf("Cloudflare OAuth HTTP %d: %s", response.StatusCode, detail)
+	}
+	if result.TokenType != "" && !strings.EqualFold(result.TokenType, "bearer") {
+		return "", fmt.Errorf("Cloudflare OAuth returned unsupported token type %q", result.TokenType)
+	}
+	if result.ExpiresIn <= 0 {
+		return "", errors.New("Cloudflare OAuth response omitted token expiry")
+	}
+
+	next := current
+	next.OAuth.AccessToken = strings.TrimSpace(result.AccessToken)
+	if strings.TrimSpace(result.RefreshToken) != "" {
+		next.OAuth.RefreshToken = strings.TrimSpace(result.RefreshToken)
+	}
+	if strings.TrimSpace(result.Scope) != "" {
+		next.OAuth.Scope = strings.TrimSpace(result.Scope)
+	}
+	next.OAuth.ExpiresAt = time.Now().UTC().Add(time.Duration(result.ExpiresIn) * time.Second)
+	next.RouteAutomation.APIToken = next.OAuth.AccessToken
+
+	if persist != nil {
+		if err := persist(ctx, next); err != nil {
+			return "", fmt.Errorf("persist rotated OAuth authorization: %w", err)
+		}
+	}
+	manager.mu.Lock()
+	if manager.config.OAuth.ClientID == next.OAuth.ClientID || manager.config.OAuth.ClientID == "" {
+		manager.config.OAuth = next.OAuth
+		manager.config.RouteAutomation.APIToken = next.RouteAutomation.APIToken
+	}
+	manager.mu.Unlock()
+	return next.OAuth.AccessToken, nil
 }

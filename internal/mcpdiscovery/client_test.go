@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/netip"
 	"strings"
@@ -12,6 +13,14 @@ import (
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
+
+type staticResolver struct {
+	addresses []net.IPAddr
+}
+
+func (resolver staticResolver) LookupIPAddr(context.Context, string) ([]net.IPAddr, error) {
+	return resolver.addresses, nil
+}
 
 func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return function(request)
@@ -78,6 +87,21 @@ func TestDiscoverRejectsPrivateAndUnsafeEndpoints(t *testing.T) {
 		if err != nil || !blockedAddress(address) {
 			t.Fatalf("address %q blocked=%v err=%v", raw, blockedAddress(address), err)
 		}
+	}
+}
+
+func TestRestrictedDiscoveryRejectsMixedPublicAndPrivateDNSAnswers(t *testing.T) {
+	endpoint, err := validateEndpoint("https://mcp.example.com/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := NewClient()
+	client.resolver = staticResolver{addresses: []net.IPAddr{
+		{IP: net.ParseIP("1.1.1.1")},
+		{IP: net.ParseIP("127.0.0.1")},
+	}}
+	if _, err := client.restrictedHTTPClient(context.Background(), endpoint); err == nil || !strings.Contains(err.Error(), "private or non-routable") {
+		t.Fatalf("restrictedHTTPClient() error = %v", err)
 	}
 }
 

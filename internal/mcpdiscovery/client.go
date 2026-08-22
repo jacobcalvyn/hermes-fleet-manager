@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/compatibility"
+	"github.com/jacobcalvyn/hermes-fleet-manager/internal/netpolicy"
 )
 
 const (
@@ -28,29 +28,6 @@ const (
 )
 
 var toolNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$`)
-
-var blockedNetworks = []netip.Prefix{
-	netip.MustParsePrefix("0.0.0.0/8"),
-	netip.MustParsePrefix("10.0.0.0/8"),
-	netip.MustParsePrefix("100.64.0.0/10"),
-	netip.MustParsePrefix("127.0.0.0/8"),
-	netip.MustParsePrefix("169.254.0.0/16"),
-	netip.MustParsePrefix("172.16.0.0/12"),
-	netip.MustParsePrefix("192.0.0.0/24"),
-	netip.MustParsePrefix("192.0.2.0/24"),
-	netip.MustParsePrefix("192.168.0.0/16"),
-	netip.MustParsePrefix("198.18.0.0/15"),
-	netip.MustParsePrefix("198.51.100.0/24"),
-	netip.MustParsePrefix("203.0.113.0/24"),
-	netip.MustParsePrefix("224.0.0.0/4"),
-	netip.MustParsePrefix("240.0.0.0/4"),
-	netip.MustParsePrefix("::/128"),
-	netip.MustParsePrefix("::1/128"),
-	netip.MustParsePrefix("fc00::/7"),
-	netip.MustParsePrefix("fe80::/10"),
-	netip.MustParsePrefix("ff00::/8"),
-	netip.MustParsePrefix("2001:db8::/32"),
-}
 
 type Request struct {
 	URL         string
@@ -82,8 +59,8 @@ func (err *HTTPStatusError) Error() string {
 }
 
 type Client struct {
-	resolver   *net.Resolver
-	dialer     *net.Dialer
+	resolver   netpolicy.Resolver
+	dialer     netpolicy.Dialer
 	httpClient *http.Client
 }
 
@@ -133,61 +110,22 @@ func (client *Client) restrictedHTTPClient(ctx context.Context, endpoint *url.UR
 	if resolver == nil {
 		resolver = net.DefaultResolver
 	}
-	addresses, err := resolver.LookupIPAddr(ctx, endpoint.Hostname())
-	if err != nil || len(addresses) == 0 {
-		return nil, errors.New("MCP discovery endpoint could not be resolved")
-	}
-	allowed := make([]net.IP, 0, len(addresses))
-	for _, candidate := range addresses {
-		address, ok := netip.AddrFromSlice(candidate.IP)
-		if !ok || blockedAddress(address.Unmap()) {
-			return nil, errors.New("MCP discovery endpoint resolves to a private or non-routable address")
-		}
-		allowed = append(allowed, append(net.IP(nil), candidate.IP...))
-	}
-	port := endpoint.Port()
-	if port == "" {
-		port = "443"
-	}
 	dialer := client.dialer
 	if dialer == nil {
 		dialer = &net.Dialer{Timeout: 8 * time.Second, KeepAlive: 15 * time.Second}
 	}
-	transport := &http.Transport{
-		Proxy:                 nil,
-		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12, ServerName: endpoint.Hostname()},
-		TLSHandshakeTimeout:   8 * time.Second,
-		ResponseHeaderTimeout: 15 * time.Second,
-		IdleConnTimeout:       15 * time.Second,
-		DisableCompression:    true,
-		DialContext: func(dialContext context.Context, network, _ string) (net.Conn, error) {
-			var lastErr error
-			for _, address := range allowed {
-				connection, dialErr := dialer.DialContext(dialContext, network, net.JoinHostPort(address.String(), port))
-				if dialErr == nil {
-					return connection, nil
-				}
-				lastErr = dialErr
-			}
-			return nil, lastErr
-		},
+	_, restricted, err := netpolicy.NewPinnedHTTPSClient(ctx, endpoint.String(), resolver, dialer, &http.Client{Timeout: 25 * time.Second})
+	if errors.Is(err, netpolicy.ErrUnsafeAddress) {
+		return nil, errors.New("MCP discovery endpoint resolves to a private or non-routable address")
 	}
-	return &http.Client{
-		Transport: transport,
-		Timeout:   25 * time.Second,
-		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-			return errors.New("MCP discovery does not follow redirects")
-		},
-	}, nil
+	if err != nil {
+		return nil, errors.New("MCP discovery endpoint could not be resolved")
+	}
+	return restricted, nil
 }
 
 func blockedAddress(address netip.Addr) bool {
-	for _, network := range blockedNetworks {
-		if network.Contains(address) {
-			return true
-		}
-	}
-	return false
+	return !netpolicy.IsPublicAddress(address)
 }
 
 type protocolClient struct {

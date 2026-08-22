@@ -52,6 +52,16 @@ type Manager struct {
 	mu         sync.RWMutex
 }
 
+// ValidateMetadata verifies the portable identity and integrity fields used by
+// recovery kit import before any filesystem path is derived from them.
+func ValidateMetadata(metadata Metadata) error {
+	if !backupIDPattern.MatchString(metadata.ID) || !backupFilenamePattern.MatchString(metadata.Filename) || metadata.SizeBytes <= 0 ||
+		!sha256Pattern.MatchString(metadata.SHA256) || metadata.CreatedAt.IsZero() || metadata.VerifiedAt.IsZero() {
+		return fmt.Errorf("%w: incomplete backup metadata", ErrIntegrity)
+	}
+	return nil
+}
+
 func New(root string, store SnapshotStore, maxBackups int) (*Manager, error) {
 	if store == nil {
 		return nil, errors.New("backup snapshot store is required")
@@ -362,8 +372,10 @@ func (m *Manager) get(id string) (Metadata, error) {
 	if err := json.Unmarshal(data, &metadata); err != nil {
 		return Metadata{}, fmt.Errorf("%w: invalid backup metadata", ErrIntegrity)
 	}
-	if metadata.ID != id || !backupFilenamePattern.MatchString(metadata.Filename) || metadata.SizeBytes <= 0 ||
-		!sha256Pattern.MatchString(metadata.SHA256) || metadata.CreatedAt.IsZero() || metadata.VerifiedAt.IsZero() {
+	if metadata.ID != id {
+		return Metadata{}, fmt.Errorf("%w: backup metadata identity does not match", ErrIntegrity)
+	}
+	if err := ValidateMetadata(metadata); err != nil {
 		return Metadata{}, fmt.Errorf("%w: incomplete backup metadata", ErrIntegrity)
 	}
 	for _, path := range []string{m.metadataPath(id), m.databasePath(id)} {

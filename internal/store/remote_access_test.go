@@ -53,3 +53,29 @@ func TestRemoteAccessConfigurationRoundTripAndDelete(t *testing.T) {
 		t.Fatalf("GetRemoteAccessConfig() after delete error=%v, want ErrNotFound", err)
 	}
 }
+
+func TestCloudflareOAuthClientRoundTrip(t *testing.T) {
+	dataStore, err := Open(filepath.Join(t.TempDir(), "fleet.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dataStore.Close()
+
+	ctx := context.Background()
+	if _, err := dataStore.GetCloudflareOAuthClient(ctx); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetCloudflareOAuthClient() error=%v, want ErrNotFound", err)
+	}
+
+	updatedAt := time.Date(2026, 8, 22, 1, 2, 3, 0, time.UTC)
+	record := CloudflareOAuthClientRecord{ClientID: "cloudflare-client-id", UpdatedAt: updatedAt}
+	if err := dataStore.PutCloudflareOAuthClient(ctx, record); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := dataStore.GetCloudflareOAuthClient(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ClientID != record.ClientID || !stored.UpdatedAt.Equal(updatedAt) {
+		t.Fatalf("stored record=%+v, want %+v", stored, record)
+	}
+}

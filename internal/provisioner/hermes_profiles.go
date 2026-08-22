@@ -487,7 +487,10 @@ func (p *Provisioner) hermesProfileHTTPRequest(ctx context.Context, port int, se
 func (p *Provisioner) hermesProfileHTTPClient(method, requestPath string) *http.Client {
 	profileMutation := method == http.MethodPost && requestPath == "/api/profiles"
 	profileDeletion := method == http.MethodDelete && strings.HasPrefix(requestPath, "/api/profiles/")
-	if !profileMutation && !profileDeletion {
+	skillMutation := (method == http.MethodPost && requestPath == "/api/skills") ||
+		(method == http.MethodPut && requestPath == "/api/skills/content")
+	toolsetMutation := method == http.MethodPut && strings.HasPrefix(requestPath, "/api/tools/toolsets/")
+	if !profileMutation && !profileDeletion && !skillMutation && !toolsetMutation {
 		return p.httpClient
 	}
 	mutationClient := *p.httpClient

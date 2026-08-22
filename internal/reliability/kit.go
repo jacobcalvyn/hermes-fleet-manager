@@ -28,6 +28,7 @@ type KitManifest struct {
 	InstanceBackups     []recovery.Metadata `json:"instance_backups"`
 	ReleaseCatalog      releases.Catalog    `json:"release_catalog"`
 	EncryptionKeyPolicy string              `json:"encryption_key_policy"`
+	AuthenticationTag   string              `json:"authentication_tag"`
 }
 
 type RecoveryKit struct {
@@ -90,10 +91,15 @@ func (k *RecoveryKit) Export(ctx context.Context, destination io.Writer) (KitMan
 		instanceBackups = append(instanceBackups, *selected)
 	}
 	manifest := KitManifest{
-		FormatVersion: 1, CreatedAt: k.now().UTC(), FleetVersion: k.fleetVersion, BuildID: k.buildID,
+		FormatVersion: 2, CreatedAt: k.now().UTC(), FleetVersion: k.fleetVersion, BuildID: k.buildID,
 		ControlPlaneBackup: controlPlaneBackup, InstanceBackups: instanceBackups, ReleaseCatalog: k.catalog,
 		EncryptionKeyPolicy: "FLEET_RECOVERY_ENCRYPTION_KEY is intentionally excluded and must be retained separately",
 	}
+	authenticated, err := authenticatedManifestBytes(manifest)
+	if err != nil {
+		return KitManifest{}, fmt.Errorf("encode recovery kit manifest for authentication: %w", err)
+	}
+	manifest.AuthenticationTag = k.recovery.AuthenticateRecoveryKitManifest(authenticated)
 	archive := tar.NewWriter(destination)
 	if err := writeJSONEntry(archive, "manifest.json", manifest); err != nil {
 		_ = archive.Close()
@@ -143,6 +149,11 @@ func (k *RecoveryKit) Export(ctx context.Context, destination io.Writer) (KitMan
 		return KitManifest{}, fmt.Errorf("finish recovery kit: %w", err)
 	}
 	return manifest, nil
+}
+
+func authenticatedManifestBytes(manifest KitManifest) ([]byte, error) {
+	manifest.AuthenticationTag = ""
+	return json.Marshal(manifest)
 }
 
 func writeJSONEntry(archive *tar.Writer, name string, value any) error {

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/domain"
+	"github.com/jacobcalvyn/hermes-fleet-manager/internal/netpolicy"
 )
 
 const (
@@ -683,7 +684,13 @@ func (manager *Manager) checkPublicEndpointOnce(ctx context.Context, hostname st
 	endpointContext, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	configuredClient := manager.endpointClient
-	if configuredClient == nil {
+	if manager.endpointClientFor != nil {
+		var err error
+		configuredClient, err = manager.endpointClientFor(endpointContext, hostname)
+		if err != nil {
+			return classifyPublicEndpointRequestError(ctx, err)
+		}
+	} else if configuredClient == nil {
 		configuredClient = manager.client
 	}
 	client := *configuredClient
@@ -719,6 +726,9 @@ func (manager *Manager) checkPublicEndpointOnce(ctx context.Context, hostname st
 }
 
 func classifyPublicEndpointRequestError(ctx context.Context, err error) (string, string, bool) {
+	if errors.Is(err, netpolicy.ErrUnsafeAddress) || errors.Is(err, netpolicy.ErrInvalidEndpoint) {
+		return EndpointUnavailable, err.Error(), false
+	}
 	var dnsError *net.DNSError
 	if errors.As(err, &dnsError) {
 		if dnsError.IsNotFound {

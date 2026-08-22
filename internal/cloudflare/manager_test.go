@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/domain"
+	"github.com/jacobcalvyn/hermes-fleet-manager/internal/netpolicy"
 )
 
 const (
@@ -829,6 +830,30 @@ func TestPublicEndpointUsesDedicatedResolverClient(t *testing.T) {
 	}
 	if apiRequests != 0 || endpointRequests != 1 {
 		t.Fatalf("api requests=%d endpoint requests=%d", apiRequests, endpointRequests)
+	}
+}
+
+func TestPublicEndpointRejectsPrivateResolutionWithoutRetry(t *testing.T) {
+	manager := &Manager{
+		client: &http.Client{},
+		endpointClientFor: func(context.Context, string) (*http.Client, error) {
+			return nil, netpolicy.ErrUnsafeAddress
+		},
+	}
+	state, detail, retry := manager.checkPublicEndpointOnce(context.Background(), "alpha.hermes.example.com")
+	if state != EndpointUnavailable || retry || !strings.Contains(detail, "private or non-routable") {
+		t.Fatalf("checkPublicEndpointOnce() = (%q, %q, %t)", state, detail, retry)
+	}
+}
+
+func TestValidHostnameRejectsLocalAndLiteralTargets(t *testing.T) {
+	for _, hostname := range []string{"localhost", "service.local", "127.0.0.1", "single-label"} {
+		if validHostname(hostname) {
+			t.Fatalf("validHostname(%q) = true", hostname)
+		}
+	}
+	if !validHostname("admin.example.com") {
+		t.Fatal("validHostname() rejected a public DNS name")
 	}
 }
 

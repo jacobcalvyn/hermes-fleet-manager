@@ -25,6 +25,11 @@ common=(
 
 docker run "${common[@]}" -e HERMES_FLEET_CONFIG_OWNER=true "$image" true
 docker run "${common[@]}" -e HERMES_FLEET_CONFIG_OWNER=false -e HERMES_FLEET_READY_TIMEOUT=0 "$image" true
+docker run --rm --network none "$image" bash -lc '
+test "$AGENT_BROWSER_EXECUTABLE_PATH" = /usr/local/bin/hermes-chromium
+test -x "$AGENT_BROWSER_EXECUTABLE_PATH"
+"$AGENT_BROWSER_EXECUTABLE_PATH" --version
+'
 docker run --rm --network none -e HERMES_HOME=/data -v "$volume:/data" --entrypoint python "$image" -c '
 import hashlib, json, os
 from hermes_cli.config import load_config

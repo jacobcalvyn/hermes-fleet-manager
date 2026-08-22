@@ -96,6 +96,9 @@ RUN cd /opt/hermes-agent \
     && test "$(.venv/bin/python -c 'import importlib.metadata as m; print(m.version("hermes-agent"))')" = "${HERMES_VERSION}" \
     && python -m playwright install chromium \
     && python -m playwright install-deps --dry-run chromium \
+    && browser_path="$(find "${PLAYWRIGHT_BROWSERS_PATH}" -path '*/chrome-linux/chrome' -type f -perm -111 -print -quit)" \
+    && test -n "$browser_path" \
+    && ln -s "$browser_path" /usr/local/bin/hermes-chromium \
     && rm -rf /var/lib/apt/lists/*
 
 COPY runtime/entrypoint.sh /usr/local/bin/hermes-fleet-runtime-entrypoint
@@ -103,11 +106,14 @@ COPY runtime/configure.py /usr/local/bin/hermes-fleet-runtime-configure
 RUN chmod +x /usr/local/bin/hermes-fleet-runtime-entrypoint /usr/local/bin/hermes-fleet-runtime-configure \
     && mkdir -p /data /workspace
 
-ENV HERMES_FLEET_RUNTIME_BUILD_ID=${RUNTIME_BUILD_ID}
+ENV HERMES_FLEET_RUNTIME_BUILD_ID=${RUNTIME_BUILD_ID} \
+    HERMES_FLEET_BROWSER_REQUIRED=true \
+    AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/hermes-chromium
 
 LABEL io.hermes-fleet.hermes-version="${HERMES_VERSION}" \
       io.hermes-fleet.hermes-ref="${HERMES_REF}" \
       io.hermes-fleet.runtime-config-schema="2" \
+      io.hermes-fleet.browser-runtime="playwright-chromium.v1" \
       io.hermes-fleet.runtime-build-id="${RUNTIME_BUILD_ID}"
 
 WORKDIR /workspace

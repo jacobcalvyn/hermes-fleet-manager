@@ -133,6 +133,54 @@ export type HermesProfileInventory = {
 	observed_at?: string
 }
 
+export type HermesCapabilityInventory = {
+	instance_id: string
+	platform?: string
+	model?: string
+	runtime_mode?: string
+	tool_execution?: string
+	split_runtime: boolean
+	features: Record<string, boolean>
+	skills: Array<{ name: string; description?: string; category?: string }>
+	toolsets: Array<{
+		name: string
+		label?: string
+		description?: string
+		enabled: boolean
+		configured: boolean
+		tools: string[]
+	}>
+	browser: { available: boolean; implementation?: string }
+	observed_at?: string
+}
+
+export type FleetSkill = {
+	name: string
+	description: string
+	category?: string
+	content: string
+	revision: string
+	origin_type: 'fleet_created' | 'copied_from_instance'
+	source_instance_id?: string
+	source_instance_name?: string
+	source_profile?: string
+	source_revision?: string
+	source_provenance?: string
+	source_observed_at?: string
+	created_at: string
+	updated_at: string
+}
+
+export type HermesSkillContentSnapshot = {
+	instance_id: string
+	skill_name: string
+	profile: string
+	provenance?: string
+	content: string
+	revision: string
+	observed_at?: string
+}
+
 export type ChatSession = {
 	id: string
 	instance_id: string
@@ -265,62 +313,6 @@ export type OutputUsage = {
 	status_counts: Partial<Record<OutputStatus, number>>
 	instances: Record<string, number>
 	sessions: Record<string, number>
-}
-
-export type PolicyComplianceSummary = {
-  total: number
-  compliant: number
-  drifted: number
-  blocked: number
-}
-
-export type FleetPolicy = {
-  id: string
-  name: string
-  description?: string
-  status: 'ENABLED' | 'DISABLED'
-  desired_hermes: 'LATEST_STABLE'
-  strategy: 'ONE_AT_A_TIME' | 'ALL_AT_ONCE'
-  scope_instance_ids: string[]
-  created_at: string
-  updated_at: string
-  compliance?: PolicyComplianceSummary
-	active_rollout?: ControlledPolicyRollout
-}
-
-export type PolicyRolloutTarget = {
-	rollout_id: string
-	policy_id: string
-	instance_id: string
-	instance_name: string
-	child_operation_id?: string
-	status: 'PENDING' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'BLOCKED'
-	detail?: string
-	created_at: string
-	updated_at: string
-}
-
-export type ControlledPolicyRollout = Operation & {
-	control_state: 'RUNNING' | 'PAUSED' | 'CANCELING'
-	control_reason?: string
-	canary_instance_id: string
-	target_version: string
-	targets: PolicyRolloutTarget[]
-}
-
-export type PolicyTargetPreview = {
-  instance_id: string
-  instance_name: string
-  current_version?: string
-  target_version?: string
-  state: 'COMPLIANT' | 'DRIFTED' | 'BLOCKED'
-  detail: string
-}
-
-export type PolicyPreview = {
-  policy: FleetPolicy
-  summary: PolicyComplianceSummary
-  targets: PolicyTargetPreview[]
 }
 
 export type Overview = {
@@ -667,9 +659,47 @@ export type RemoteAccessConfiguration = {
 	instance_publishing_fleet_namespace?: string
 	instance_publishing_tunnel_id?: string
 	instance_publishing_token_fingerprint?: string
+	cloudflare_oauth_available?: boolean
+	cloudflare_oauth_connected?: boolean
+	cloudflare_oauth_scope?: string
+	cloudflare_oauth_setup?: CloudflareOAuthSetup
 	legacy_provider_managed: boolean
 	admin_url: string
 	instance_endpoints: RemoteAccessInstanceEndpoint[]
 	admin_origin_service: string
 	instance_routes: RemoteAccessPublishedRoute[]
+}
+
+export type CloudflareOAuthSetup = {
+	client_configured: boolean
+	client_id?: string
+	managed_externally: boolean
+	redirect_url: string
+	oauth_clients_url: string
+	documentation_url: string
+	scopes: CloudflareOAuthRequiredScope[]
+}
+
+export type CloudflareOAuthRequiredScope = {
+	id: string
+	name: string
+	purpose: string
+}
+
+export type CloudflareOAuthAccount = {
+	id: string
+	name: string
+}
+
+export type CloudflareOAuthZone = {
+	id: string
+	name: string
+	account_id: string
+}
+
+export type CloudflareOAuthSession = {
+	id: string
+	accounts: CloudflareOAuthAccount[]
+	zones: CloudflareOAuthZone[]
+	expires_at: string
 }

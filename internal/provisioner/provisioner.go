@@ -32,6 +32,7 @@ import (
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/compatibility"
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/domain"
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/mcpconfig"
+	"github.com/jacobcalvyn/hermes-fleet-manager/internal/mcpdiscovery"
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/messaging"
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/providers"
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/recovery"
@@ -61,6 +62,8 @@ const (
 	dashboardReadinessPollInterval  = 2 * time.Second
 	hermesChatConnectionIdleTimeout = 90 * time.Second
 	hermesChatSemanticIdleTimeout   = 2 * time.Minute
+	hermesChatProcessWaitGrace      = 30 * time.Second
+	hermesChatProcessWaitMaximum    = 10 * time.Minute
 )
 
 type Provisioner struct {
@@ -73,6 +76,7 @@ type Provisioner struct {
 	chatConnectionIdleTimeout time.Duration
 	chatSemanticIdleTimeout   time.Duration
 	portCheck                 func(int) error
+	mcpDiscover               func(context.Context, mcpdiscovery.Request) ([]mcpdiscovery.Tool, error)
 	recoveryBlocks            map[string]string
 	diskAvailable             func(string) (uint64, error)
 	volumeSize                func(context.Context, string, string, int64) (int64, error)
@@ -179,12 +183,14 @@ func New(root, dockerPath string) (*Provisioner, error) {
 	if dockerPath == "" {
 		dockerPath = "docker"
 	}
+	mcpClient := mcpdiscovery.NewClient()
 	return &Provisioner{
 		root: absoluteRoot, dockerPath: dockerPath,
 		httpClient:                &http.Client{Timeout: 5 * time.Second},
 		chatConnectionIdleTimeout: hermesChatConnectionIdleTimeout,
 		chatSemanticIdleTimeout:   hermesChatSemanticIdleTimeout,
 		portCheck:                 checkPort,
+		mcpDiscover:               mcpClient.Discover,
 		recoveryBlocks:            recoveryBlocks,
 	}, nil
 }
@@ -339,6 +345,36 @@ func (p *Provisioner) ExecuteWithProgress(ctx context.Context, job domain.Job, r
 			return failure("invalid Hermes profile deletion payload", err)
 		}
 		return p.deleteHermesProfile(ctx, payload)
+	case domain.JobInspectHermesCapabilities:
+		var payload domain.HermesCapabilityInspectPayload
+		if err := json.Unmarshal(job.Payload, &payload); err != nil {
+			return failure("invalid Hermes capability inspection payload", err)
+		}
+		return p.inspectHermesCapabilities(ctx, payload)
+	case domain.JobSyncHermesSkill:
+		var payload domain.HermesSkillSyncPayload
+		if err := json.Unmarshal(job.Payload, &payload); err != nil {
+			return failure("invalid Hermes skill synchronization payload", err)
+		}
+		return p.syncHermesSkill(ctx, payload)
+	case domain.JobRemoveHermesSkill:
+		var payload domain.HermesSkillRemovePayload
+		if err := json.Unmarshal(job.Payload, &payload); err != nil {
+			return failure("invalid Hermes skill removal payload", err)
+		}
+		return p.removeHermesSkill(ctx, payload)
+	case domain.JobInspectHermesSkillContent:
+		var payload domain.HermesSkillContentInspectPayload
+		if err := json.Unmarshal(job.Payload, &payload); err != nil {
+			return failure("invalid Hermes skill content inspection payload", err)
+		}
+		return p.inspectHermesSkillContent(ctx, payload)
+	case domain.JobSetHermesToolset:
+		var payload domain.HermesToolsetMutationPayload
+		if err := json.Unmarshal(job.Payload, &payload); err != nil {
+			return failure("invalid Hermes toolset mutation payload", err)
+		}
+		return p.setHermesToolset(ctx, payload)
 	case "instance.recovery.create":
 		var payload domain.RecoveryPointPayload
 		if err := json.Unmarshal(job.Payload, &payload); err != nil {
@@ -557,7 +593,7 @@ func (p *Provisioner) sendChatMessageStream(
 	semanticProgress := chatSemanticProgressTracker{}
 	semanticReport := func(reportCtx context.Context, event domain.ChatStreamEvent) error {
 		if semanticProgress.Observe(event) {
-			semanticGuard.Touch()
+			semanticGuard.TouchFor(hermesSemanticProgressTimeout(event, semanticIdleTimeout))
 		}
 		return report(reportCtx, event)
 	}
@@ -565,7 +601,7 @@ func (p *Provisioner) sendChatMessageStream(
 		&chatProgressReader{reader: response.Body, progress: connectionGuard.Touch}, sequence, semanticReport)
 	if err != nil {
 		if semanticGuard.Expired() {
-			return domain.JobResult{Success: false, Error: fmt.Sprintf("tool stalled: Hermes produced no tool or output progress for %s", semanticIdleTimeout)}
+			return domain.JobResult{Success: false, Error: fmt.Sprintf("tool stalled: Hermes produced no tool or output progress for %s", semanticGuard.ActiveTimeout())}
 		}
 		if connectionGuard.Expired() {
 			return domain.JobResult{Success: false, Error: fmt.Sprintf("Hermes chat connection stalled: no stream data received for %s", connectionIdleTimeout)}
@@ -583,10 +619,11 @@ func (p *Provisioner) sendChatMessageStream(
 }
 
 type chatArtifactCandidate struct {
-	SourcePath string
-	Name       string
-	Kind       string
-	MediaType  string
+	SourcePath    string
+	Name          string
+	Kind          string
+	MediaType     string
+	AllowTempPath bool
 }
 
 var chatArtifactMediaTypes = map[string]string{
@@ -610,8 +647,9 @@ var chatArtifactMediaTypes = map[string]string{
 const chatArtifactReadScript = `import os, stat, sys
 path = os.path.normpath(sys.argv[1])
 limit = int(sys.argv[2])
+allow_tmp = sys.argv[3] == '1'
 parts = [part for part in path.split('/') if part]
-allowed = path.startswith('/data/cache/') or path.startswith('/workspace/') or os.path.dirname(path) == '/root'
+allowed = path.startswith('/data/cache/') or path.startswith('/workspace/') or os.path.dirname(path) == '/root' or (allow_tmp and path.startswith('/tmp/'))
 if not allowed or any(part.startswith('.') for part in parts):
     raise SystemExit(20)
 if os.path.realpath(path) != path:
@@ -699,13 +737,14 @@ func discoverChatArtifactCandidates(content string) (string, []chatArtifactCandi
 			kept = append(kept, line)
 			continue
 		}
-		sourcePath, recognized := chatArtifactSourcePath(trimmed)
+		sourcePath, explicitMarker, recognized := chatArtifactSourcePath(trimmed)
 		if !recognized || seen[sourcePath] {
 			kept = append(kept, line)
 			continue
 		}
 		mediaType, allowed := chatArtifactMediaTypes[strings.ToLower(path.Ext(sourcePath))]
-		if !allowed || !safeChatArtifactSourcePath(sourcePath) {
+		allowTempPath := explicitMarker && strings.HasPrefix(sourcePath, "/tmp/")
+		if !allowed || !safeChatArtifactSourcePath(sourcePath, allowTempPath) {
 			kept = append(kept, line)
 			continue
 		}
@@ -717,15 +756,16 @@ func discoverChatArtifactCandidates(content string) (string, []chatArtifactCandi
 		seen[sourcePath] = true
 		candidates = append(candidates, chatArtifactCandidate{
 			SourcePath: sourcePath, Name: name, MediaType: mediaType,
-			Kind: artifactKind("", mediaType, name),
+			Kind: artifactKind("", mediaType, name), AllowTempPath: allowTempPath,
 		})
 	}
 	return strings.Join(kept, "\n"), candidates
 }
 
-func chatArtifactSourcePath(line string) (string, bool) {
+func chatArtifactSourcePath(line string) (string, bool, bool) {
 	value := line
-	if strings.HasPrefix(value, "MEDIA:") || strings.HasPrefix(value, "FILE:") {
+	explicitMarker := strings.HasPrefix(value, "MEDIA:") || strings.HasPrefix(value, "FILE:")
+	if explicitMarker {
 		value = strings.TrimSpace(value[strings.IndexByte(value, ':')+1:])
 	} else if strings.HasPrefix(value, "Lokasi file:") {
 		// Compatibility for the natural-language path label emitted by older
@@ -735,24 +775,24 @@ func chatArtifactSourcePath(line string) (string, bool) {
 	} else if strings.HasPrefix(value, "file://") {
 		parsed, err := url.Parse(value)
 		if err != nil || parsed.Scheme != "file" || (parsed.Host != "" && parsed.Host != "localhost") || parsed.RawQuery != "" || parsed.Fragment != "" {
-			return "", false
+			return "", false, false
 		}
 		var unescapeErr error
 		value, unescapeErr = url.PathUnescape(parsed.Path)
 		if unescapeErr != nil {
-			return "", false
+			return "", false, false
 		}
 	} else if !strings.HasPrefix(value, "/") {
-		return "", false
+		return "", false, false
 	}
 	if strings.ContainsAny(value, "\x00\n\r") {
-		return "", false
+		return "", false, false
 	}
 	cleaned := path.Clean(value)
-	return cleaned, cleaned == value && strings.HasPrefix(cleaned, "/")
+	return cleaned, explicitMarker, cleaned == value && strings.HasPrefix(cleaned, "/")
 }
 
-func safeChatArtifactSourcePath(sourcePath string) bool {
+func safeChatArtifactSourcePath(sourcePath string, allowTempPath bool) bool {
 	if sourcePath == "" || path.Clean(sourcePath) != sourcePath {
 		return false
 	}
@@ -768,6 +808,8 @@ func safeChatArtifactSourcePath(sourcePath string) bool {
 	case strings.HasPrefix(sourcePath, "/workspace/"):
 		return true
 	case path.Dir(sourcePath) == "/root":
+		return true
+	case allowTempPath && strings.HasPrefix(sourcePath, "/tmp/"):
 		return true
 	default:
 		return false
@@ -816,7 +858,12 @@ func (p *Provisioner) stageChatArtifact(
 	hermesContainer string,
 	candidate chatArtifactCandidate,
 ) (string, int64, string, error) {
-	if !containerIDPattern.MatchString(hermesContainer) || !safeChatArtifactSourcePath(candidate.SourcePath) {
+	allowTempPath := candidate.AllowTempPath && strings.HasPrefix(candidate.SourcePath, "/tmp/")
+	if candidate.AllowTempPath != allowTempPath {
+		return "", 0, "", errors.New("unsafe temporary chat artifact")
+	}
+	if !containerIDPattern.MatchString(hermesContainer) ||
+		!safeChatArtifactSourcePath(candidate.SourcePath, allowTempPath) {
 		return "", 0, "", errors.New("unsafe chat artifact source")
 	}
 	stage, err := os.CreateTemp("", "hermes-fleet-chat-artifact-*")
@@ -831,8 +878,12 @@ func (p *Provisioner) stageChatArtifact(
 			_ = os.Remove(stagePath)
 		}
 	}()
+	temporaryPathFlag := "0"
+	if allowTempPath {
+		temporaryPathFlag = "1"
+	}
 	reader, wait := p.dockerOutput(ctx, "exec", hermesContainer, "python", "-c", chatArtifactReadScript,
-		candidate.SourcePath, strconv.FormatInt(25<<20, 10))
+		candidate.SourcePath, strconv.FormatInt(25<<20, 10), temporaryPathFlag)
 	hasher := sha256.New()
 	written, copyErr := io.Copy(io.MultiWriter(stage, hasher), io.LimitReader(reader, (25<<20)+1))
 	_ = reader.Close()
@@ -1137,6 +1188,37 @@ func isHermesSemanticProgressEvent(content string) bool {
 	return false
 }
 
+func hermesSemanticProgressTimeout(event domain.ChatStreamEvent, fallback time.Duration) time.Duration {
+	if event.Type != domain.ChatEventActivity {
+		return fallback
+	}
+	var payload domain.ChatEventPayload
+	if json.Unmarshal([]byte(event.Content), &payload) != nil || !strings.EqualFold(strings.TrimSpace(payload.Event), "tool.started") {
+		return fallback
+	}
+	var envelope map[string]any
+	if json.Unmarshal([]byte(payload.Data), &envelope) != nil ||
+		!strings.EqualFold(stringValue(envelope["tool_name"]), "process") {
+		return fallback
+	}
+	arguments := objectValue(envelope["args"])
+	if !strings.EqualFold(stringValue(arguments["action"]), "wait") {
+		return fallback
+	}
+	waitMilliseconds := safeActivityDurationMS(arguments["timeout"])
+	if waitMilliseconds == 0 {
+		return fallback
+	}
+	requested := time.Duration(waitMilliseconds)*time.Millisecond + hermesChatProcessWaitGrace
+	if requested > hermesChatProcessWaitMaximum {
+		requested = hermesChatProcessWaitMaximum
+	}
+	if requested < fallback {
+		return fallback
+	}
+	return requested
+}
+
 func hermesToolIdentity(envelope map[string]any) bool {
 	for _, key := range []string{"tool_name", "call_id", "callId", "tool_call_id", "toolCallId"} {
 		if strings.TrimSpace(stringValue(envelope[key])) != "" {
@@ -1156,17 +1238,18 @@ func hermesToolIdentity(envelope map[string]any) bool {
 }
 
 type chatIdleGuard struct {
-	mu       sync.Mutex
-	timer    *time.Timer
-	timeout  time.Duration
-	deadline time.Time
-	cancel   context.CancelFunc
-	expired  bool
-	stopped  bool
+	mu            sync.Mutex
+	timer         *time.Timer
+	timeout       time.Duration
+	activeTimeout time.Duration
+	deadline      time.Time
+	cancel        context.CancelFunc
+	expired       bool
+	stopped       bool
 }
 
 func newChatIdleGuard(timeout time.Duration, cancel context.CancelFunc) *chatIdleGuard {
-	guard := &chatIdleGuard{timeout: timeout, deadline: time.Now().Add(timeout), cancel: cancel}
+	guard := &chatIdleGuard{timeout: timeout, activeTimeout: timeout, deadline: time.Now().Add(timeout), cancel: cancel}
 	guard.timer = time.AfterFunc(timeout, guard.check)
 	return guard
 }
@@ -1189,10 +1272,18 @@ func (g *chatIdleGuard) check() {
 }
 
 func (g *chatIdleGuard) Touch() {
+	g.TouchFor(g.timeout)
+}
+
+func (g *chatIdleGuard) TouchFor(timeout time.Duration) {
+	if timeout <= 0 {
+		timeout = g.timeout
+	}
 	g.mu.Lock()
 	if !g.stopped && !g.expired {
-		g.deadline = time.Now().Add(g.timeout)
-		g.timer.Reset(g.timeout)
+		g.activeTimeout = timeout
+		g.deadline = time.Now().Add(timeout)
+		g.timer.Reset(timeout)
 	}
 	g.mu.Unlock()
 }
@@ -1201,6 +1292,12 @@ func (g *chatIdleGuard) Expired() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.expired
+}
+
+func (g *chatIdleGuard) ActiveTimeout() time.Duration {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.activeTimeout
 }
 
 func (g *chatIdleGuard) Stop() {
@@ -2962,6 +3059,17 @@ func (p *Provisioner) configureMCP(
 	if payload.Revision != hex.EncodeToString(digest[:]) {
 		return fail("MCP configuration revision does not match the leased job", nil)
 	}
+	if err := report(ctx, domain.JobProgress{Stage: "TESTING_CONNECTIONS", Detail: "Verifying public MCP endpoints and tool allowlists"}); err != nil {
+		return fail("MCP progress could not be recorded", err)
+	}
+	for _, server := range config.Servers {
+		if !server.Enabled {
+			continue
+		}
+		if verifyErr := p.verifyMCPServer(ctx, server); verifyErr != nil {
+			return fail("MCP server "+server.Name+" connection or tool verification failed", verifyErr)
+		}
+	}
 
 	snapshotCommand := p.mcpPythonCommand(payload, hermesContainer, mcpConfigSnapshotScript)
 	snapshotOutput, err := p.docker(ctx, snapshotCommand...)
@@ -3048,18 +3156,6 @@ func (p *Provisioner) configureMCP(
 			return failedAfterChange("Hermes Dashboard did not recover after applying MCP configuration", dashboardErr)
 		}
 	}
-	if err := report(ctx, domain.JobProgress{Stage: "TESTING_CONNECTIONS", Detail: "Testing every enabled MCP server"}); err != nil {
-		return failedAfterChange("MCP progress could not be recorded", err)
-	}
-	for _, server := range config.Servers {
-		if !server.Enabled {
-			continue
-		}
-		if output, testErr := p.testMCPServer(ctx, payload, managedPath, server.Name); testErr != nil {
-			_ = output
-			return failedAfterChange("MCP server "+server.Name+" connection test failed", nil)
-		}
-	}
 	if err := report(ctx, domain.JobProgress{Stage: "VERIFYING_TOOLS", Detail: "Confirming the applied MCP tool allowlists"}); err != nil {
 		return failedAfterChange("MCP progress could not be recorded", err)
 	}
@@ -3078,15 +3174,26 @@ func (p *Provisioner) mcpPythonCommand(payload domain.MCPApplyPayload, hermesCon
 	}
 }
 
-func (p *Provisioner) testMCPServer(ctx context.Context, payload domain.MCPApplyPayload, managedPath, serverName string) (string, error) {
-	if payload.DesiredStatus == domain.InstanceRunning {
-		return p.compose(ctx, managedPath, payload.ProjectName, "exec", "-T", "hermes", "hermes", "mcp", "test", serverName)
+func (p *Provisioner) verifyMCPServer(ctx context.Context, server domain.MCPServerConfiguration) error {
+	discover := p.mcpDiscover
+	if discover == nil {
+		client := mcpdiscovery.NewClient()
+		discover = client.Discover
 	}
-	return p.docker(ctx,
-		"run", "--rm", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--user", "0:0",
-		"-e", "HERMES_HOME=/data", "-v", payload.DataVolume+":/data", "--entrypoint", "hermes", payload.ImageID,
-		"mcp", "test", serverName,
-	)
+	tools, err := discover(ctx, mcpdiscovery.Request{URL: server.URL, BearerToken: server.BearerToken})
+	if err != nil {
+		return err
+	}
+	discovered := make(map[string]struct{}, len(tools))
+	for _, tool := range tools {
+		discovered[tool.Name] = struct{}{}
+	}
+	for _, allowedTool := range server.Tools {
+		if _, exists := discovered[allowedTool]; !exists {
+			return fmt.Errorf("allowed tool %q was not reported", allowedTool)
+		}
+	}
+	return nil
 }
 
 func messagingEnvironment(config domain.MessagingConfiguration) map[string]string {

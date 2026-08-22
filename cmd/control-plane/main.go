@@ -18,6 +18,7 @@ import (
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/capacity"
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/chatartifacts"
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/cloudflare"
+	"github.com/jacobcalvyn/hermes-fleet-manager/internal/cloudflareoauth"
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/recovery"
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/releases"
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/reliability"
@@ -93,6 +94,20 @@ func main() {
 		os.Exit(1)
 	}
 	cloudflareAccess.SetOwnershipStore(dataStore)
+	if !config.cloudflareOAuthManagedExternally {
+		storedOAuthClient, readErr := dataStore.GetCloudflareOAuthClient(context.Background())
+		if readErr == nil {
+			config.cloudflareOAuth.ClientID = storedOAuthClient.ClientID
+		} else if !errors.Is(readErr, store.ErrNotFound) {
+			logger.Error("read stored Cloudflare OAuth client", "error", readErr)
+			os.Exit(1)
+		}
+	}
+	cloudflareOAuth, err := cloudflareoauth.New(config.cloudflareOAuth)
+	if err != nil {
+		logger.Error("configure Cloudflare OAuth", "error", err)
+		os.Exit(1)
+	}
 	remoteAccess, err := remoteaccess.New(cloudflareAccess, dataStore.ListInstances)
 	if err != nil {
 		logger.Error("configure remote access", "error", err)
@@ -137,10 +152,13 @@ func main() {
 		HermesReleaseSource: releaseSource,
 		WebDir:              config.webDir, OfflineAfter: 30 * time.Second, Sealer: sealer,
 		Backups: backupManager, RecoveryPoints: recoveryManager, ChatArtifacts: chatArtifactManager,
-		MaxRecoveryPointBytes: config.recoveryMaxBytes,
-		RemoteAccess:          remoteAccess,
-		Reliability:           reliabilityManager,
+		MaxRecoveryPointBytes:                  config.recoveryMaxBytes,
+		RemoteAccess:                           remoteAccess,
+		CloudflareOAuth:                        cloudflareOAuth,
+		CloudflareOAuthClientManagedExternally: config.cloudflareOAuthManagedExternally,
+		Reliability:                            reliabilityManager,
 	}, dataStore, logger)
+	cloudflareAccess.SetConfigPersister(application.PersistCloudflareRuntimeConfig)
 	maintenanceContext, stopMaintenance := context.WithCancel(context.Background())
 	defer stopMaintenance()
 	application.Start(maintenanceContext)
@@ -171,27 +189,29 @@ func main() {
 }
 
 type runtimeConfig struct {
-	address                      string
-	operatorURL                  string
-	dbPath                       string
-	adminToken                   string
-	enrollmentToken              string
-	hermesReleaseCatalogPath     string
-	webDir                       string
-	secretEncryptionKey          string
-	backupDir                    string
-	backupRetention              int
-	recoveryEncryptionKey        string
-	recoveryDir                  string
-	recoveryRetention            int
-	recoveryMaxBytes             int64
-	recoveryIsolated             bool
-	chatArtifactSessionMaxBytes  int64
-	chatArtifactInstanceMaxBytes int64
-	chatArtifactTotalMaxBytes    int64
-	chatArtifactRetention        time.Duration
-	capacityPolicy               capacity.Policy
-	cloudflare                   cloudflare.Config
+	address                          string
+	operatorURL                      string
+	dbPath                           string
+	adminToken                       string
+	enrollmentToken                  string
+	hermesReleaseCatalogPath         string
+	webDir                           string
+	secretEncryptionKey              string
+	backupDir                        string
+	backupRetention                  int
+	recoveryEncryptionKey            string
+	recoveryDir                      string
+	recoveryRetention                int
+	recoveryMaxBytes                 int64
+	recoveryIsolated                 bool
+	chatArtifactSessionMaxBytes      int64
+	chatArtifactInstanceMaxBytes     int64
+	chatArtifactTotalMaxBytes        int64
+	chatArtifactRetention            time.Duration
+	capacityPolicy                   capacity.Policy
+	cloudflare                       cloudflare.Config
+	cloudflareOAuth                  cloudflareoauth.Config
+	cloudflareOAuthManagedExternally bool
 }
 
 func loadConfig(logger *slog.Logger) runtimeConfig {
@@ -229,6 +249,17 @@ func loadConfig(logger *slog.Logger) runtimeConfig {
 			InstancesConnectorHealthURL:  "http://cloudflare-instances:9081/healthz",
 		},
 	}
+	redirectURL := strings.TrimSpace(os.Getenv("FLEET_CLOUDFLARE_OAUTH_REDIRECT_URL"))
+	if redirectURL == "" {
+		redirectURL = strings.TrimRight(config.operatorURL, "/") + "/api/v1/system/remote-access/cloudflare/oauth/callback"
+	}
+	scopes := strings.Fields(os.Getenv("FLEET_CLOUDFLARE_OAUTH_SCOPES"))
+	if len(scopes) == 0 {
+		scopes = cloudflareoauth.DefaultScopes()
+	}
+	clientID := strings.TrimSpace(os.Getenv("FLEET_CLOUDFLARE_OAUTH_CLIENT_ID"))
+	config.cloudflareOAuth = cloudflareoauth.Config{ClientID: clientID, RedirectURL: redirectURL, Scopes: scopes}
+	config.cloudflareOAuthManagedExternally = clientID != ""
 	if value := os.Getenv("FLEET_BACKUP_RETENTION"); value != "" {
 		retention, err := strconv.Atoi(value)
 		if err != nil || retention < 1 || retention > 100 {

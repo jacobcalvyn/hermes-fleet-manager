@@ -57,6 +57,20 @@ func TestDockerfileDeclaresRuntimeConfigSchemaV2(t *testing.T) {
 	}
 }
 
+func TestDockerfileProvidesDeterministicBrowserRuntime(t *testing.T) {
+	contents := string(dockerfile)
+	for _, fragment := range []string{
+		`ln -s "$browser_path" /usr/local/bin/hermes-chromium`,
+		`HERMES_FLEET_BROWSER_REQUIRED=true`,
+		`AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/hermes-chromium`,
+		`io.hermes-fleet.browser-runtime="playwright-chromium.v1"`,
+	} {
+		if !strings.Contains(contents, fragment) {
+			t.Fatalf("runtime Dockerfile is missing browser runtime declaration %q", fragment)
+		}
+	}
+}
+
 func TestDockerfilePinsImmutableNodeBase(t *testing.T) {
 	contents := string(dockerfile)
 	if !regexp.MustCompile(`(?m)^FROM node:22-bookworm-slim@sha256:[a-f0-9]{64}$`).MatchString(contents) {

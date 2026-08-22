@@ -21,6 +21,7 @@ import (
 
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/compatibility"
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/domain"
+	"github.com/jacobcalvyn/hermes-fleet-manager/internal/mcpdiscovery"
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/recovery"
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/recoverycodec"
 	runtimeassets "github.com/jacobcalvyn/hermes-fleet-manager/runtime"
@@ -332,36 +333,35 @@ func TestMCPRuntimeConfigurationKeepsSecretsOutOfYAMLAndBlocksLocalExecution(t *
 	}
 }
 
-func TestMCPConnectionTestUsesOnlyTheExactManagedRuntime(t *testing.T) {
-	payload := domain.MCPApplyPayload{
-		DesiredStatus: domain.InstanceStopped,
-		ImageID:       "sha256:" + strings.Repeat("d", 64),
-		DataVolume:    "hermes-fleet-instance-00000000-data",
-		ProjectName:   "hermes-fleet-instance-00000000",
-	}
+func TestMCPConnectionTestUsesRestrictedDiscoveryClient(t *testing.T) {
 	p, err := New(t.TempDir(), "docker")
 	if err != nil {
 		t.Fatal(err)
 	}
-	var command []string
-	p.dockerRun = func(_ context.Context, args ...string) (string, error) {
-		command = append([]string(nil), args...)
-		return "connection ok", nil
+	if p.mcpDiscover == nil {
+		t.Fatal("New() did not install the restricted MCP discovery client")
 	}
-	if _, err := p.testMCPServer(context.Background(), payload, "/managed/instance", "knowledge"); err != nil {
+}
+
+func TestMCPConnectionTestPassesSecretDirectlyAndVerifiesAllowlist(t *testing.T) {
+	server := domain.MCPServerConfiguration{
+		Name: "knowledge", URL: "https://mcp.example.com/v1", AuthType: "bearer", BearerToken: "secret-token",
+		Enabled: true, Tools: []string{"search", "fetch"},
+	}
+	p := &Provisioner{mcpDiscover: func(_ context.Context, request mcpdiscovery.Request) ([]mcpdiscovery.Tool, error) {
+		if request.URL != server.URL || request.BearerToken != server.BearerToken {
+			t.Fatalf("discovery request = %+v", request)
+		}
+		return []mcpdiscovery.Tool{{Name: "search"}, {Name: "fetch"}}, nil
+	}}
+	if err := p.verifyMCPServer(context.Background(), server); err != nil {
 		t.Fatal(err)
 	}
-	joined := strings.Join(command, " ")
-	for _, expected := range []string{
-		"run --rm", "--cap-drop ALL", "no-new-privileges", payload.DataVolume + ":/data",
-		"--entrypoint hermes " + payload.ImageID + " mcp test knowledge",
-	} {
-		if !strings.Contains(joined, expected) {
-			t.Fatalf("MCP connection test does not contain %q: %v", expected, command)
-		}
+	p.mcpDiscover = func(context.Context, mcpdiscovery.Request) ([]mcpdiscovery.Tool, error) {
+		return []mcpdiscovery.Tool{{Name: "search"}}, nil
 	}
-	if strings.Contains(joined, " sh ") || strings.Contains(joined, " bash ") {
-		t.Fatalf("MCP connection test unexpectedly invokes a shell: %v", command)
+	if err := p.verifyMCPServer(context.Background(), server); err == nil || !strings.Contains(err.Error(), `allowed tool "fetch" was not reported`) {
+		t.Fatalf("verifyMCPServer() error = %v", err)
 	}
 }
 
@@ -2760,18 +2760,55 @@ func TestHermesActivityPayloadDoesNotPromoteArgumentFragmentsToActivities(t *tes
 }
 
 func TestDiscoverChatArtifactCandidatesRemovesOnlyStandaloneSafeOutputs(t *testing.T) {
-	content := "Report ready.\n\nMEDIA:/data/cache/screenshots/dashboard.png\n/root/report.xlsx\nFILE:/root/report.txt\nLokasi file: /root/legacy.txt\n\n```text\n/root/inside-code.pdf\n```\nUnsafe: /root/not-standalone.pdf"
+	content := "Report ready.\n\nMEDIA:/data/cache/screenshots/dashboard.png\nMEDIA:/tmp/kibana_shots/reload1.png\n/root/report.xlsx\nFILE:/root/report.txt\nLokasi file: /root/legacy.txt\n\n```text\n/root/inside-code.pdf\n```\nUnsafe: /root/not-standalone.pdf"
 	cleaned, candidates := discoverChatArtifactCandidates(content)
-	if len(candidates) != 4 || candidates[0].SourcePath != "/data/cache/screenshots/dashboard.png" ||
-		candidates[0].Kind != "image" || candidates[1].SourcePath != "/root/report.xlsx" || candidates[1].Kind != "file" ||
-		candidates[2].SourcePath != "/root/report.txt" || candidates[2].MediaType != "text/plain" ||
-		candidates[3].SourcePath != "/root/legacy.txt" || candidates[3].MediaType != "text/plain" {
+	if len(candidates) != 5 || candidates[0].SourcePath != "/data/cache/screenshots/dashboard.png" ||
+		candidates[0].Kind != "image" || candidates[0].AllowTempPath ||
+		candidates[1].SourcePath != "/tmp/kibana_shots/reload1.png" || candidates[1].Kind != "image" || !candidates[1].AllowTempPath ||
+		candidates[2].SourcePath != "/root/report.xlsx" || candidates[2].Kind != "file" ||
+		candidates[3].SourcePath != "/root/report.txt" || candidates[3].MediaType != "text/plain" ||
+		candidates[4].SourcePath != "/root/legacy.txt" || candidates[4].MediaType != "text/plain" {
 		t.Fatalf("candidates=%+v", candidates)
 	}
 	if strings.Contains(cleaned, "MEDIA:") || strings.Contains(cleaned, "/root/report.xlsx") ||
 		strings.Contains(cleaned, "FILE:") || strings.Contains(cleaned, "Lokasi file:") ||
 		!strings.Contains(cleaned, "/root/inside-code.pdf") || !strings.Contains(cleaned, "Unsafe: /root/not-standalone.pdf") {
 		t.Fatalf("cleaned=%q", cleaned)
+	}
+}
+
+func TestDiscoverChatArtifactCandidatesAcceptsExplicitTemporaryOutputs(t *testing.T) {
+	content := "FILE:/tmp/report.txt\nMEDIA:/tmp/report.pdf"
+	cleaned, candidates := discoverChatArtifactCandidates(content)
+	if len(candidates) != 2 || candidates[0].SourcePath != "/tmp/report.txt" ||
+		candidates[0].MediaType != "text/plain" || !candidates[0].AllowTempPath ||
+		candidates[1].SourcePath != "/tmp/report.pdf" || candidates[1].MediaType != "application/pdf" ||
+		!candidates[1].AllowTempPath {
+		t.Fatalf("temporary outputs were not accepted: %+v", candidates)
+	}
+	if cleaned != "" {
+		t.Fatalf("accepted markers should be removed from the response: %q", cleaned)
+	}
+}
+
+func TestDiscoverChatArtifactCandidatesRejectsUnmarkedOrHiddenTemporaryFiles(t *testing.T) {
+	content := "/tmp/screenshot.png\nMEDIA:/tmp/.hidden/screenshot.png"
+	cleaned, candidates := discoverChatArtifactCandidates(content)
+	if len(candidates) != 0 {
+		t.Fatalf("unmarked or hidden temporary outputs were accepted: %+v", candidates)
+	}
+	if cleaned != content {
+		t.Fatalf("rejected paths should remain visible: %q", cleaned)
+	}
+}
+
+func TestStageChatArtifactRejectsTemporaryAllowanceOutsideTemporaryPath(t *testing.T) {
+	provisioner := &Provisioner{}
+	_, _, _, err := provisioner.stageChatArtifact(context.Background(), "aaaaaaaaaaaa", chatArtifactCandidate{
+		SourcePath: "/root/report.txt", Name: "report.txt", Kind: "file", MediaType: "text/plain", AllowTempPath: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "unsafe temporary chat artifact") {
+		t.Fatalf("unscoped temporary allowance error=%v", err)
 	}
 }
 
@@ -3070,6 +3107,55 @@ func TestChatSemanticProgressTrackerOnlyAcceptsToolAndOutputProgress(t *testing.
 		t.Run(test.name, func(t *testing.T) {
 			if got := tracker.Observe(test.event); got != test.want {
 				t.Fatalf("Observe()=%v, want %v for event %+v", got, test.want, test.event)
+			}
+		})
+	}
+}
+
+func TestHermesSemanticProgressTimeoutHonorsBoundedProcessWait(t *testing.T) {
+	activity := func(eventName, data string) domain.ChatStreamEvent {
+		content, err := json.Marshal(domain.ChatEventPayload{Kind: "activity", Event: eventName, Data: data})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return domain.ChatStreamEvent{Type: domain.ChatEventActivity, Content: string(content)}
+	}
+	fallback := 2 * time.Minute
+	tests := []struct {
+		name  string
+		event domain.ChatStreamEvent
+		want  time.Duration
+	}{
+		{
+			name:  "five minute process wait",
+			event: activity("tool.started", `{"tool_name":"process","args":{"action":"wait","session_id":"cell-1","timeout":300}}`),
+			want:  5*time.Minute + hermesChatProcessWaitGrace,
+		},
+		{
+			name:  "short process wait keeps fallback",
+			event: activity("tool.started", `{"tool_name":"process","args":{"action":"wait","timeout":10}}`),
+			want:  fallback,
+		},
+		{
+			name:  "long process wait is capped",
+			event: activity("tool.started", `{"tool_name":"process","args":{"action":"wait","timeout":3600}}`),
+			want:  hermesChatProcessWaitMaximum,
+		},
+		{
+			name:  "other tools keep fallback",
+			event: activity("tool.started", `{"tool_name":"terminal","args":{"timeout":300}}`),
+			want:  fallback,
+		},
+		{
+			name:  "process start without wait keeps fallback",
+			event: activity("tool.started", `{"tool_name":"process","args":{"action":"poll","timeout":300}}`),
+			want:  fallback,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := hermesSemanticProgressTimeout(test.event, fallback); got != test.want {
+				t.Fatalf("hermesSemanticProgressTimeout()=%s, want %s", got, test.want)
 			}
 		})
 	}

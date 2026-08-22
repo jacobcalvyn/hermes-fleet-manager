@@ -455,24 +455,26 @@ type RecoveryRestorePayload struct {
 }
 
 type JobResult struct {
-	Success           bool                    `json:"success"`
-	Message           string                  `json:"message,omitempty"`
-	Error             string                  `json:"error,omitempty"`
-	ProjectName       string                  `json:"project_name,omitempty"`
-	DataVolume        string                  `json:"data_volume,omitempty"`
-	ManagedPath       string                  `json:"managed_path,omitempty"`
-	ImageID           string                  `json:"image_id,omitempty"`
-	Credentials       *Credentials            `json:"credentials,omitempty"`
-	InstanceStatus    string                  `json:"instance_status,omitempty"`
-	RecoveryPointID   string                  `json:"recovery_point_id,omitempty"`
-	RecoverySHA256    string                  `json:"recovery_sha256,omitempty"`
-	RecoverySizeBytes int64                   `json:"recovery_size_bytes,omitempty"`
-	RecoveryArtifact  string                  `json:"-"`
-	RecoveryKey       []byte                  `json:"-"`
-	ChatMessage       string                  `json:"chat_message,omitempty"`
-	ChatCiphertext    string                  `json:"-"`
-	ChatArtifacts     []ChatArtifactUpload    `json:"-"`
-	HermesProfiles    *HermesProfileInventory `json:"hermes_profiles,omitempty"`
+	Success            bool                        `json:"success"`
+	Message            string                      `json:"message,omitempty"`
+	Error              string                      `json:"error,omitempty"`
+	ProjectName        string                      `json:"project_name,omitempty"`
+	DataVolume         string                      `json:"data_volume,omitempty"`
+	ManagedPath        string                      `json:"managed_path,omitempty"`
+	ImageID            string                      `json:"image_id,omitempty"`
+	Credentials        *Credentials                `json:"credentials,omitempty"`
+	InstanceStatus     string                      `json:"instance_status,omitempty"`
+	RecoveryPointID    string                      `json:"recovery_point_id,omitempty"`
+	RecoverySHA256     string                      `json:"recovery_sha256,omitempty"`
+	RecoverySizeBytes  int64                       `json:"recovery_size_bytes,omitempty"`
+	RecoveryArtifact   string                      `json:"-"`
+	RecoveryKey        []byte                      `json:"-"`
+	ChatMessage        string                      `json:"chat_message,omitempty"`
+	ChatCiphertext     string                      `json:"-"`
+	ChatArtifacts      []ChatArtifactUpload        `json:"-"`
+	HermesProfiles     *HermesProfileInventory     `json:"hermes_profiles,omitempty"`
+	HermesCapabilities *HermesCapabilityInventory  `json:"hermes_capabilities,omitempty"`
+	HermesSkillContent *HermesSkillContentSnapshot `json:"hermes_skill_content,omitempty"`
 }
 
 type Credentials struct {

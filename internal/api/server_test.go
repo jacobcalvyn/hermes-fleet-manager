@@ -25,6 +25,7 @@ import (
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/backup"
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/chatartifacts"
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/cloudflare"
+	"github.com/jacobcalvyn/hermes-fleet-manager/internal/cloudflareoauth"
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/domain"
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/mcpdiscovery"
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/recovery"
@@ -987,6 +988,51 @@ func TestRemoteAccessConfigurationEncryptsTunnelTokensAndKeepsThemOnBlankUpdate(
 	assertStatus(t, response, http.StatusOK)
 	if _, err := environment.dataStore.GetRemoteAccessConfig(context.Background()); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("remote access configuration remains after verified cleanup: %v", err)
+	}
+}
+
+func TestCloudflareOAuthClientCanBeConfiguredAndReported(t *testing.T) {
+	environment := newAPITestEnvironment(t)
+	managed, err := cloudflare.New(cloudflare.Config{}, environment.dataStore.ListInstances, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteAccess, err := remoteaccess.New(managed, environment.dataStore.ListInstances)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oauth, err := cloudflareoauth.New(cloudflareoauth.Config{
+		RedirectURL: "http://127.0.0.1:9180/api/v1/system/remote-access/cloudflare/oauth/callback",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	environment.server.config.RemoteAccess = remoteAccess
+	environment.server.config.CloudflareOAuth = oauth
+
+	path := "/api/v1/system/remote-access/cloudflare/oauth/client"
+	response := environment.request(t, http.MethodPut, path, map[string]string{"client_id": "invalid id"}, environment.adminToken, nil)
+	assertStatus(t, response, http.StatusBadRequest)
+	response.Body.Close()
+
+	response = environment.request(t, http.MethodPut, path, map[string]string{"client_id": "cloudflare-oauth-client-id"}, environment.adminToken, nil)
+	assertStatus(t, response, http.StatusOK)
+	response.Body.Close()
+	record, err := environment.dataStore.GetCloudflareOAuthClient(context.Background())
+	if err != nil || record.ClientID != "cloudflare-oauth-client-id" {
+		t.Fatalf("stored OAuth client=%+v err=%v", record, err)
+	}
+
+	response = environment.request(t, http.MethodGet, "/api/v1/system/remote-access/configuration", nil, environment.adminToken, nil)
+	assertStatus(t, response, http.StatusOK)
+	var configuration remoteaccess.ConfigurationView
+	decodeResponse(t, response, &configuration)
+	response.Body.Close()
+	if !configuration.CloudflareOAuthAvailable || !configuration.CloudflareOAuthSetup.ClientConfigured || configuration.CloudflareOAuthSetup.ClientID != record.ClientID {
+		t.Fatalf("OAuth configuration=%+v", configuration.CloudflareOAuthSetup)
+	}
+	if configuration.CloudflareOAuthSetup.RedirectURL == "" || len(configuration.CloudflareOAuthSetup.Scopes) != len(cloudflareoauth.DefaultScopes()) {
+		t.Fatalf("OAuth setup metadata=%+v", configuration.CloudflareOAuthSetup)
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jacobcalvyn/hermes-fleet-manager/internal/backup"
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/recovery"
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/releases"
 	"github.com/jacobcalvyn/hermes-fleet-manager/internal/store"
@@ -80,8 +81,28 @@ func ImportCleanHost(ctx context.Context, options CleanHostImportOptions) (KitMa
 	if err := json.NewDecoder(io.LimitReader(archive, header.Size)).Decode(&manifest); err != nil {
 		return KitManifest{}, fmt.Errorf("decode recovery kit manifest: %w", err)
 	}
-	if manifest.FormatVersion != 1 || manifest.ControlPlaneBackup.ID == "" || manifest.ControlPlaneBackup.Filename == "" || manifest.ControlPlaneBackup.SizeBytes < 1 {
+	if manifest.FormatVersion != 2 || manifest.AuthenticationTag == "" {
 		return KitManifest{}, errors.New("recovery kit manifest is unsupported or incomplete")
+	}
+	authenticated, err := authenticatedManifestBytes(manifest)
+	if err != nil {
+		return KitManifest{}, fmt.Errorf("encode recovery kit manifest for authentication: %w", err)
+	}
+	if err := recovery.VerifyRecoveryKitManifest(options.RecoveryKey, authenticated, manifest.AuthenticationTag); err != nil {
+		return KitManifest{}, err
+	}
+	if err := backup.ValidateMetadata(manifest.ControlPlaneBackup); err != nil {
+		return KitManifest{}, errors.New("recovery kit contains invalid control-plane backup metadata")
+	}
+	seenPointIDs := make(map[string]struct{}, len(manifest.InstanceBackups))
+	for _, point := range manifest.InstanceBackups {
+		if err := recovery.ValidateMetadata(point); err != nil || point.Status != recovery.StatusReady || point.EncryptedSizeBytes < 1 {
+			return KitManifest{}, errors.New("recovery kit contains invalid instance backup metadata")
+		}
+		if _, exists := seenPointIDs[point.ID]; exists {
+			return KitManifest{}, errors.New("recovery kit contains duplicate instance backup metadata")
+		}
+		seenPointIDs[point.ID] = struct{}{}
 	}
 	if options.ExpectedVersion != "" && manifest.FleetVersion != options.ExpectedVersion {
 		return KitManifest{}, fmt.Errorf("recovery kit Fleet version %q does not match expected %q", manifest.FleetVersion, options.ExpectedVersion)
@@ -113,12 +134,20 @@ func ImportCleanHost(ctx context.Context, options CleanHostImportOptions) (KitMa
 		maximumPointBytes = 50 << 30
 	}
 	for _, point := range manifest.InstanceBackups {
-		if point.ID == "" || point.InstanceName == "" || point.EncryptedSizeBytes < 1 || point.EncryptedSizeBytes > maximumPointBytes {
+		if point.EncryptedSizeBytes > maximumPointBytes {
 			return KitManifest{}, errors.New("recovery kit contains invalid instance backup metadata")
 		}
 		base := filepath.ToSlash(filepath.Join("instances", safeArchiveName(point.InstanceName), point.ID))
-		expected[base+".json"] = cleanHostEntry{destination: filepath.Join(stage, "recovery-points", point.ID+".json"), maximumSize: 1 << 20}
-		expected[base+".enc"] = cleanHostEntry{destination: filepath.Join(stage, "recovery-points", point.ID+".enc"), exactSize: point.EncryptedSizeBytes}
+		metadataDestination, pathErr := containedPath(stage, "recovery-points", point.ID+".json")
+		if pathErr != nil {
+			return KitManifest{}, pathErr
+		}
+		artifactDestination, pathErr := containedPath(stage, "recovery-points", point.ID+".enc")
+		if pathErr != nil {
+			return KitManifest{}, pathErr
+		}
+		expected[base+".json"] = cleanHostEntry{destination: metadataDestination, maximumSize: 1 << 20}
+		expected[base+".enc"] = cleanHostEntry{destination: artifactDestination, exactSize: point.EncryptedSizeBytes}
 	}
 	seen := map[string]bool{"manifest.json": true}
 	for {
@@ -136,7 +165,7 @@ func ImportCleanHost(ctx context.Context, options CleanHostImportOptions) (KitMa
 		if (entry.exactSize > 0 && header.Size != entry.exactSize) || (entry.maximumSize > 0 && (header.Size < 1 || header.Size > entry.maximumSize)) {
 			return KitManifest{}, fmt.Errorf("recovery kit entry %q has an invalid size", header.Name)
 		}
-		if err := writeImportedFile(ctx, entry.destination, archive, header.Size, int(stat.Uid), int(stat.Gid)); err != nil {
+		if err := writeImportedFile(ctx, stage, entry.destination, archive, header.Size, int(stat.Uid), int(stat.Gid)); err != nil {
 			return KitManifest{}, fmt.Errorf("extract recovery kit entry %q: %w", header.Name, err)
 		}
 		seen[header.Name] = true
@@ -159,8 +188,11 @@ func ImportCleanHost(ctx context.Context, options CleanHostImportOptions) (KitMa
 	if err := os.Chown(backupRoot, int(stat.Uid), int(stat.Gid)); err != nil {
 		return KitManifest{}, err
 	}
-	backupPath := filepath.Join(backupRoot, manifest.ControlPlaneBackup.ID+".sqlite")
-	if err := copyImportedFile(filepath.Join(stage, "fleet.db"), backupPath, int(stat.Uid), int(stat.Gid)); err != nil {
+	backupPath, err := containedPath(backupRoot, manifest.ControlPlaneBackup.ID+".sqlite")
+	if err != nil {
+		return KitManifest{}, err
+	}
+	if err := copyImportedFile(backupRoot, filepath.Join(stage, "fleet.db"), backupPath, int(stat.Uid), int(stat.Gid)); err != nil {
 		return KitManifest{}, fmt.Errorf("preserve imported control-plane backup: %w", err)
 	}
 	metadataData, err := json.MarshalIndent(manifest.ControlPlaneBackup, "", "  ")
@@ -168,7 +200,11 @@ func ImportCleanHost(ctx context.Context, options CleanHostImportOptions) (KitMa
 		return KitManifest{}, err
 	}
 	metadataData = append(metadataData, '\n')
-	if err := writeBytes(filepath.Join(backupRoot, manifest.ControlPlaneBackup.ID+".json"), metadataData, int(stat.Uid), int(stat.Gid)); err != nil {
+	backupMetadataPath, err := containedPath(backupRoot, manifest.ControlPlaneBackup.ID+".json")
+	if err != nil {
+		return KitManifest{}, err
+	}
+	if err := writeBytes(backupRoot, backupMetadataPath, metadataData, int(stat.Uid), int(stat.Gid)); err != nil {
 		return KitManifest{}, err
 	}
 	dataStore, err := store.Open(filepath.Join(stage, "fleet.db"))
@@ -178,6 +214,29 @@ func ImportCleanHost(ctx context.Context, options CleanHostImportOptions) (KitMa
 	if err := dataStore.VerifyBackup(ctx, backupPath); err != nil {
 		dataStore.Close()
 		return KitManifest{}, fmt.Errorf("verify preserved control-plane backup: %w", err)
+	}
+	importedInstances, err := dataStore.ListInstances(ctx)
+	if err != nil {
+		dataStore.Close()
+		return KitManifest{}, fmt.Errorf("list imported Fleet instances: %w", err)
+	}
+	manifestInstances := make(map[string]struct{}, len(manifest.InstanceBackups))
+	for _, point := range manifest.InstanceBackups {
+		if _, duplicate := manifestInstances[point.InstanceID]; duplicate {
+			dataStore.Close()
+			return KitManifest{}, errors.New("recovery kit contains more than one backup for an instance")
+		}
+		manifestInstances[point.InstanceID] = struct{}{}
+	}
+	if len(importedInstances) != len(manifestInstances) {
+		dataStore.Close()
+		return KitManifest{}, errors.New("recovery kit instance backups do not match the control-plane database")
+	}
+	for _, instance := range importedInstances {
+		if _, exists := manifestInstances[instance.ID]; !exists {
+			dataStore.Close()
+			return KitManifest{}, errors.New("recovery kit instance backups do not match the control-plane database")
+		}
 	}
 	if err := dataStore.PrepareCleanHostRecovery(ctx, time.Now().UTC()); err != nil {
 		dataStore.Close()
@@ -218,6 +277,15 @@ func ImportCleanHost(ctx context.Context, options CleanHostImportOptions) (KitMa
 	return manifest, nil
 }
 
+func containedPath(root string, elements ...string) (string, error) {
+	destination := filepath.Join(append([]string{root}, elements...)...)
+	relative, err := filepath.Rel(root, destination)
+	if err != nil || relative == "." || relative == ".." || filepath.IsAbs(relative) || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", errors.New("recovery kit path escapes the import staging directory")
+	}
+	return destination, nil
+}
+
 func secureImportedTree(root string, uid, gid int) error {
 	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -241,7 +309,10 @@ func secureImportedTree(root string, uid, gid int) error {
 	})
 }
 
-func writeImportedFile(ctx context.Context, destination string, source io.Reader, size int64, uid, gid int) error {
+func writeImportedFile(ctx context.Context, root, destination string, source io.Reader, size int64, uid, gid int) error {
+	if err := validateContainedDestination(root, destination); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
 		return err
 	}
@@ -269,11 +340,19 @@ func writeImportedFile(ctx context.Context, destination string, source io.Reader
 	return os.Chown(destination, uid, gid)
 }
 
-func writeBytes(destination string, data []byte, uid, gid int) error {
-	return writeImportedFile(context.Background(), destination, strings.NewReader(string(data)), int64(len(data)), uid, gid)
+func validateContainedDestination(root, destination string) error {
+	relative, err := filepath.Rel(root, destination)
+	if err != nil || relative == "." || relative == ".." || filepath.IsAbs(relative) || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return errors.New("recovery kit path escapes the import staging directory")
+	}
+	return nil
 }
 
-func copyImportedFile(source, destination string, uid, gid int) error {
+func writeBytes(root, destination string, data []byte, uid, gid int) error {
+	return writeImportedFile(context.Background(), root, destination, strings.NewReader(string(data)), int64(len(data)), uid, gid)
+}
+
+func copyImportedFile(root, source, destination string, uid, gid int) error {
 	file, err := os.Open(source)
 	if err != nil {
 		return err
@@ -283,7 +362,7 @@ func copyImportedFile(source, destination string, uid, gid int) error {
 	if err != nil {
 		return err
 	}
-	return writeImportedFile(context.Background(), destination, file, info.Size(), uid, gid)
+	return writeImportedFile(context.Background(), root, destination, file, info.Size(), uid, gid)
 }
 
 func validateImportedCatalog(filename string, expected releases.Catalog) error {

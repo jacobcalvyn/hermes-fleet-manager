@@ -1,10 +1,9 @@
-import { FormEvent, type KeyboardEvent as ReactKeyboardEvent, lazy, Suspense, useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
+import { FormEvent, type KeyboardEvent as ReactKeyboardEvent, lazy, Suspense, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
   Activity,
   Archive,
   ArrowLeft,
-  Bell,
   Bot,
   Boxes,
   Brain,
@@ -20,12 +19,14 @@ import {
   FileOutput,
   History,
   KeyRound,
+  LayoutDashboard,
   LoaderCircle,
   LogOut,
   Menu,
   MessageCircle,
   PanelLeftClose,
   PanelLeftOpen,
+  Pencil,
   Plug,
   Play,
   Plus,
@@ -42,17 +43,17 @@ import type { LucideIcon } from 'lucide-react'
 import { ApiError, apiDownloadToFile, apiRequest, getOperations, getOperationsPage, getOverview, streamChatEvents, streamFleetEvents } from './api'
 import type { OptimisticChatMessage } from './FleetAssistantThread'
 import OutputsView from './OutputsView'
-import type { Backup, ChatEvent, ChatSession, ChatThread, CodexAuthSession, CredentialReveal, Credentials, FleetStateEvent, HermesProfileInventory, HermesReleaseCatalog, HermesUpdate, Host, Instance, InstanceObservation, MCPConfiguration, MCPDiscoveredTool, MCPDiscoveryResult, MCPServerConfiguration, MessagingConfiguration, ObservationCheck, Operation, Overview, RecoveryPoint, RemoteAccessConfiguration, RemoteAccessMode, RemoteAccessPublishedRoute, RuntimeHealth, SystemInfo } from './types'
+import type { Backup, ChatEvent, ChatSession, ChatThread, CloudflareOAuthSession, CodexAuthSession, CredentialReveal, Credentials, FleetSkill, FleetStateEvent, HermesCapabilityInventory, HermesProfileInventory, HermesReleaseCatalog, HermesSkillContentSnapshot, HermesUpdate, Host, Instance, InstanceObservation, MCPConfiguration, MCPDiscoveredTool, MCPDiscoveryResult, MCPServerConfiguration, MessagingConfiguration, ObservationCheck, Operation, Overview, RecoveryPoint, RemoteAccessConfiguration, RemoteAccessMode, RemoteAccessPublishedRoute, RuntimeHealth, SystemInfo } from './types'
 
 const FleetAssistantThread = lazy(() => import('./FleetAssistantThread'))
 
-type View = 'fleet' | 'hosts' | 'chat' | 'outputs' | 'alerts' | 'operations' | 'system'
+type View = 'dashboard' | 'fleet' | 'hosts' | 'catalog' | 'chat' | 'outputs' | 'operations' | 'system'
 type NavigationSection = {
-	id: 'primary' | 'fleet' | 'observability' | 'administration'
+	id: 'primary' | 'workspace' | 'fleet' | 'administration'
 	label: string
 	items: Array<{ id: View; label: string; icon: LucideIcon }>
 }
-type InstanceTab = 'overview' | 'access' | 'configuration' | 'profiles' | 'messaging' | 'mcp' | 'recovery' | 'diagnostics' | 'operations'
+type InstanceTab = 'overview' | 'access' | 'configuration' | 'capabilities' | 'profiles' | 'messaging' | 'mcp' | 'recovery' | 'diagnostics' | 'operations'
 type SystemSection = 'general' | 'runtime-health' | 'remote-access' | 'backups'
 type ControlPlaneStatus = 'CHECKING' | 'ONLINE' | 'OFFLINE'
 type HermesUpdateFlow = {
@@ -75,19 +76,6 @@ type OperationGroup = {
 	actor: string
 	createdAt: string
 	updatedAt: string
-}
-
-type FleetAlertRecord = {
-	id: string
-	state: 'ACTIVE' | 'RECOVERED' | 'FAILED'
-	resolution?: 'RECOVERED' | 'SUPERSEDED'
-	severity: 'CRITICAL' | 'WARNING'
-	title: string
-	detail: string
-	source: string
-	detectedAt: string
-	evidence: string[]
-	action: { label: string; view: View; instanceID?: string; systemSection?: SystemSection }
 }
 
 type RuntimeFormState = {
@@ -357,6 +345,25 @@ async function waitForOperationResult(
 	throw new Error('The operation did not finish before the timeout')
 }
 
+async function waitForCapabilityInventory(
+	token: string,
+	instanceID: string,
+	signal: AbortSignal,
+	verify: (inventory: HermesCapabilityInventory) => boolean,
+	timeout = 15_000,
+) {
+	const deadline = Date.now() + timeout
+	while (Date.now() < deadline) {
+		const inventory = await apiRequest<HermesCapabilityInventory>(token, `/api/v1/instances/${instanceID}/capabilities`, {
+			cache: 'no-store',
+			signal,
+		})
+		if (verify(inventory)) return inventory
+		await sleep(500, signal)
+	}
+	throw new Error('The refreshed capability inventory did not confirm the skill change')
+}
+
 async function waitForRecoveryPoint(
 	token: string,
 	instanceID: string,
@@ -436,12 +443,18 @@ function persistentHermesUpdateFlow(operation?: Operation): HermesUpdateFlow {
 }
 
 const chatSidebarCollapsedStorageKey = 'fleet-chat-sidebar-collapsed'
-const navigationStorageKey = 'fleet-navigation-state'
+// Version the persisted navigation so existing installations adopt Dashboard as
+// the new landing page once without losing navigation persistence afterward.
+const navigationStorageKey = 'fleet-navigation-state:v2'
+const catalogTabStorageKey = 'fleet-catalog-tab'
+const cloudflareOAuthSessionStorageKey = 'fleet-cloudflare-oauth-session'
 const instanceTabStoragePrefix = 'fleet-instance-tab:'
 const selectedChatSessionStorageKey = 'fleet-selected-chat-session'
+const operationWarningReadThroughStorageKey = 'fleet-operation-warning-read-through'
 
-const validViews: View[] = ['fleet', 'hosts', 'chat', 'outputs', 'alerts', 'operations', 'system']
-const validInstanceTabs: InstanceTab[] = ['overview', 'access', 'configuration', 'profiles', 'messaging', 'mcp', 'recovery', 'diagnostics', 'operations']
+const validViews: View[] = ['dashboard', 'fleet', 'hosts', 'catalog', 'chat', 'outputs', 'operations', 'system']
+const validInstanceTabs: InstanceTab[] = ['overview', 'access', 'configuration', 'capabilities', 'profiles', 'messaging', 'mcp', 'recovery', 'diagnostics', 'operations']
+type CatalogTab = 'skills' | 'inventory'
 
 type StoredNavigation = {
   view: View
@@ -461,6 +474,25 @@ function readStoredNavigation(): StoredNavigation | null {
   }
 }
 
+function readStoredCatalogTab(): CatalogTab {
+	try {
+		const stored = window.localStorage.getItem(catalogTabStorageKey)
+		if (stored === 'skills' || stored === 'inventory') return stored
+	} catch {
+		// Fall through to the first Catalog tab when browser storage is unavailable.
+	}
+	return 'skills'
+}
+
+function readStoredOperationWarningReadThrough() {
+	try {
+		const value = Number(window.localStorage.getItem(operationWarningReadThroughStorageKey) ?? 0)
+		return Number.isFinite(value) && value > 0 ? value : 0
+	} catch {
+		return 0
+	}
+}
+
 function readStoredInstanceTab(instanceID: string): InstanceTab {
   try {
     const stored = window.localStorage.getItem(`${instanceTabStoragePrefix}${instanceID}`) as InstanceTab | null
@@ -469,6 +501,14 @@ function readStoredInstanceTab(instanceID: string): InstanceTab {
     // Fall through to the default tab when browser storage is unavailable.
   }
   return 'overview'
+}
+
+function storeInstanceTab(instanceID: string, tab: InstanceTab) {
+	try {
+		window.localStorage.setItem(`${instanceTabStoragePrefix}${instanceID}`, tab)
+	} catch {
+		// Keep the selected tab in memory when browser storage is unavailable.
+	}
 }
 
 function readStoredChatSession(): string {
@@ -494,7 +534,7 @@ export default function App() {
   const documentVisible = useDocumentVisible()
   const [token, setToken] = useState(() => sessionStorage.getItem('fleet-admin-token') ?? '')
   const [overview, setOverview] = useState<Overview>(emptyOverview)
-  const [view, setView] = useState<View>(() => window.location.hash.startsWith('#system/') ? 'system' : readStoredNavigation()?.view ?? 'chat')
+  const [view, setView] = useState<View>(() => window.location.hash.startsWith('#system/') ? 'system' : readStoredNavigation()?.view ?? 'dashboard')
   const [loading, setLoading] = useState(Boolean(token))
   const [error, setError] = useState('')
   const [createOpen, setCreateOpen] = useState(false)
@@ -506,14 +546,10 @@ export default function App() {
 	const [chatSidebarCollapsed, setChatSidebarCollapsedState] = useState<boolean | null>(readStoredChatSidebarCollapsed)
   const [refreshSignal, setRefreshSignal] = useState(0)
   const [controlPlaneStatus, setControlPlaneStatus] = useState<ControlPlaneStatus>(token ? 'CHECKING' : 'OFFLINE')
-  const [alertHealth, setAlertHealth] = useState<RuntimeHealth | null>(null)
-  const [alertSystemInfo, setAlertSystemInfo] = useState<SystemInfo | null>(null)
-  const [alertBackups, setAlertBackups] = useState<Backup[]>([])
-  const [alertDataError, setAlertDataError] = useState('')
-  const [alertSourcesLoaded, setAlertSourcesLoaded] = useState(false)
   const [operationsNextCursor, setOperationsNextCursor] = useState<string | null>(null)
   const [loadingMoreOperations, setLoadingMoreOperations] = useState(false)
   const [refreshingSelectedObservation, setRefreshingSelectedObservation] = useState(false)
+	const [operationWarningReadThrough, setOperationWarningReadThrough] = useState(readStoredOperationWarningReadThrough)
 	const [fleetRemoteRoutes, setFleetRemoteRoutes] = useState<Record<string, RemoteAccessPublishedRoute>>({})
   const refreshController = useRef<AbortController | null>(null)
   const loadMoreController = useRef<AbortController | null>(null)
@@ -634,51 +670,6 @@ export default function App() {
       loadMoreController.current?.abort()
     }
   }, [documentVisible, runRefresh])
-
-	useEffect(() => {
-		if (!token || view !== 'alerts') return
-		let stopped = false
-		let timer = 0
-		let controller = new AbortController()
-		const load = async () => {
-			controller.abort()
-			controller = new AbortController()
-			try {
-				const [healthResult, infoResult, backupsResult] = await Promise.allSettled([
-					apiRequest<RuntimeHealth>(token, '/api/v1/system/runtime-health', { cache: 'no-store', signal: controller.signal }),
-					apiRequest<SystemInfo>(token, '/api/v1/system', { cache: 'no-store', signal: controller.signal }),
-					apiRequest<Backup[]>(token, '/api/v1/backups', { cache: 'no-store', signal: controller.signal }),
-				])
-				if (stopped || controller.signal.aborted) return
-				const failures: string[] = []
-				if (healthResult.status === 'fulfilled') setAlertHealth(healthResult.value)
-				else failures.push(`Runtime health: ${requestErrorMessage(healthResult.reason)}`)
-				if (infoResult.status === 'fulfilled') setAlertSystemInfo(infoResult.value)
-				else failures.push(`System information: ${requestErrorMessage(infoResult.reason)}`)
-				if (backupsResult.status === 'fulfilled') setAlertBackups(backupsResult.value ?? [])
-				else failures.push(`Control-plane backups: ${requestErrorMessage(backupsResult.reason)}`)
-				setAlertDataError(failures.join(' · '))
-			} catch (requestError) {
-				if (stopped || controller.signal.aborted) return
-				setAlertDataError(requestError instanceof Error ? requestError.message : 'Alert sources could not be loaded')
-			} finally {
-				if (!stopped) {
-					setAlertSourcesLoaded(true)
-					timer = window.setTimeout(() => void load(), 30000)
-				}
-			}
-		}
-		const initial = window.setTimeout(() => {
-			setAlertSourcesLoaded(false)
-			void load()
-		}, 0)
-		return () => {
-			stopped = true
-			window.clearTimeout(initial)
-			window.clearTimeout(timer)
-			controller.abort()
-		}
-	}, [refreshSignal, token, view])
 
 	useEffect(() => {
 		if (!token) return
@@ -819,7 +810,24 @@ export default function App() {
     }
   }, [closeMobileNavigation, mobileNav])
 
-  if (!token) {
+	const operations = overview.operations ?? []
+	const operationWarnings = unresolvedOperationWarnings(operations)
+	const latestOperationWarningAt = operationWarnings.reduce((latest, group) => {
+		const updatedAt = Date.parse(group.updatedAt)
+		return Number.isFinite(updatedAt) ? Math.max(latest, updatedAt) : latest
+	}, 0)
+	const operationWarningCount = view === 'operations' ? 0 : operationWarnings.filter((group) => Date.parse(group.updatedAt) > operationWarningReadThrough).length
+	const markOperationWarningsRead = () => {
+		if (latestOperationWarningAt <= operationWarningReadThrough) return
+		setOperationWarningReadThrough(latestOperationWarningAt)
+		try {
+			window.localStorage.setItem(operationWarningReadThroughStorageKey, String(latestOperationWarningAt))
+		} catch {
+			// The read marker still works for the current page when browser storage is unavailable.
+		}
+	}
+
+	if (!token) {
     return <Login onLogin={(value) => {
       sessionStorage.setItem('fleet-admin-token', value)
       operationHistoryExpanded.current = false
@@ -833,10 +841,6 @@ export default function App() {
 
   const hosts = overview.hosts ?? []
   const instances = overview.instances ?? []
-  const operations = overview.operations ?? []
-	const activeOperationCount = groupOperations(operations).filter((group) => ['PENDING', 'RUNNING'].includes(group.status)).length
-  const alertRecords = buildFleetAlertRecords(hosts, instances, operations, alertHealth, alertSystemInfo, alertBackups)
-	const activeAlertCount = alertRecords.filter((record) => record.state === 'ACTIVE').length
   const onlineHosts = hosts.filter((host) => host.status === 'ONLINE').length
   const runningInstances = instances.filter((instance) => instance.status === 'RUNNING').length
 	const latestPublicationOperations = new Map<string, Operation>()
@@ -865,43 +869,36 @@ export default function App() {
       id: 'primary',
       label: '',
       items: [
-		{ id: 'chat', label: 'Chat', icon: MessageCircle },
+		{ id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
 	  ],
     },
+	{
+	  id: 'workspace',
+	  label: 'Workspace',
+	  items: [
+		{ id: 'chat', label: 'Chat', icon: MessageCircle },
+		{ id: 'outputs', label: 'Outputs', icon: FileOutput },
+	  ],
+	},
     {
       id: 'fleet',
       label: 'Fleet',
       items: [
         { id: 'fleet', label: 'Instances', icon: Boxes },
-        { id: 'hosts', label: 'Hosts', icon: Server },
-      ],
-    },
-    {
-      id: 'observability',
-      label: 'Observability',
-      items: [
-		{ id: 'outputs', label: 'Outputs', icon: FileOutput },
-        { id: 'alerts', label: 'Alerts', icon: Bell },
-        { id: 'operations', label: 'Operations', icon: History },
+		{ id: 'catalog', label: 'Capabilities', icon: Plug },
       ],
     },
     {
       id: 'administration',
       label: 'Administration',
-      items: [{ id: 'system', label: 'System', icon: Settings }],
+      items: [
+		{ id: 'hosts', label: 'Hosts', icon: Server },
+		{ id: 'operations', label: 'Operations', icon: History },
+        { id: 'system', label: 'System', icon: Settings },
+      ],
     },
   ]
   const navigation = navigationSections.flatMap((section) => section.items)
-
-	const navigateFromAlert = (target: FleetAlertRecord['action']) => {
-		setSelectedInstanceID(target.instanceID ?? '')
-		setView(target.view)
-		if (target.view === 'system') {
-			window.history.pushState(null, '', `#system/${target.systemSection ?? 'runtime-health'}`)
-		} else if (window.location.hash.startsWith('#system/')) {
-			window.history.replaceState(null, '', window.location.pathname + window.location.search)
-		}
-	}
 
   return (
     <div className="app-shell">
@@ -926,6 +923,7 @@ export default function App() {
               {section.label && <span className="nav-section-label" aria-hidden="true">{section.label}</span>}
               {section.items.map((item) => (
                 <button key={item.id} className={view === item.id && !selectedInstance ? 'nav-active' : ''} onClick={() => {
+							if (item.id === 'operations' || view === 'operations') markOperationWarningsRead()
 							setSelectedInstanceID('')
 							if (item.id === 'outputs') setRequestedOutputInstanceID('')
 							setView(item.id)
@@ -933,7 +931,7 @@ export default function App() {
 							if (item.id === 'system' && !window.location.hash.startsWith('#system/')) window.history.pushState(null, '', '#system/general')
 							if (item.id !== 'system' && window.location.hash.startsWith('#system/')) window.history.replaceState(null, '', window.location.pathname + window.location.search)
 						}}>
-				  <item.icon size={18} /><span>{item.label}</span>{item.id === 'alerts' && activeAlertCount > 0 && <span className="nav-count alert-nav-count" aria-hidden="true">{activeAlertCount}</span>}{item.id === 'operations' && activeOperationCount > 0 && <span className="nav-count" aria-hidden="true" title={`${activeOperationCount} active ${plural(activeOperationCount, 'operation')} · clears automatically when finished`}>{activeOperationCount}</span>}
+				  <item.icon size={18} /><span>{item.label}</span>{item.id === 'operations' && operationWarningCount > 0 && <span className="nav-count alert-nav-count" aria-label={`${operationWarningCount} unread operation ${plural(operationWarningCount, 'warning')}`} title={`${operationWarningCount} unread operation ${plural(operationWarningCount, 'warning')}`}>{operationWarningCount}</span>}
                 </button>
               ))}
             </div>
@@ -972,6 +970,15 @@ export default function App() {
         {error && <div className="error-banner"><span>{error}</span><button className="icon-button" onClick={() => setError('')} title="Dismiss error"><X size={17} /></button></div>}
 
         <div className="content">
+          {!selectedInstance && view === 'dashboard' && <DashboardView
+			hosts={hosts}
+			instances={instances}
+			operations={operations}
+			counts={{ onlineHosts, runningInstances, attentionInstances }}
+			hasMoreOperations={Boolean(operationsNextCursor)}
+			onNavigate={(nextView) => { setSelectedInstanceID(''); setView(nextView) }}
+			onSelectInstance={(instanceID) => { setSelectedInstanceID(instanceID); setView('fleet') }}
+		  />}
           {selectedInstance ? <InstanceProfile key={selectedInstance.id} instance={selectedInstance} operations={operations.filter((operation) => operation.instance_id === selectedInstance.id)} token={token} onChanged={refresh} onOperation={recordOperation} refreshSignal={refreshSignal} /> : view === 'fleet' && (
             <FleetView
               hosts={hosts}
@@ -989,17 +996,85 @@ export default function App() {
             />
           )}
           {!selectedInstance && view === 'hosts' && <HostsView hosts={hosts} instances={instances} operations={operations} token={token} refreshSignal={refreshSignal} onSelectInstance={setSelectedInstanceID} />}
+		  {!selectedInstance && view === 'catalog' && <CatalogView token={token} instances={instances} refreshSignal={refreshSignal} onOperation={recordOperation} onOpenInstance={(instanceID) => { storeInstanceTab(instanceID, 'capabilities'); setSelectedInstanceID(instanceID); setView('fleet') }} />}
 		  {!selectedInstance && view === 'chat' && <ChatView token={token} instances={instances} refreshSignal={refreshSignal} onOperation={recordOperation} initialSessionID={requestedChatSessionID} onInitialSessionHandled={() => setRequestedChatSessionID('')} sidebarCollapsedState={chatSidebarCollapsed} onSidebarCollapsedChange={setChatSidebarCollapsed} onOpenOutputs={(instanceID) => { setRequestedOutputInstanceID(instanceID); setSelectedInstanceID(''); setView('outputs') }} />}
 		  {!selectedInstance && view === 'outputs' && <OutputsView token={token} instances={instances} refreshSignal={refreshSignal} initialInstanceID={requestedOutputInstanceID} onOpenChat={(sessionID) => { setRequestedChatSessionID(sessionID); setSelectedInstanceID(''); setView('chat') }} />}
-          {!selectedInstance && view === 'alerts' && <AlertsView records={alertRecords} loading={!alertSourcesLoaded} error={alertDataError} onNavigate={navigateFromAlert} />}
-		  {!selectedInstance && view === 'operations' && <OperationsView operations={operations} instances={instances} token={token} nextCursor={operationsNextCursor} loadingMore={loadingMoreOperations} onLoadMore={loadMoreOperations} onChanged={refresh} />}
+		  {!selectedInstance && view === 'operations' && <OperationsView operations={operations} instances={instances} token={token} nextCursor={operationsNextCursor} loadingMore={loadingMoreOperations} onLoadMore={loadMoreOperations} onChanged={refresh} onOperation={recordOperation} onOpenInstance={(instanceID, tab) => { markOperationWarningsRead(); storeInstanceTab(instanceID, tab); setSelectedInstanceID(instanceID); setView('fleet') }} />}
           {!selectedInstance && view === 'system' && <SystemView token={token} refreshSignal={refreshSignal} />}
         </div>
       </main>
 
-      {createOpen && <CreateInstanceDialog hosts={hosts} token={token} onClose={() => setCreateOpen(false)} onCreated={() => { setCreateOpen(false); void refresh() }} onOperation={recordOperation} />}
+      {createOpen && <CreateInstanceDialog hosts={hosts} token={token} onClose={() => setCreateOpen(false)} onCreated={() => { void refresh() }} onOperation={recordOperation} onOpenInstance={(instanceID) => { setCreateOpen(false); setSelectedInstanceID(instanceID); setView('fleet') }} onStartChat={(sessionID) => { setCreateOpen(false); setRequestedChatSessionID(sessionID); setSelectedInstanceID(''); setView('chat') }} />}
     </div>
   )
+}
+
+function CatalogView({ token, instances, refreshSignal, onOperation, onOpenInstance }: {
+	token: string
+	instances: Instance[]
+	refreshSignal: number
+	onOperation: (operation: Operation) => void
+	onOpenInstance: (instanceID: string) => void
+}) {
+	const runningInstances = useMemo(() => instances.filter((instance) => instance.status === 'RUNNING' && instance.managed_path), [instances])
+	const [activeTab, setActiveTab] = useState<CatalogTab>(readStoredCatalogTab)
+	const [inventories, setInventories] = useState<Record<string, HermesCapabilityInventory>>({})
+	const [loadingInventory, setLoadingInventory] = useState(false)
+	const [inventoryError, setInventoryError] = useState('')
+
+	const loadInventory = useCallback(async () => {
+		if (runningInstances.length === 0) {
+			setInventories({})
+			return
+		}
+		setLoadingInventory(true)
+		setInventoryError('')
+		try {
+			const results = await Promise.allSettled(runningInstances.map(async (instance) => [instance.id, await apiRequest<HermesCapabilityInventory>(token, `/api/v1/instances/${instance.id}/capabilities`, { cache: 'no-store' })] as const))
+			setInventories(Object.fromEntries(results.flatMap((result) => result.status === 'fulfilled' ? [result.value] : [])))
+			const failures = results.filter((result) => result.status === 'rejected').length
+			if (failures > 0) setInventoryError(`${failures} ${plural(failures, 'instance')} did not return capability inventory.`)
+		} catch (requestError) {
+			setInventoryError(requestError instanceof Error ? requestError.message : 'Fleet capability inventory could not be loaded')
+		} finally {
+			setLoadingInventory(false)
+		}
+	}, [runningInstances, token])
+
+	useEffect(() => {
+		const timer = window.setTimeout(() => void loadInventory(), 0)
+		return () => window.clearTimeout(timer)
+	}, [loadInventory, refreshSignal])
+
+	useEffect(() => {
+		try {
+			window.localStorage.setItem(catalogTabStorageKey, activeTab)
+		} catch {
+			// Keep the selected Catalog tab in memory when browser storage is unavailable.
+		}
+	}, [activeTab])
+
+	return <div className="catalog-page">
+		<section className="section-block first-section catalog-intro">
+			<div className="section-heading"><div><h2>Fleet capabilities</h2><p>Shared skills and reported capability inventory across managed Hermes instances</p></div></div>
+			<div className="catalog-tabs" role="tablist" aria-label="Fleet capability sections">
+				<button role="tab" aria-selected={activeTab === 'skills'} onClick={() => setActiveTab('skills')}>Skill Catalog</button>
+				<button role="tab" aria-selected={activeTab === 'inventory'} onClick={() => setActiveTab('inventory')}>Instance Inventory</button>
+			</div>
+		</section>
+		{activeTab === 'skills' && <FleetSkillCatalogPanel allInstances={instances} targetInstances={instances} inventories={inventories} token={token} onOperation={onOperation} onInventoryChanged={(instanceID, inventory) => setInventories((current) => ({ ...current, [instanceID]: inventory }))} refreshSignal={refreshSignal} />}
+		{activeTab === 'inventory' && <section className="section-block catalog-inventory-section" role="tabpanel">
+			<div className="section-heading"><div><h2>Instance capability matrix</h2><p>Tools and API features are reported here; only portable Fleet-owned assets can be distributed.</p></div><button className="secondary-button compact-button" onClick={() => void loadInventory()} disabled={loadingInventory}><RefreshCw size={15} className={loadingInventory ? 'spin' : ''} />Refresh inventory</button></div>
+			<div className="backup-scope"><ShieldCheck size={18} /><div><strong>Inventory is not distribution</strong><span>Toolsets can depend on host binaries, browser runtimes, credentials, or plugins. Fleet reports them per instance and does not copy them until a portable manifest is available.</span></div></div>
+			{inventoryError && <div className="inline-error" role="alert">{inventoryError}</div>}
+			<div className="catalog-instance-grid">{runningInstances.length === 0 ? <EmptyState icon={Boxes} title="No running instances" detail="Capability inventory appears after a managed instance is running." /> : runningInstances.map((instance) => {
+				const inventory = inventories[instance.id]
+				const toolsets = inventory?.toolsets ?? []
+				const features = Object.values(inventory?.features ?? {})
+				return <article key={instance.id}><div className="catalog-instance-heading"><div><strong>{instance.name}</strong><span>{inventory?.observed_at ? `Observed ${relativeTime(inventory.observed_at)}` : loadingInventory ? 'Loading inventory' : 'Not observed'}</span></div><Status value={inventory ? 'READY' : 'CHECKING'} label={inventory ? 'Reported' : 'Waiting'} /></div><div className="catalog-instance-facts"><div><span>Skills</span><strong>{inventory?.skills.length ?? '—'}</strong></div><div><span>Toolsets</span><strong>{inventory ? `${toolsets.filter((item) => item.enabled).length}/${toolsets.length}` : '—'}</strong></div><div><span>API features</span><strong>{inventory ? `${features.filter(Boolean).length}/${features.length}` : '—'}</strong></div><div><span>Browser</span><strong>{inventory ? inventory.browser.available ? 'Ready' : 'Unavailable' : '—'}</strong></div></div><button className="secondary-button compact-button" onClick={() => onOpenInstance(instance.id)}>Open local capabilities</button></article>
+			})}</div>
+		</section>}
+	</div>
 }
 
 function ChatView({ token, instances, refreshSignal, onOperation, initialSessionID = '', onInitialSessionHandled, sidebarCollapsedState, onSidebarCollapsedChange, onOpenOutputs }: {
@@ -1478,6 +1553,56 @@ function Login({ onLogin }: { onLogin: (token: string) => void }) {
   )
 }
 
+function DashboardView({ hosts, instances, operations, counts, hasMoreOperations, onNavigate, onSelectInstance }: {
+	hosts: Host[]
+	instances: Instance[]
+	operations: Operation[]
+	counts: { onlineHosts: number; runningInstances: number; attentionInstances: number }
+	hasMoreOperations: boolean
+	onNavigate: (view: View) => void
+	onSelectInstance: (instanceID: string) => void
+}) {
+	const activeOperations = operations.filter((operation) => ['PENDING', 'RUNNING'].includes(operation.status)).length
+	const recentOperations = groupOperations(operations).slice(0, 5)
+	const instanceNames = new Map(instances.map((instance) => [instance.id, instance.name]))
+	const visibleInstances = [...instances]
+		.sort((left, right) => Number(right.status === 'RUNNING') - Number(left.status === 'RUNNING') || left.name.localeCompare(right.name))
+		.slice(0, 5)
+
+	return <div className="dashboard-overview">
+		<section className="metrics-band first-section" aria-label="Fleet overview">
+			<Metric icon={Server} label="Hosts online" value={`${counts.onlineHosts}/${hosts.length}`} tone="green" />
+			<Metric icon={Boxes} label="Instances running" value={`${counts.runningInstances}/${instances.length}`} tone="blue" />
+			<Metric icon={Activity} label="Needs attention" value={String(counts.attentionInstances)} tone={counts.attentionInstances ? 'red' : 'neutral'} />
+			<Metric icon={History} label="Active operations" value={String(activeOperations)} tone={activeOperations ? 'amber' : 'neutral'} />
+		</section>
+		<div className="dashboard-overview-grid">
+			<section className="section-block dashboard-overview-card">
+				<div className="section-heading"><div><h2>Fleet status</h2><p>Current managed instance state</p></div><button className="text-button" onClick={() => onNavigate('fleet')}>View instances</button></div>
+				{visibleInstances.length === 0 ? <EmptyState icon={Boxes} title="No managed instances" detail="Fleet status appears after an instance is created." /> : <div className="dashboard-overview-list">{visibleInstances.map((instance) => {
+					const runtimeHealthy = instance.status === 'RUNNING' && instanceOperationalHealthStatus(instance) === 'IN_SYNC'
+					const statusValue = runtimeHealthy ? 'READY' : instance.status
+					const statusLabel = runtimeHealthy ? 'Healthy' : runtimeStatusLabel(instance.status)
+					return <button key={instance.id} className="dashboard-overview-row" onClick={() => onSelectInstance(instance.id)}>
+						<span><strong>{instance.name}</strong><small>{instance.host_name || 'Host not assigned'} · Hermes {installedHermesVersion(instance)}</small></span>
+						<Status value={statusValue} label={statusLabel} />
+						<ChevronRight size={16} aria-hidden="true" />
+					</button>
+				})}</div>}
+				{instances.length > visibleInstances.length && <div className="dashboard-overview-more">+{instances.length - visibleInstances.length} more managed {plural(instances.length - visibleInstances.length, 'instance')}</div>}
+			</section>
+			<section className="section-block dashboard-overview-card">
+				<div className="section-heading"><div><h2>Recent activity</h2><p>Latest Fleet operations{hasMoreOperations ? ' · older history available' : ''}</p></div><button className="text-button" onClick={() => onNavigate('operations')}>View operations</button></div>
+				{recentOperations.length === 0 ? <EmptyState icon={History} title="No recorded activity" detail="Lifecycle and chat operations appear here." /> : <div className="dashboard-overview-list">{recentOperations.map((group) => <button key={group.id} className="dashboard-overview-row" onClick={() => onNavigate('operations')}>
+					<span><strong>{group.summary}</strong><small>{instanceNames.get(group.operations[0]?.instance_id) || 'Fleet'} · {relativeTime(group.updatedAt)}</small></span>
+					<Status value={group.status} label={operationStatusLabel(group.status)} />
+					<ChevronRight size={16} aria-hidden="true" />
+				</button>)}</div>}
+			</section>
+		</div>
+	</div>
+}
+
 function FleetView({ hosts, instances, operations, counts, remoteRoutes, publicationAttentionInstanceIDs, token, onChanged, onOperation, loading, hasMoreOperations, onSelect }: {
   hosts: Host[]
   instances: Instance[]
@@ -1838,6 +1963,7 @@ function InstanceProfile({
 		{ id: 'overview', label: 'Overview' },
 		{ id: 'access', label: 'Access' },
 		{ id: 'configuration', label: 'Provider' },
+		{ id: 'capabilities', label: 'Capabilities' },
 		{ id: 'profiles', label: 'Profiles' },
 		{ id: 'messaging', label: 'Messaging' },
 		{ id: 'mcp', label: 'MCP' },
@@ -2299,6 +2425,10 @@ function InstanceProfile({
 		if (instanceActionBusy) return
 		const confirmation = window.prompt(`Restore backup ${point.filename}? This replaces the stopped instance data and workspace using the compatible Hermes release installed on this host. Type ${instance.name} to continue.`)
 		if (confirmation === null) return
+		if (confirmation.trim() !== instance.name) {
+			setRecoveryError(`Type ${instance.name} exactly to restore this backup.`)
+			return
+		}
 		const controller = beginActionPoll('restore-backup')
 		if (!controller) return
 		setRecoveryBusy(`restore-${point.id}`)
@@ -2432,7 +2562,7 @@ function InstanceProfile({
         </section>}
 		<section className={`attention-card ${operationalIssueChecks.length === 0 && !failedProvisioningRetryAvailable && !manualRuntimeRecoveryRequired && !failedHermesVersionUpdate ? 'attention-clear' : ''}`}>
 		  <div className="attention-heading"><div><span>{manualRuntimeRecoveryRequired || failedHermesVersionUpdate ? 'Recovery issue' : failedProvisioningRetryAvailable ? 'Provisioning issue' : operationalIssueChecks.length > 0 ? 'Health issue' : 'Health'}</span><strong>{manualRuntimeRecoveryRequired ? 'Runtime state requires manual recovery' : failedHermesVersionUpdate ? 'Hermes update stopped before the instance was restored' : failedProvisioningRetryAvailable ? 'Provisioning stopped before the managed runtime was ready' : runtimeDrift ? 'Managed runtime needs repair' : imageDrift ? 'Container image update needs review' : effectiveOperationalSummary}</strong><small>{manualRuntimeRecoveryRequired || failedHermesVersionUpdate ? instance.last_error || latestHermesUpdateOperation?.error : failedProvisioningRetryAvailable ? 'Retry uses the current supported Fleet runtime wrapper.' : observationChecks.length > 0 ? `${passedChecks.length} checks passed · ${observationTimestamp(observation?.received_at)}` : observationTimestamp(observation?.received_at)}</small></div><Status value={manualRuntimeRecoveryRequired || failedProvisioningRetryAvailable || failedHermesVersionUpdate ? 'FAILED' : effectiveOperationalHealth} label={manualRuntimeRecoveryRequired ? 'Recovery required' : failedHermesVersionUpdate ? 'Update failed' : failedProvisioningRetryAvailable ? 'Needs action' : healthStatusLabel(effectiveOperationalHealth)} /></div>
-		  {(operationalIssueChecks.length > 0 || failedProvisioningRetryAvailable || manualRuntimeRecoveryRequired || failedHermesVersionUpdate) && <div className="attention-actions">{(manualRuntimeRecoveryRequired || failedHermesVersionUpdate) && <button className="primary-button compact-button" onClick={() => setSelectedTab('operations')}>Review failed operation</button>}{failedProvisioningRetryAvailable && <button className="primary-button compact-button" onClick={() => void retryProvisioning()} disabled={instanceActionBusy}><RefreshCw size={16} className={activeAction === 'retry-provisioning' ? 'spin' : ''} />{activeAction === 'retry-provisioning' ? 'Retrying provisioning' : 'Retry provisioning'}</button>}{runtimeDrift && !runtimeRemediation && !manualRuntimeRecoveryRequired && !failedHermesVersionUpdate && <button className="primary-button compact-button" onClick={() => void repairRuntime()} disabled={instanceActionBusy || !canRepairRuntime || repairingRuntime || refreshingObservation}><RefreshCw size={16} className={repairingRuntime ? 'spin' : ''} />{repairingRuntime || instance.status === 'RESTARTING' ? 'Repairing and verifying' : 'Repair and verify'}</button>}{imageDrift && !manualRuntimeRecoveryRequired && !failedHermesVersionUpdate && <button className="primary-button compact-button" onClick={() => void fixImageDrift()} disabled={instanceActionBusy || !canFixImageDrift || fixingImage || refreshingObservation}><Wrench size={16} />{imageRepairing ? 'Fix in progress' : fixingImage ? 'Queuing fix' : 'Fix automatically'}</button>}{!manualRuntimeRecoveryRequired && <button className="secondary-button compact-button" onClick={() => setSelectedTab('diagnostics')}>Review diagnostics</button>}</div>}
+		  {(operationalIssueChecks.length > 0 || failedProvisioningRetryAvailable || manualRuntimeRecoveryRequired || failedHermesVersionUpdate) && <div className="attention-actions">{failedHermesVersionUpdate && <button className="primary-button compact-button" onClick={() => setSelectedTab('recovery')}>Open backups</button>}{failedHermesVersionUpdate && <button className="secondary-button compact-button" onClick={() => setSelectedTab('operations')}>Review failed operation</button>}{manualRuntimeRecoveryRequired && canRepairRuntime && <button className="primary-button compact-button" onClick={() => void repairRuntime()} disabled={instanceActionBusy || repairingRuntime}><RefreshCw size={16} className={repairingRuntime ? 'spin' : ''} />{repairingRuntime || instance.status === 'RESTARTING' ? 'Repairing and verifying' : 'Repair and verify'}</button>}{manualRuntimeRecoveryRequired && !failedHermesVersionUpdate && <button className={canRepairRuntime ? 'secondary-button compact-button' : 'primary-button compact-button'} onClick={() => setSelectedTab('operations')}>Review failed operation</button>}{failedProvisioningRetryAvailable && <button className="primary-button compact-button" onClick={() => void retryProvisioning()} disabled={instanceActionBusy}><RefreshCw size={16} className={activeAction === 'retry-provisioning' ? 'spin' : ''} />{activeAction === 'retry-provisioning' ? 'Retrying provisioning' : 'Retry provisioning'}</button>}{runtimeDrift && !runtimeRemediation && !manualRuntimeRecoveryRequired && !failedHermesVersionUpdate && <button className="primary-button compact-button" onClick={() => void repairRuntime()} disabled={instanceActionBusy || !canRepairRuntime || repairingRuntime || refreshingObservation}><RefreshCw size={16} className={repairingRuntime ? 'spin' : ''} />{repairingRuntime || instance.status === 'RESTARTING' ? 'Repairing and verifying' : 'Repair and verify'}</button>}{imageDrift && !manualRuntimeRecoveryRequired && !failedHermesVersionUpdate && <button className="primary-button compact-button" onClick={() => void fixImageDrift()} disabled={instanceActionBusy || !canFixImageDrift || fixingImage || refreshingObservation}><Wrench size={16} />{imageRepairing ? 'Fix in progress' : fixingImage ? 'Queuing fix' : 'Fix automatically'}</button>}{!manualRuntimeRecoveryRequired && <button className="secondary-button compact-button" onClick={() => setSelectedTab('diagnostics')}>Review diagnostics</button>}</div>}
 		</section>
 		{providerSetupIssue && <section className="setup-card"><div><span>{provider.shortLabel} setup</span><strong>{effectiveProviderSetupTitle}</strong><small>This setup is separate from runtime health.</small></div><Status value="UNKNOWN" label="Setup incomplete" /><div className="attention-actions">{!providerConnected ? <button className="primary-button compact-button" onClick={() => setAuthProvider(instance.provider)} disabled={instanceActionBusy || instance.status !== 'RUNNING'}><KeyRound size={16} />Authenticate {provider.shortLabel}</button> : !hasProviderConfiguration ? <button className="primary-button compact-button" onClick={() => setSelectedTab('configuration')} disabled={instanceActionBusy || !['RUNNING', 'STOPPED'].includes(instance.status)}><Settings size={16} />Configure {provider.shortLabel}</button> : canSyncRuntime && <button className="primary-button compact-button" onClick={() => void syncRuntimeConfiguration()} disabled={instanceActionBusy || syncingRuntime || refreshingObservation}><Wrench size={16} />{runtimeSyncInProgress ? 'Setup in progress' : syncingRuntime ? 'Queuing setup' : 'Complete setup'}</button>}</div></section>}
         {observationError && <div className="inline-error">{observationError}</div>}
@@ -2464,7 +2594,7 @@ function InstanceProfile({
 					<details className="publishing-technical"><summary>Technical details</summary><div className="publication-health" aria-label="Publication health"><div><span>DNS</span><strong>{remoteResourceStateLabel(instancePublishedRoute?.dns_state)}</strong></div><div><span>Route</span><strong>{remoteResourceStateLabel(instancePublishedRoute?.route_state)}</strong></div><div><span>Endpoint</span><strong>{remoteRouteEndpointLabel(instancePublishedRoute?.endpoint_state)}</strong></div></div><div className="detail-list"><CopyableDetailRow label="Service URL" value={publicDashboardOrigin} /><DetailRow label="Route owner" value="Cloudflare" /></div></details>
 					{publicationOperation?.progress?.steps && <ol className="publication-progress" aria-label={publicationOperation.summary}>{publicationOperation.progress.steps.map((step) => <li key={step.stage} className={`publication-step ${step.status}`}><span aria-hidden="true">{step.status === 'succeeded' ? '✓' : step.status === 'failed' ? '✕' : step.status === 'running' ? '●' : '○'}</span><div><strong>{publicationStageLabel(step.stage)}</strong>{step.detail && <small>{step.detail}</small>}</div></li>)}</ol>}
 					{publicationOperation?.status === 'FAILED' && <div className="publication-failure"><strong>{publicationOperation.progress?.detail || publicationOperation.error || 'Dashboard publication failed'}</strong><div className="button-row">{publicationOperation.progress?.action_code === 'replace_api_token' && <a className="secondary-button" href="#system/remote-access">Replace API token</a>}<button type="submit" className="secondary-button" disabled={publicationBusy || !effectivePublishingHostname}>Retry</button></div></div>}
-					<div className="section-footer"><span>Fleet changes only DNS and ingress resources recorded as Fleet-owned.</span><div className="button-row"><a className="secondary-button" href="#system/remote-access">Remote access settings</a>{managedRoutePublished ? <button type="button" className="secondary-button danger-button" onClick={() => void publishDashboard('')} disabled={publicationBusy}>Unpublish</button> : <button type="submit" className="primary-button" disabled={publicationBusy || !remoteAccessConfiguration.instance_publishing_configured || !effectivePublishingHostname}>{publicationBusy ? <RefreshCw className="spin" size={16} /> : <ShieldCheck size={16} />}{publicationBusy ? 'Publishing dashboard' : 'Publish dashboard'}</button>}</div></div>
+					<div className="section-footer"><span>Fleet changes only DNS and ingress resources recorded as Fleet-owned.</span><div className="button-row"><a className="secondary-button" href="#system/remote-access">Remote access settings</a>{managedRoutePublished ? <button type="button" className="secondary-button danger-button" onClick={() => { if (!window.confirm(`Unpublish the public dashboard for ${instance.name}? The public URL stops working immediately. The instance keeps running.`)) return; void publishDashboard('') }} disabled={publicationBusy}>Unpublish</button> : <button type="submit" className="primary-button" disabled={publicationBusy || !remoteAccessConfiguration.instance_publishing_configured || !effectivePublishingHostname}>{publicationBusy ? <RefreshCw className="spin" size={16} /> : <ShieldCheck size={16} />}{publicationBusy ? 'Publishing dashboard' : 'Publish dashboard'}</button>}</div></div>
 				</form> : <div className="access-provider-note"><span>{remoteAccessConfiguration?.mode === 'existing_endpoints' ? 'The external provider owns this dashboard route.' : 'Connect Instance publishing before assigning a public hostname.'}</span><a className="secondary-button" href="#system/remote-access">Remote access settings</a></div>}
 			</div>
 			{remoteAccessError && <div className="inline-error">{remoteAccessError}</div>}
@@ -2524,6 +2654,8 @@ function InstanceProfile({
         </section>
       </div>}
 
+	  {selectedTab === 'capabilities' && <HermesCapabilitiesPanel instance={instance} token={token} onOperation={onOperation} refreshSignal={refreshSignal} blocked={instanceActionBusy} />}
+
 	  {selectedTab === 'profiles' && <HermesProfilesPanel instance={instance} token={token} onOperation={onOperation} refreshSignal={refreshSignal} blocked={instanceActionBusy} />}
 
       {selectedTab === 'messaging' && <MessagingSettings instance={instance} token={token} onChanged={onChanged} onOperation={onOperation} refreshSignal={refreshSignal} blocked={instanceActionBusy} />}
@@ -2553,12 +2685,441 @@ function InstanceProfile({
       </div>}
 
       {selectedTab === 'operations' && <div className="profile-tab-content">
-		<OperationsWorkspace operations={updateOperations} instances={[instance]} token={token} fixedInstanceID={instance.id} pageSize={5} onChanged={onChanged} />
+		<OperationsWorkspace operations={updateOperations} instances={[instance]} token={token} fixedInstanceID={instance.id} pageSize={5} onChanged={onChanged} onOperation={onOperation} onOpenInstance={(_, tab) => setSelectedTab(tab)} />
       </div>}
 
       {authProvider && <CodexAuthDialog instance={instance} token={token} provider={authProvider} onClose={() => setAuthProvider(null)} onConnected={() => { void requestObservation(); onChanged() }} />}
     </div>
   )
+}
+
+function HermesCapabilitiesPanel({
+	instance,
+	token,
+	onOperation,
+	refreshSignal,
+	blocked = false,
+}: {
+	instance: Instance
+	token: string
+	onOperation: (operation: Operation) => void
+	refreshSignal: number
+	blocked?: boolean
+}) {
+	const documentVisible = useDocumentVisible()
+	const [inventory, setInventory] = useState<HermesCapabilityInventory | null>(null)
+	const [loading, setLoading] = useState(true)
+	const [refreshing, setRefreshing] = useState(false)
+	const [activeInventoryTab, setActiveInventoryTab] = useState<'tools' | 'skills' | 'features'>('tools')
+	const [mutatingToolset, setMutatingToolset] = useState('')
+	const [selectedSkill, setSelectedSkill] = useState<{ name: string; description?: string; category?: string } | null>(null)
+	const [skillDetail, setSkillDetail] = useState<HermesSkillContentSnapshot | null>(null)
+	const [detailCatalogSkill, setDetailCatalogSkill] = useState<FleetSkill | null>(null)
+	const [detailLoading, setDetailLoading] = useState(false)
+	const [detailAction, setDetailAction] = useState('')
+	const [detailError, setDetailError] = useState('')
+	const [detailNotice, setDetailNotice] = useState('')
+	const [error, setError] = useState('')
+	const loadController = useRef<AbortController | null>(null)
+	const refreshController = useRef<AbortController | null>(null)
+	const refreshInFlight = useRef(false)
+	const inventoryRef = useRef<HermesCapabilityInventory | null>(null)
+	const lastAutomaticAttempt = useRef(0)
+
+	const loadCapabilities = useCallback(async () => {
+		loadController.current?.abort()
+		const controller = new AbortController()
+		loadController.current = controller
+		setLoading(true)
+		try {
+			const next = await apiRequest<HermesCapabilityInventory>(token, `/api/v1/instances/${instance.id}/capabilities`, {
+				cache: 'no-store', signal: controller.signal,
+			})
+			inventoryRef.current = next
+			setInventory(next)
+			setError('')
+		} catch (requestError) {
+			if (!(requestError instanceof DOMException && requestError.name === 'AbortError')) {
+				setError(requestError instanceof Error ? requestError.message : 'Hermes capabilities could not be loaded')
+			}
+		} finally {
+			if (!controller.signal.aborted) setLoading(false)
+		}
+	}, [instance.id, token])
+
+	useEffect(() => {
+		const scheduledLoad = window.setTimeout(() => void loadCapabilities(), 0)
+		return () => {
+			window.clearTimeout(scheduledLoad)
+			loadController.current?.abort()
+		}
+	}, [loadCapabilities, refreshSignal])
+
+	useEffect(() => () => refreshController.current?.abort(), [])
+
+	const refreshCapabilities = useCallback(async (automatic = false) => {
+		if (refreshInFlight.current || instance.status !== 'RUNNING' || blocked || mutatingToolset) return
+		const controller = new AbortController()
+		refreshController.current?.abort()
+		refreshController.current = controller
+		refreshInFlight.current = true
+		setRefreshing(true)
+		if (!automatic) setError('')
+		try {
+			let operation = await apiRequest<Operation>(token, `/api/v1/instances/${instance.id}/capabilities/refresh`, {
+				method: 'POST', signal: controller.signal,
+			})
+			onOperation(operation)
+			if (['PENDING', 'RUNNING'].includes(operation.status)) {
+				operation = await waitForOperation(token, operation.id, controller.signal)
+				onOperation(operation)
+			}
+			if (operation.status !== 'SUCCEEDED') throw new Error(operation.error || 'Hermes capability inspection failed')
+			await loadCapabilities()
+		} catch (requestError) {
+			if (!(requestError instanceof DOMException && requestError.name === 'AbortError') &&
+				!(automatic && requestError instanceof ApiError && requestError.status === 409)) {
+				setError(requestError instanceof Error ? requestError.message : 'Hermes capabilities could not be refreshed')
+			}
+		} finally {
+			if (refreshController.current === controller) refreshController.current = null
+			refreshInFlight.current = false
+			setRefreshing(false)
+		}
+	}, [blocked, instance.id, instance.status, loadCapabilities, mutatingToolset, onOperation, token])
+
+	useEffect(() => {
+		if (!documentVisible || loading || instance.status !== 'RUNNING' || blocked) return
+		const refreshIfStale = () => {
+			const observed = inventoryRef.current?.observed_at
+			const observedTime = observed ? Date.parse(observed) : Number.NaN
+			const stale = !Number.isFinite(observedTime) || Date.now() - observedTime >= 5 * 60 * 1000
+			if (!stale || refreshInFlight.current || Date.now() - lastAutomaticAttempt.current < 5 * 60 * 1000) return
+			lastAutomaticAttempt.current = Date.now()
+			void refreshCapabilities(true)
+		}
+		refreshIfStale()
+		const timer = window.setInterval(refreshIfStale, 30_000)
+		return () => window.clearInterval(timer)
+	}, [blocked, documentVisible, instance.status, loading, refreshCapabilities])
+
+	const setToolset = async (name: string, enabled: boolean) => {
+		const controller = new AbortController()
+		setMutatingToolset(name)
+		setError('')
+		try {
+			let operation = await apiRequest<Operation>(token, `/api/v1/instances/${instance.id}/toolsets/${encodeURIComponent(name)}`, {
+				method: 'POST', body: JSON.stringify({ profile: 'default', enabled }), signal: controller.signal,
+			})
+			onOperation(operation)
+			if (['PENDING', 'RUNNING'].includes(operation.status)) {
+				operation = await waitForOperation(token, operation.id, controller.signal)
+				onOperation(operation)
+			}
+			if (operation.status !== 'SUCCEEDED') throw new Error(operation.error || 'Hermes toolset mutation failed')
+			await refreshCapabilities()
+		} catch (requestError) {
+			setError(requestError instanceof Error ? requestError.message : 'Hermes toolset mutation failed')
+		} finally {
+			setMutatingToolset('')
+		}
+	}
+
+	const openSkill = async (skill: { name: string; description?: string; category?: string }) => {
+		const controller = new AbortController()
+		setSelectedSkill(skill)
+		setSkillDetail(null)
+		setDetailCatalogSkill(null)
+		setDetailLoading(true)
+		setDetailError('')
+		setDetailNotice('')
+		try {
+			let operation = await apiRequest<Operation>(token, `/api/v1/instances/${instance.id}/skills/${encodeURIComponent(skill.name)}/content/refresh?profile=default`, {
+				method: 'POST', signal: controller.signal,
+			})
+			onOperation(operation)
+			if (['PENDING', 'RUNNING'].includes(operation.status)) {
+				operation = await waitForOperation(token, operation.id, controller.signal)
+				onOperation(operation)
+			}
+			if (operation.status !== 'SUCCEEDED') throw new Error(operation.error || 'Hermes skill inspection failed')
+			const [detail, catalog] = await Promise.all([
+				apiRequest<HermesSkillContentSnapshot>(token, `/api/v1/instances/${instance.id}/skills/${encodeURIComponent(skill.name)}/content?profile=default`, { cache: 'no-store', signal: controller.signal }),
+				apiRequest<FleetSkill[]>(token, '/api/v1/skills/catalog', { cache: 'no-store', signal: controller.signal }),
+			])
+			setSkillDetail(detail)
+			setDetailCatalogSkill(catalog.find((entry) => entry.name === skill.name) ?? null)
+		} catch (requestError) {
+			setDetailError(requestError instanceof Error ? requestError.message : 'Hermes skill detail could not be loaded')
+		} finally {
+			setDetailLoading(false)
+		}
+	}
+
+	const copySkillToCatalog = async () => {
+		if (!selectedSkill || !skillDetail) return
+		setDetailAction('copy')
+		setDetailError('')
+		try {
+			const copied = await apiRequest<FleetSkill>(token, `/api/v1/instances/${instance.id}/skills/${encodeURIComponent(selectedSkill.name)}/copy-to-catalog?profile=${encodeURIComponent(skillDetail.profile)}`, { method: detailCatalogSkill ? 'PUT' : 'POST' })
+			setDetailCatalogSkill(copied)
+			setDetailNotice(`Copied revision ${copied.revision.slice(0, 12)} from ${instance.name} / ${skillDetail.profile} to the Fleet catalog.`)
+		} catch (requestError) {
+			setDetailError(requestError instanceof Error ? requestError.message : 'Hermes skill could not be copied')
+		} finally {
+			setDetailAction('')
+		}
+	}
+
+	const syncDetailSkill = async () => {
+		if (!selectedSkill || !detailCatalogSkill || !skillDetail) return
+		const controller = new AbortController()
+		const sourceRevision = detailCatalogSkill.revision
+		const targetProfile = skillDetail.profile
+		setDetailAction('sync')
+		setDetailError('')
+		setDetailNotice('')
+		try {
+			let operation = await apiRequest<Operation>(token, `/api/v1/instances/${instance.id}/skills/${encodeURIComponent(selectedSkill.name)}/sync`, {
+				method: 'POST', body: JSON.stringify({ profile: skillDetail.profile }), signal: controller.signal,
+			})
+			onOperation(operation)
+			if (['PENDING', 'RUNNING'].includes(operation.status)) {
+				operation = await waitForOperation(token, operation.id, controller.signal)
+				onOperation(operation)
+			}
+			if (operation.status !== 'SUCCEEDED') throw new Error(operation.error || 'Fleet skill synchronization failed')
+			await openSkill(selectedSkill)
+			setDetailNotice(`Installed Fleet revision ${sourceRevision.slice(0, 12)} on ${instance.name} / ${targetProfile} and verified the exact content.`)
+		} catch (requestError) {
+			setDetailError(requestError instanceof Error ? requestError.message : 'Fleet skill synchronization failed')
+		} finally {
+			setDetailAction('')
+		}
+	}
+
+	const skills = inventory?.skills ?? []
+	const toolsets = inventory?.toolsets ?? []
+	const enabledToolsets = toolsets.filter((toolset) => toolset.enabled)
+	const observedAt = inventory?.observed_at && !inventory.observed_at.startsWith('0001-') ? inventory.observed_at : ''
+	const featureEntries = Object.entries(inventory?.features ?? {}).sort(([left], [right]) => left.localeCompare(right))
+	const available = instance.status === 'RUNNING' && !blocked && !refreshing && !mutatingToolset
+
+	return <div className="profile-tab-content">
+		<section className="section-block first-section profile-section hermes-capabilities-section">
+			<div className="section-heading">
+				<div><h2>Hermes capabilities</h2><p>Authoritative runtime, browser, skill, and toolset inventory reported by {instance.name}</p></div>
+				<div className="capability-refresh-actions"><span><span className="status-dot online" />Auto · 5 min</span><button className="secondary-button compact-button" onClick={() => void refreshCapabilities()} disabled={!available}>
+					<RefreshCw size={16} className={refreshing ? 'spin' : ''} />{refreshing ? 'Inspecting' : 'Refresh capabilities'}
+				</button></div>
+			</div>
+			<div className="capability-notices"><div className="backup-scope"><ShieldCheck size={18} /><div><strong>Read-only Host Agent inspection</strong><span>Fleet authenticates to the local Hermes API through the owning Host Agent and stores only non-secret capability metadata. API keys and browser executable paths never reach this browser.</span></div></div>{error && <div className="inline-error">{error}</div>}</div>
+			<div className="capability-main">{loading ? <div className="compact-empty"><LoaderCircle className="spin" size={18} /><div><strong>Loading capabilities</strong><span>Reading the latest Fleet snapshot.</span></div></div> : !observedAt ? <div className="compact-empty"><Boxes size={18} /><div><strong>No capability inventory yet</strong><span>Fleet will inspect Hermes, Chromium, skills, and toolsets automatically.</span></div></div> : <>
+				<div className="overview-grid capability-summary-grid">
+					<div className="overview-card"><span>Browser runtime</span><strong>{inventory?.browser.available ? 'Ready' : 'Unavailable'}</strong><small>{inventory?.browser.implementation || 'No executable verified'}</small></div>
+					<div className="overview-card"><span>Hermes API</span><strong>{inventory?.runtime_mode || 'Not reported'}</strong><small>{inventory?.tool_execution ? `Tools execute on ${inventory.tool_execution}` : inventory?.platform || 'Platform not reported'}</small></div>
+					<div className="overview-card"><span>Skills</span><strong>{skills.length}</strong><small>Visible to the API-server agent</small></div>
+					<div className="overview-card"><span>Toolsets</span><strong>{enabledToolsets.length} enabled</strong><small>{toolsets.length} reported</small></div>
+				</div>
+				<div className="capability-inventory">
+					<div className="capability-subtabs" role="tablist" aria-label="Capability inventory">
+						<button role="tab" aria-selected={activeInventoryTab === 'tools'} onClick={() => setActiveInventoryTab('tools')}>Tools <span>{toolsets.reduce((count, toolset) => count + toolset.tools.length, 0)}</span></button>
+						<button role="tab" aria-selected={activeInventoryTab === 'skills'} onClick={() => setActiveInventoryTab('skills')}>Skills <span>{skills.length}</span></button>
+						<button role="tab" aria-selected={activeInventoryTab === 'features'} onClick={() => setActiveInventoryTab('features')}>API Features <span>{featureEntries.length}</span></button>
+					</div>
+					<div className="capability-data-grid">
+						{activeInventoryTab === 'tools' && <section className="capability-data-panel" role="tabpanel" aria-labelledby="capability-toolsets-heading"><div className="capability-card-heading"><h3 id="capability-toolsets-heading">Toolsets &amp; tools</h3><span>{toolsets.reduce((count, toolset) => count + toolset.tools.length, 0)} tools</span></div><div className="capability-table-scroll">{toolsets.length === 0 ? <p className="capability-panel-empty">No toolsets reported.</p> : <table className="capability-compact-table"><thead><tr><th>Toolset</th><th>Tools</th><th><span className="sr-only">Action</span></th></tr></thead><tbody>{toolsets.map((toolset) => <tr key={toolset.name}><td><strong>{toolset.label || toolset.name}</strong><small>{toolset.description || toolset.name}</small></td><td><div className="capability-tool-list">{toolset.tools.length === 0 ? <span>No tools</span> : toolset.tools.map((tool) => <code key={tool}>{tool}</code>)}</div></td><td><div className="capability-toolset-actions"><Status value={toolset.enabled ? toolset.configured ? 'READY' : 'DRIFT' : 'STOPPED'} label={toolset.enabled ? toolset.configured ? 'On' : 'Config' : 'Off'} /><button className="secondary-button compact-button" onClick={() => void setToolset(toolset.name, !toolset.enabled)} disabled={!available}>{mutatingToolset === toolset.name ? <LoaderCircle className="spin" size={13} /> : toolset.enabled ? 'Disable' : 'Enable'}</button></div></td></tr>)}</tbody></table>}</div></section>}
+						{activeInventoryTab === 'skills' && <section className="capability-data-panel" role="tabpanel" aria-labelledby="capability-skills-heading"><div className="capability-card-heading"><h3 id="capability-skills-heading">Skills</h3><span>{skills.length}</span></div><div className="capability-table-scroll">{skills.length === 0 ? <p className="capability-panel-empty">No skills reported.</p> : <table className="capability-compact-table capability-skills-table"><thead><tr><th>Skill</th><th>Category</th><th><span className="sr-only">Action</span></th></tr></thead><tbody>{skills.map((skill) => <tr key={skill.name}><td><strong>{skill.name}</strong><small>{skill.description || 'No description reported'}</small></td><td>{skill.category || 'Uncategorized'}</td><td><button className="secondary-button compact-button" onClick={() => void openSkill(skill)} disabled={!available}>View</button></td></tr>)}</tbody></table>}</div></section>}
+						{activeInventoryTab === 'features' && <section className="capability-data-panel" role="tabpanel" aria-labelledby="capability-features-heading"><div className="capability-card-heading"><h3 id="capability-features-heading">API features</h3><span>{featureEntries.length}</span></div><div className="capability-table-scroll">{featureEntries.length === 0 ? <p className="capability-panel-empty">No API features reported.</p> : <table className="capability-compact-table capability-features-table"><thead><tr><th>Feature</th><th>Status</th></tr></thead><tbody>{featureEntries.map(([name, enabled]) => <tr key={name}><td><code>{name}</code></td><td><Status value={enabled ? 'READY' : 'STOPPED'} label={enabled ? 'Available' : 'Unavailable'} /></td></tr>)}</tbody></table>}</div></section>}
+					</div>
+				</div>
+			</>}</div>
+			<div className="section-footer"><span>{observedAt ? `Observed ${relativeTime(observedAt)}` : 'Inventory has not been observed yet.'}</span><span>{skills.length} {plural(skills.length, 'skill')} · {toolsets.length} {plural(toolsets.length, 'toolset')}</span></div>
+		</section>
+		{selectedSkill && <HermesSkillDetailPanel instanceName={instance.name} skill={selectedSkill} detail={skillDetail} catalogSkill={detailCatalogSkill} loading={detailLoading} action={detailAction} error={detailError} notice={detailNotice} onClose={() => setSelectedSkill(null)} onCopy={() => void copySkillToCatalog()} onSync={() => void syncDetailSkill()} />}
+	</div>
+}
+
+function HermesSkillDetailPanel({ instanceName, skill, detail, catalogSkill, loading, action, error, notice, onClose, onCopy, onSync }: {
+	instanceName: string
+	skill: { name: string; description?: string; category?: string }
+	detail: HermesSkillContentSnapshot | null
+	catalogSkill: FleetSkill | null
+	loading: boolean
+	action: string
+	error: string
+	notice: string
+	onClose: () => void
+	onCopy: () => void
+	onSync: () => void
+}) {
+	const { dialogRef, onKeyDown } = useDialogAccessibility(onClose)
+	const comparison = !detail ? 'UNKNOWN' : !catalogSkill ? 'NOT_IN_FLEET' : catalogSkill.revision === detail.revision ? 'IN_SYNC' : 'DRIFT'
+	return createPortal(<div className="operation-detail-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
+		<aside ref={dialogRef} className="operation-detail-panel skill-detail-panel" role="dialog" aria-modal="true" aria-labelledby="skill-detail-title" tabIndex={-1} onKeyDown={onKeyDown}>
+			<div className="operation-detail-heading"><div><span>Hermes skill</span><strong id="skill-detail-title">{skill.name}</strong></div><button className="icon-button" onClick={onClose} title="Close skill details"><X size={18} /></button></div>
+			<div className="operation-detail-status"><span>{detail?.provenance || skill.category || 'Provenance not reported'}</span><Status value={comparison === 'IN_SYNC' ? 'READY' : comparison === 'DRIFT' ? 'DRIFT' : comparison === 'NOT_IN_FLEET' ? 'STOPPED' : 'CHECKING'} label={comparison === 'IN_SYNC' ? 'Matches Fleet' : comparison === 'DRIFT' ? 'Different revision' : comparison === 'NOT_IN_FLEET' ? 'Not in Fleet' : 'Checking'} /></div>
+			{loading ? <div className="compact-empty"><LoaderCircle className="spin" size={18} /><div><strong>Loading SKILL.md</strong><span>Host Agent is reading the selected Hermes profile.</span></div></div> : <>
+				{error && <div className="inline-error" role="alert">{error}</div>}
+				{notice && <div className="inline-success" role="status">{notice}</div>}
+				{detail && <><div className="skill-sync-direction"><div><span>Hermes instance</span><strong>{instanceName} / {detail.profile}</strong><code>{detail.revision.slice(0, 12)}</code></div><span aria-hidden="true">⇄</span><div><span>Fleet catalog</span><strong>Shared Fleet revision</strong><code>{catalogSkill ? catalogSkill.revision.slice(0, 12) : 'Not copied'}</code></div></div><div className="skill-detail-facts"><div><span>Target profile</span><strong>{instanceName} / {detail.profile}</strong></div><div><span>Hermes revision</span><code>{detail.revision.slice(0, 12)}</code></div><div><span>Observed</span><strong>{detail.observed_at ? relativeTime(detail.observed_at) : 'Just now'}</strong></div></div><pre className="skill-content-preview"><code>{detail.content}</code></pre></>}
+			</>}
+			<div className="operation-detail-actions"><button className="secondary-button" onClick={onCopy} disabled={!detail || Boolean(action) || comparison === 'IN_SYNC'}>{action === 'copy' ? <LoaderCircle className="spin" size={15} /> : <Copy size={15} />}{catalogSkill ? `Copy ${instanceName} revision to Fleet` : 'Copy Hermes skill to Fleet'}</button><button className="primary-button" onClick={onSync} disabled={!detail || !catalogSkill || Boolean(action) || comparison === 'IN_SYNC'}>{action === 'sync' ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}Install Fleet revision on {instanceName}</button></div>
+		</aside>
+	</div>, document.body)
+}
+
+function FleetSkillCatalogPanel({ allInstances, targetInstances, inventories, token, onOperation, onInventoryChanged, refreshSignal }: {
+	allInstances: Instance[]
+	targetInstances: Instance[]
+	inventories: Record<string, HermesCapabilityInventory>
+	token: string
+	onOperation: (operation: Operation) => void
+	onInventoryChanged: (instanceID: string, inventory: HermesCapabilityInventory) => void
+	refreshSignal: number
+}) {
+	const emptyDraft = { name: '', description: '', category: '', content: '' }
+	const [skills, setSkills] = useState<FleetSkill[]>([])
+	const [draft, setDraft] = useState(emptyDraft)
+	const [editingName, setEditingName] = useState('')
+	const [showEditor, setShowEditor] = useState(false)
+	const [loading, setLoading] = useState(true)
+	const [saving, setSaving] = useState(false)
+	const [mutating, setMutating] = useState('')
+	const [error, setError] = useState('')
+	const [notice, setNotice] = useState('')
+
+	const load = useCallback(async () => {
+		setLoading(true)
+		try {
+			setSkills(await apiRequest<FleetSkill[]>(token, '/api/v1/skills/catalog', { cache: 'no-store' }))
+			setError('')
+		} catch (requestError) {
+			setError(requestError instanceof Error ? requestError.message : 'Fleet skill catalog could not be loaded')
+		} finally {
+			setLoading(false)
+		}
+	}, [token])
+
+	useEffect(() => {
+		const scheduledLoad = window.setTimeout(() => void load(), 0)
+		return () => window.clearTimeout(scheduledLoad)
+	}, [load, refreshSignal])
+
+	const edit = (skill: FleetSkill) => {
+		setEditingName(skill.name)
+		setDraft({ name: skill.name, description: skill.description, category: skill.category ?? '', content: skill.content })
+		setShowEditor(true)
+	}
+
+	const save = async (event: FormEvent) => {
+		event.preventDefault()
+		setSaving(true)
+		setError('')
+		try {
+			const path = editingName ? `/api/v1/skills/catalog/${encodeURIComponent(editingName)}` : '/api/v1/skills/catalog'
+			await apiRequest<FleetSkill>(token, path, { method: editingName ? 'PUT' : 'POST', body: JSON.stringify(draft) })
+			setDraft(emptyDraft)
+			setEditingName('')
+			setShowEditor(false)
+			await load()
+		} catch (requestError) {
+			setError(requestError instanceof Error ? requestError.message : 'Fleet skill could not be saved')
+		} finally {
+			setSaving(false)
+		}
+	}
+
+	const removeFromCatalog = async (skill: FleetSkill) => {
+		if (!window.confirm(`Delete ${skill.name} from the Fleet catalog? Existing copies on Hermes instances are not deleted.`)) return
+		setError('')
+		try {
+			await apiRequest<void>(token, `/api/v1/skills/catalog/${encodeURIComponent(skill.name)}`, { method: 'DELETE' })
+			if (editingName === skill.name) { setEditingName(''); setDraft(emptyDraft) }
+			await load()
+		} catch (requestError) {
+			setError(requestError instanceof Error ? requestError.message : 'Fleet skill could not be deleted')
+		}
+	}
+
+	const runDistribution = async (skill: FleetSkill, instance: Instance, action: 'add' | 'remove') => {
+		const mutationKey = `${skill.name}:${instance.id}`
+		if (action === 'remove' && !window.confirm(`Remove ${skill.name} from ${instance.name}? Fleet will only remove a copy it owns.`)) return
+		setMutating(mutationKey)
+		setError('')
+		setNotice('')
+		const controller = new AbortController()
+		try {
+			const path = `/api/v1/instances/${instance.id}/skills/${encodeURIComponent(skill.name)}`
+			let operation = await apiRequest<Operation>(token, action === 'add' ? `${path}/sync` : `${path}?profile=default`, {
+				method: action === 'add' ? 'POST' : 'DELETE',
+				body: action === 'add' ? JSON.stringify({ profile: 'default' }) : undefined,
+				signal: controller.signal,
+			})
+			onOperation(operation)
+			if (['PENDING', 'RUNNING'].includes(operation.status)) {
+				operation = await waitForOperation(token, operation.id, controller.signal)
+				onOperation(operation)
+			}
+			if (operation.status !== 'SUCCEEDED') throw new Error(operation.error || `Fleet skill ${action} failed`)
+
+			let refreshOperation = await apiRequest<Operation>(token, `/api/v1/instances/${instance.id}/capabilities/refresh`, {
+				method: 'POST',
+				signal: controller.signal,
+			})
+			onOperation(refreshOperation)
+			if (['PENDING', 'RUNNING'].includes(refreshOperation.status)) {
+				refreshOperation = await waitForOperation(token, refreshOperation.id, controller.signal)
+				onOperation(refreshOperation)
+			}
+			if (refreshOperation.status !== 'SUCCEEDED') throw new Error(refreshOperation.error || 'Hermes capability inspection failed')
+
+			const inventory = await waitForCapabilityInventory(
+				token,
+				instance.id,
+				controller.signal,
+				(current) => current.skills.some((item) => item.name === skill.name) === (action === 'add'),
+			)
+			onInventoryChanged(instance.id, inventory)
+			setNotice(action === 'add'
+				? `${skill.name} was installed and verified on ${instance.name}.`
+				: `${skill.name} was removed and verified on ${instance.name}.`)
+		} catch (requestError) {
+			setError(requestError instanceof Error ? requestError.message : `Fleet skill ${action} failed`)
+		} finally {
+			setMutating('')
+		}
+	}
+
+	return <section className="section-block profile-section fleet-skill-section">
+		<div className="section-heading"><div><h2>Skills</h2><p>Shared skills, their original source, and distribution state on every managed instance</p></div><button className="primary-button compact-button" onClick={() => { setEditingName(''); setDraft(emptyDraft); setShowEditor((current) => !current) }}><Plus size={15} />{showEditor && !editingName ? 'Close editor' : 'Add catalog skill'}</button></div>
+		{error && <div className="inline-error" role="alert">{error}</div>}
+		{notice && <div className="inline-success fleet-skill-sync-result" role="status">{notice}</div>}
+		{showEditor && <form className="fleet-skill-form fleet-skill-inline-editor" onSubmit={(event) => void save(event)}>
+				<div className="form-grid"><label>Name<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value.toLowerCase() })} disabled={Boolean(editingName) || saving} required pattern="[a-z0-9][a-z0-9-]{0,63}" /></label><label>Category<input value={draft.category} onChange={(event) => setDraft({ ...draft, category: event.target.value.toLowerCase() })} disabled={saving} pattern="[a-z0-9][a-z0-9-]{0,63}" /></label></div>
+				<label>Description<input value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} disabled={saving} required maxLength={1000} /></label>
+				<label>SKILL.md<textarea value={draft.content} onChange={(event) => setDraft({ ...draft, content: event.target.value })} disabled={saving} required rows={10} placeholder={'---\nname: browser-report\ndescription: Create a browser report\n---\n\n# Instructions'} /></label>
+				<div className="fleet-skill-form-actions"><button type="button" className="secondary-button compact-button" onClick={() => { setEditingName(''); setDraft(emptyDraft); setShowEditor(false) }} disabled={saving}>Cancel</button><button className="primary-button compact-button" type="submit" disabled={saving}>{saving ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />}{editingName ? 'Update skill' : 'Add skill'}</button></div>
+			</form>}
+		<div className="fleet-catalog-list">{loading ? <div className="compact-empty"><LoaderCircle className="spin" size={18} /><div><strong>Loading catalog</strong></div></div> : skills.length === 0 ? <div className="compact-empty"><Boxes size={18} /><div><strong>No Fleet skills</strong><span>Copy a skill from an instance or add a Fleet-created skill.</span></div></div> : skills.map((skill) => {
+			const source = allInstances.find((instance) => instance.id === skill.source_instance_id)
+			const sourceName = source?.name || skill.source_instance_name
+			return <article className="fleet-catalog-row" key={skill.name}>
+				<div className="fleet-catalog-skill"><strong>{skill.name}</strong><span>{skill.description || 'No description'}</span><small>{skill.origin_type === 'copied_from_instance' ? `Source instance: ${sourceName || 'Deleted instance'} / ${skill.source_profile || 'default'}` : 'Source: Fleet catalog'} · revision {skill.revision.slice(0, 10)}</small></div>
+				<div className="fleet-catalog-targets" aria-label={`Distribution for ${skill.name}`}>{targetInstances.length === 0 ? <span className="secondary-text">No managed instances</span> : targetInstances.map((instance) => {
+					const key = `${skill.name}:${instance.id}`
+					const inventoryInstalled = inventories[instance.id]?.skills.some((item) => item.name === skill.name) ?? false
+					const installed = inventoryInstalled
+					const isSource = skill.origin_type === 'copied_from_instance' && skill.source_instance_id === instance.id
+					const runnable = instance.status === 'RUNNING' && Boolean(instance.managed_path)
+					const busy = mutating === key
+					const distributionRole = isSource ? 'Source instance' : installed ? 'Installed copy' : 'Copy target'
+					return <div className={`fleet-catalog-target${isSource ? ' fleet-catalog-target-source' : ''}`} key={instance.id}><div className="fleet-catalog-target-identity"><span>{instance.name}</span><small>{distributionRole}</small></div>{isSource ? <Status value="READY" label="Original" /> : !runnable ? <Status value="STOPPED" label="Stopped" /> : installed ? <button className="secondary-button compact-button danger-outline-button" onClick={() => void runDistribution(skill, instance, 'remove')} disabled={Boolean(mutating)}>{busy ? <LoaderCircle className="spin" size={13} /> : <Trash2 size={13} />}Remove</button> : <button className="secondary-button compact-button" onClick={() => void runDistribution(skill, instance, 'add')} disabled={Boolean(mutating)}>{busy ? <LoaderCircle className="spin" size={13} /> : <Plus size={13} />}Add</button>}</div>
+				})}</div>
+				<div className="fleet-catalog-row-actions"><button className="icon-button" onClick={() => edit(skill)} disabled={saving || Boolean(mutating)} title={`Edit ${skill.name}`}><Pencil size={14} /></button><button className="icon-button danger-button" onClick={() => void removeFromCatalog(skill)} disabled={saving || Boolean(mutating)} title={`Delete ${skill.name} from catalog`}><Trash2 size={14} /></button></div>
+			</article>
+		})}</div>
+	</section>
 }
 
 function HermesProfilesPanel({
@@ -3435,6 +3996,9 @@ function MCPSettings({
 	}
 
 	const removeServer = (index: number) => {
+		const draft = drafts[index]
+		const label = draft?.name.trim() || 'this MCP server'
+		if (!window.confirm(`Remove ${label}? Hermes loses those tools after you apply this configuration.`)) return
 		setDrafts((current) => current.filter((_, draftIndex) => draftIndex !== index))
 		setEditingIndex((current) => current === index ? null : current !== null && current > index ? current - 1 : current)
 	}
@@ -3716,68 +4280,6 @@ function CredentialRow({ label, value, initiallyVisible = false }: { label: stri
   return <div className="credential-row"><span>{label}</span><code>{visible ? value : '****************'}</code><div><button className="icon-button" onClick={() => setVisible(!visible)} title={visible ? `Hide ${label}` : `Show ${label}`}>{visible ? <EyeOff size={16} /> : <Eye size={16} />}</button><button className="icon-button" onClick={() => void copy()} title={`Copy ${label}`}><Copy size={16} /></button></div>{copied && <small>Copied</small>}</div>
 }
 
-function AlertsView({ records, loading, error, onNavigate }: { records: FleetAlertRecord[]; loading: boolean; error: string; onNavigate: (target: FleetAlertRecord['action']) => void }) {
-	const [stateFilter, setStateFilter] = useState('ALL')
-	const [severityFilter, setSeverityFilter] = useState('ALL')
-	const [selectedID, setSelectedID] = useState('')
-	const [showAllHistory, setShowAllHistory] = useState(false)
-	const active = records.filter((record) => record.state === 'ACTIVE')
-	const history = records.filter((record) => record.state !== 'ACTIVE')
-	const filtered = records.filter((record) => (stateFilter === 'ALL' || (stateFilter === 'ACTIVE' ? record.state === 'ACTIVE' : record.state !== 'ACTIVE')) && (severityFilter === 'ALL' || record.severity === severityFilter))
-	const filteredHistory = filtered.filter((record) => record.state !== 'ACTIVE')
-	const visibleHistoryIDs = new Set((showAllHistory ? filteredHistory : filteredHistory.slice(0, 5)).map((record) => record.id))
-	const visible = filtered.filter((record) => record.state === 'ACTIVE' || visibleHistoryIDs.has(record.id))
-	const hiddenHistory = filteredHistory.length - visibleHistoryIDs.size
-	const selected = records.find((record) => record.id === selectedID)
-	return <section className="section-block first-section alerts-section">
-		<div className="section-heading"><div><h2>Alerts &amp; incidents</h2><p>Actionable current state and recent recovery history</p></div>{loading && <RefreshCw className="spin" size={17} aria-label="Loading alert sources" />}</div>
-		<div className="alert-summary-band" aria-label="Alert summary">
-			<div><span>Active</span><strong>{active.length}</strong></div>
-			<div><span>Critical</span><strong>{active.filter((record) => record.severity === 'CRITICAL').length}</strong></div>
-			<div><span>Warning</span><strong>{active.filter((record) => record.severity === 'WARNING').length}</strong></div>
-			<div><span>Recent incidents</span><strong>{history.length}</strong></div>
-		</div>
-		<div className="alerts-toolbar">
-			<label><span>State</span><select aria-label="Alert state" value={stateFilter} onChange={(event) => setStateFilter(event.target.value)}><option value="ALL">All states</option><option value="ACTIVE">Active</option><option value="HISTORY">History</option></select></label>
-			<label><span>Severity</span><select aria-label="Alert severity" value={severityFilter} onChange={(event) => setSeverityFilter(event.target.value)}><option value="ALL">All severity</option><option value="CRITICAL">Critical</option><option value="WARNING">Warning</option></select></label>
-		</div>
-		{error && <div className="alert-source-warning"><Activity size={16} /><div><strong>Some alert sources are unavailable</strong><span>{error}</span></div></div>}
-		{visible.length === 0 ? <EmptyState icon={ShieldCheck} title={loading ? 'Checking Fleet health' : stateFilter === 'ACTIVE' ? 'No active alerts' : 'No matching alerts'} detail={loading ? 'Fleet is loading runtime, backup, and infrastructure state.' : 'Current authoritative checks do not match this filter.'} /> : <div className="alert-list">{visible.map((record) => <button key={record.id} className={selectedID === record.id ? 'selected' : undefined} onClick={() => setSelectedID(record.id)} aria-label={`Open alert: ${record.title}`}>
-			<span className={`alert-severity-mark ${record.severity.toLowerCase()}`} aria-hidden="true" />
-			<span className="alert-list-copy"><strong>{record.title}</strong><small>{record.detail}</small><em>{record.source} · {relativeTime(record.detectedAt)}</em></span>
-			<span className="alert-list-status"><Status value={alertStatusValue(record)} label={alertStatusLabel(record)} /><ChevronRight size={16} /></span>
-		</button>)}</div>}
-		{filteredHistory.length > 5 && <div className="alert-history-footer"><button type="button" className="secondary-button compact-button" onClick={() => setShowAllHistory((current) => !current)}>{showAllHistory ? 'Show recent only' : `Show all history (${filteredHistory.length})`}</button>{hiddenHistory > 0 && <span>{hiddenHistory} older incidents hidden</span>}</div>}
-		{selected && <AlertDetailPanel record={selected} onClose={() => setSelectedID('')} onNavigate={onNavigate} />}
-	</section>
-}
-
-function alertStatusValue(record: FleetAlertRecord) {
-	if (record.state === 'ACTIVE') return record.severity === 'CRITICAL' ? 'FAILED' : 'PENDING'
-	return record.state === 'RECOVERED' ? 'READY' : 'FAILED'
-}
-
-function alertStatusLabel(record: FleetAlertRecord) {
-	if (record.state === 'ACTIVE') return record.severity === 'CRITICAL' ? 'Critical' : 'Warning'
-	if (record.resolution === 'SUPERSEDED') return 'Superseded'
-	return record.state === 'RECOVERED' ? 'Recovered' : 'Failed'
-}
-
-function AlertDetailPanel({ record, onClose, onNavigate }: { record: FleetAlertRecord; onClose: () => void; onNavigate: (target: FleetAlertRecord['action']) => void }) {
-	const { dialogRef, onKeyDown } = useDialogAccessibility(onClose)
-	return createPortal(<div className="operation-detail-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
-		<aside ref={dialogRef} className="operation-detail-panel alert-detail-panel" role="dialog" aria-modal="true" aria-labelledby="alert-detail-title" tabIndex={-1} onKeyDown={onKeyDown}>
-			<div className="operation-detail-heading"><div><span>{record.state === 'ACTIVE' ? 'Active alert' : 'Incident history'}</span><strong id="alert-detail-title">{record.title}</strong></div><button className="icon-button" onClick={onClose} title="Close alert details" aria-label="Close alert details"><X size={18} /></button></div>
-			<div className="operation-detail-status"><span>{record.source}</span><Status value={alertStatusValue(record)} label={alertStatusLabel(record)} /></div>
-			<div className="alert-detail-copy"><strong>What happened</strong><p>{record.detail}</p></div>
-			<div className="alert-detail-evidence"><strong>Evidence</strong><ul>{record.evidence.map((item) => <li key={item}>{item}</li>)}</ul></div>
-			<div className="operation-detail-grid"><div><span>Detected</span><strong>{relativeTime(record.detectedAt)}</strong></div><div><span>State</span><strong>{record.state === 'ACTIVE' ? 'Active' : record.resolution === 'SUPERSEDED' ? 'Superseded by success' : record.state === 'RECOVERED' ? 'Recovered' : 'Recorded failure'}</strong></div></div>
-			<div className="alert-detail-actions"><button className="primary-button" onClick={() => { onClose(); onNavigate(record.action) }}>{record.action.label}<ChevronRight size={16} /></button></div>
-			<div className="alert-authority-note"><ShieldCheck size={16} /><span>Alert state is derived from authoritative Fleet checks. It cannot be resolved manually.</span></div>
-		</aside>
-	</div>, document.body)
-}
-
 function HostsView({ hosts, instances, operations, token, refreshSignal, onSelectInstance }: {
 	hosts: Host[]
 	instances: Instance[]
@@ -3863,7 +4365,7 @@ function HostDetailPanel({ host, instances, operations, expectedAgentVersion, ad
 	</div>, document.body)
 }
 
-function OperationsView({ operations, instances, token, nextCursor, loadingMore, onLoadMore, onChanged }: {
+function OperationsView({ operations, instances, token, nextCursor, loadingMore, onLoadMore, onChanged, onOperation, onOpenInstance }: {
   operations: Operation[]
   instances: Instance[]
 	token: string
@@ -3871,11 +4373,13 @@ function OperationsView({ operations, instances, token, nextCursor, loadingMore,
   loadingMore: boolean
   onLoadMore: () => Promise<void>
 	onChanged: () => Promise<void>
+	onOperation: (operation: Operation) => void
+	onOpenInstance: (instanceID: string, tab: InstanceTab) => void
 }) {
-	return <OperationsWorkspace operations={operations} instances={instances} token={token} nextCursor={nextCursor} loadingMore={loadingMore} onLoadMore={onLoadMore} onChanged={onChanged} />
+	return <OperationsWorkspace operations={operations} instances={instances} token={token} nextCursor={nextCursor} loadingMore={loadingMore} onLoadMore={onLoadMore} onChanged={onChanged} onOperation={onOperation} onOpenInstance={onOpenInstance} />
 }
 
-function OperationsWorkspace({ operations, instances, token, fixedInstanceID = '', pageSize = 10, nextCursor = null, loadingMore = false, onLoadMore, onChanged }: {
+function OperationsWorkspace({ operations, instances, token, fixedInstanceID = '', pageSize = 10, nextCursor = null, loadingMore = false, onLoadMore, onChanged, onOperation, onOpenInstance }: {
 	operations: Operation[]
 	instances: Instance[]
 	token: string
@@ -3885,9 +4389,11 @@ function OperationsWorkspace({ operations, instances, token, fixedInstanceID = '
 	loadingMore?: boolean
 	onLoadMore?: () => Promise<void>
 	onChanged: () => Promise<void>
+	onOperation?: (operation: Operation) => void
+	onOpenInstance?: (instanceID: string, tab: InstanceTab) => void
 }) {
   const [query, setQuery] = useState('')
-	const [statusFilter, setStatusFilter] = useState(() => !fixedInstanceID && groupOperations(operations).some((group) => ['PENDING', 'RUNNING'].includes(group.status)) ? 'ACTIVE' : 'ALL')
+	const [statusFilter, setStatusFilter] = useState('ALL')
 	const [typeFilter, setTypeFilter] = useState('ALL')
 	const [instanceFilter, setInstanceFilter] = useState(fixedInstanceID || 'ALL')
 	const [timeFilter, setTimeFilter] = useState('ALL')
@@ -3940,7 +4446,7 @@ function OperationsWorkspace({ operations, instances, token, fixedInstanceID = '
 		</div>
 		<div className={`operations-workspace${selectedGroup ? ' has-detail' : ''}`}>
 			<div className="operations-list"><OperationsTable groups={visibleGroups} instanceNames={instanceNames} selectedGroupID={selectedGroupID} onSelect={setSelectedGroupID} />{(filtered.length > pageSize || nextCursor) && <div className="pagination"><span>Page {safePage + 1} of {pageCount}{nextCursor ? ' · older history available' : ''}</span><div><button className="secondary-button compact-button" onClick={() => setPage(Math.max(0, safePage - 1))} disabled={safePage === 0}>Previous</button><button className="secondary-button compact-button" onClick={() => setPage(Math.min(pageCount - 1, safePage + 1))} disabled={safePage >= pageCount - 1}>Next</button>{nextCursor && onLoadMore && <button className="secondary-button compact-button" onClick={() => void onLoadMore()} disabled={loadingMore}>{loadingMore ? 'Loading older' : 'Load older'}</button>}</div></div>}</div>
-			{selectedGroup && createPortal(<OperationDetailPanel group={selectedGroup} instanceName={instanceNames.get(selectedGroup.operations.find((operation) => operation.instance_id)?.instance_id ?? '') ?? 'Fleet Manager'} token={token} onChanged={onChanged} onClose={() => setSelectedGroupID('')} />, document.body)}
+			{selectedGroup && createPortal(<OperationDetailPanel group={selectedGroup} instance={instances.find((item) => item.id === (selectedGroup.operations.find((operation) => operation.instance_id)?.instance_id ?? ''))} token={token} onChanged={onChanged} onOperation={onOperation} onOpenInstance={onOpenInstance} onClose={() => setSelectedGroupID('')} />, document.body)}
 		</div>
 	</section>
 }
@@ -3955,14 +4461,37 @@ function OperationsTable({ groups, instanceNames, selectedGroupID, onSelect }: {
 	})}</tbody></table></div>
 }
 
-function OperationDetailPanel({ group, instanceName, token, onChanged, onClose }: { group: OperationGroup; instanceName: string; token: string; onChanged: () => Promise<void>; onClose: () => void }) {
+function instanceHasRuntimeDrift(instance: Instance) {
+	return Boolean(instance.observation?.checks?.some((check) =>
+		['runtime', 'health_endpoint', 'dashboard_endpoint'].includes(check.name) &&
+		['DRIFT', 'MISSING'].includes(check.status),
+	))
+}
+
+function OperationDetailPanel({ group, instance, token, onChanged, onOperation, onOpenInstance, onClose }: {
+	group: OperationGroup
+	instance?: Instance
+	token: string
+	onChanged: () => Promise<void>
+	onOperation?: (operation: Operation) => void
+	onOpenInstance?: (instanceID: string, tab: InstanceTab) => void
+	onClose: () => void
+}) {
 	const latest = latestOperation(group.operations)
+	const instanceName = instance?.name ?? 'Fleet Manager'
 	const sessionID = group.type === 'CHAT_MESSAGE' && ['PENDING', 'RUNNING'].includes(group.status) && typeof latest.metadata?.chat_session_id === 'string'
 		? latest.metadata.chat_session_id
 		: ''
 	const [stopping, setStopping] = useState(false)
 	const [stopError, setStopError] = useState('')
+	const [continueBusy, setContinueBusy] = useState('')
+	const [continueError, setContinueError] = useState('')
 	const { dialogRef, onKeyDown } = useDialogAccessibility(onClose)
+	const failed = latest.status === 'FAILED'
+	const canRepairRuntime = Boolean(instance && instanceHasRuntimeDrift(instance) && instance.status === 'RUNNING')
+	const retryProvisioningAvailable = Boolean(failed && instance && instance.status === 'FAILED' && ['PROVISION', 'RETRY'].includes(latest.type))
+	const openBackupsAvailable = Boolean(failed && instance && ((latest.type === 'UPGRADE_HERMES' && latest.metadata?.update_kind !== 'RUNTIME_REFRESH') || latest.type === 'RESTORE'))
+	const repairAvailable = Boolean(failed && instance && latest.type === 'REPAIR_RUNTIME' && canRepairRuntime)
 	const stopChatResponse = async () => {
 		if (!sessionID || stopping) return
 		setStopping(true)
@@ -3974,6 +4503,31 @@ function OperationDetailPanel({ group, instanceName, token, onChanged, onClose }
 			setStopError(requestError instanceof Error ? requestError.message : 'Chat response could not be stopped')
 		} finally {
 			setStopping(false)
+		}
+	}
+	const runInstanceAction = async (action: 'retry' | 'repair-runtime') => {
+		if (!instance || continueBusy) return
+		if (action === 'repair-runtime' && !window.confirm(`Repair and verify ${instance.name}? Fleet will preserve its data, repair the managed services, and confirm Hermes and dashboard health.`)) return
+		setContinueBusy(action)
+		setContinueError('')
+		try {
+			let operation = await apiRequest<Operation>(token, `/api/v1/instances/${instance.id}/actions`, {
+				method: 'POST',
+				body: JSON.stringify(action === 'retry'
+					? { action: 'retry', workflow_id: window.crypto.randomUUID() }
+					: { action: 'repair-runtime', confirm_name: instance.name }),
+			})
+			onOperation?.(operation)
+			if (['PENDING', 'RUNNING'].includes(operation.status)) {
+				operation = await waitForOperation(token, operation.id, new AbortController().signal)
+				onOperation?.(operation)
+			}
+			await onChanged()
+			onClose()
+		} catch (requestError) {
+			setContinueError(requestError instanceof Error ? requestError.message : 'The recovery action failed')
+		} finally {
+			setContinueBusy('')
 		}
 	}
 	return <div className="operation-detail-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><aside ref={dialogRef} className="operation-detail-panel" role="dialog" aria-modal="true" aria-label="Operation details" tabIndex={-1} onKeyDown={onKeyDown}>
@@ -3990,6 +4544,12 @@ function OperationDetailPanel({ group, instanceName, token, onChanged, onClose }
 		<div className="operation-detail-timeline"><strong>Audit timeline</strong><OperationTimeline operations={group.operations} hideErrorForOperationID={latest.id} /></div>
 		{(latest.error || latest.progress?.detail) && <div className="operation-detail-error"><strong>{latest.status === 'FAILED' ? 'Failure detail' : 'Current detail'}</strong><span>{latest.error || latest.progress?.detail}</span>{latest.progress?.action_code && <small>Required action: {sentenceCase(latest.progress.action_code.replaceAll('_', ' '))}. Return to the originating module to retry safely.</small>}</div>}
 		{stopError && <div className="operation-detail-error"><strong>Stop failed</strong><span>{stopError}</span></div>}
+		{continueError && <div className="operation-detail-error"><strong>Recovery failed</strong><span>{continueError}</span></div>}
+		{(retryProvisioningAvailable || openBackupsAvailable || repairAvailable) && instance && <div className="operation-continue-actions">
+			{openBackupsAvailable && onOpenInstance && <button className="primary-button compact-button" onClick={() => { onOpenInstance(instance.id, 'recovery'); onClose() }}>Open backups</button>}
+			{repairAvailable && <button className="primary-button compact-button" onClick={() => void runInstanceAction('repair-runtime')} disabled={Boolean(continueBusy)}><RefreshCw size={15} className={continueBusy === 'repair-runtime' ? 'spin' : ''} />{continueBusy === 'repair-runtime' ? 'Repairing' : 'Repair and verify'}</button>}
+			{retryProvisioningAvailable && <button className="primary-button compact-button" onClick={() => void runInstanceAction('retry')} disabled={Boolean(continueBusy)}><RefreshCw size={15} className={continueBusy === 'retry' ? 'spin' : ''} />{continueBusy === 'retry' ? 'Retrying provisioning' : 'Retry provisioning'}</button>}
+		</div>}
 	</aside></div>
 }
 
@@ -4237,7 +4797,7 @@ function RuntimeHealthPanel({ token, info }: { token: string; info: SystemInfo |
 
 function RemoteAccessPanel({ token, info, loading, reload }: { token: string; info: SystemInfo | null; loading: boolean; reload: () => Promise<void> }) {
 	const [syncing, setSyncing] = useState(false)
-	const [savingTarget, setSavingTarget] = useState<'admin' | 'publishing' | 'endpoints' | ''>('')
+	const [savingTarget, setSavingTarget] = useState<'oauth' | 'oauth-client' | 'admin' | 'publishing' | 'endpoints' | ''>('')
 	const [syncError, setSyncError] = useState('')
 	const [editing, setEditing] = useState(false)
 	const [configuration, setConfiguration] = useState<RemoteAccessConfiguration | null>(null)
@@ -4247,9 +4807,17 @@ function RemoteAccessPanel({ token, info, loading, reload }: { token: string; in
 	const [mode, setMode] = useState<RemoteAccessMode | ''>('')
 	const [adminURL, setAdminURL] = useState('')
 	const [instanceURLs, setInstanceURLs] = useState<Record<string, string>>({})
+	const [oauthSession, setOAuthSession] = useState<CloudflareOAuthSession | null>(null)
+	const [oauthAccountID, setOAuthAccountID] = useState('')
+	const [oauthZoneID, setOAuthZoneID] = useState('')
+	const [oauthClientID, setOAuthClientID] = useState('')
+	const [oauthCopied, setOAuthCopied] = useState('')
+	const oauthClientDirty = useRef(false)
+	const modeDirty = useRef(false)
+	const oauthFlowActive = useRef(Boolean(new URLSearchParams(window.location.search).get('cloudflare_oauth') || sessionStorage.getItem(cloudflareOAuthSessionStorageKey)))
 	const [form, setForm] = useState({
 		admin_tunnel_token: '', instances_tunnel_token: '', admin_hostname: '',
-		route_account_id: '', route_zone_id: '', route_api_token: '', route_fleet_namespace: '',
+		route_account_id: '', route_zone_id: '', route_api_token: '', route_fleet_namespace: 'fleet',
 	})
 	const dirtyFormFields = useRef(new Set<keyof typeof form>())
 	const remote = info?.remote_access
@@ -4262,6 +4830,7 @@ function RemoteAccessPanel({ token, info, loading, reload }: { token: string; in
 			if (configurationResult.status === 'rejected') throw configurationResult.reason
 			const value = configurationResult.value
 			setConfiguration(value)
+			if (!oauthClientDirty.current) setOAuthClientID(value.cloudflare_oauth_setup?.client_id || '')
 			if (instancesResult.status === 'fulfilled') {
 				setInstances((instancesResult.value ?? []).filter((instance) => instance.status !== 'DELETED'))
 				setSyncError('')
@@ -4269,7 +4838,7 @@ function RemoteAccessPanel({ token, info, loading, reload }: { token: string; in
 				setInstances([])
 				setSyncError(value.mode === 'existing_endpoints' ? 'Instance endpoints cannot be edited because the instance list could not be loaded.' : '')
 			}
-			setMode(value.mode || '')
+			if (!oauthFlowActive.current && (!modeDirty.current || Boolean(value.mode))) setMode(value.mode || '')
 			setAdminURL(value.admin_url || '')
 			setInstanceURLs(Object.fromEntries((value.instance_endpoints ?? []).map((endpoint) => [endpoint.instance_id, endpoint.dashboard_url || ''])))
 			setForm((current) => ({
@@ -4280,7 +4849,7 @@ function RemoteAccessPanel({ token, info, loading, reload }: { token: string; in
 				admin_hostname: dirtyFormFields.current.has('admin_hostname') ? current.admin_hostname : value.admin_hostname || '',
 				route_account_id: dirtyFormFields.current.has('route_account_id') ? current.route_account_id : value.instance_publishing_account_id || '',
 				route_zone_id: dirtyFormFields.current.has('route_zone_id') ? current.route_zone_id : value.instance_publishing_zone_id || '',
-				route_fleet_namespace: dirtyFormFields.current.has('route_fleet_namespace') ? current.route_fleet_namespace : value.instance_publishing_fleet_namespace || '',
+				route_fleet_namespace: dirtyFormFields.current.has('route_fleet_namespace') ? current.route_fleet_namespace : value.instance_publishing_fleet_namespace || current.route_fleet_namespace || 'fleet',
 			}))
 		} catch (requestError) {
 			setSyncError(requestError instanceof Error ? requestError.message : 'Remote access configuration could not be loaded')
@@ -4290,6 +4859,43 @@ function RemoteAccessPanel({ token, info, loading, reload }: { token: string; in
 		const initial = window.setTimeout(() => void loadConfiguration(), 0)
 		return () => window.clearTimeout(initial)
 	}, [loadConfiguration, remote?.configured])
+	useEffect(() => {
+		const parameters = new URLSearchParams(window.location.search)
+		const callbackSessionID = parameters.get('cloudflare_oauth')
+		const sessionID = callbackSessionID || sessionStorage.getItem(cloudflareOAuthSessionStorageKey)
+		if (!sessionID) return
+		if (callbackSessionID) {
+			sessionStorage.setItem(cloudflareOAuthSessionStorageKey, sessionID)
+			window.history.replaceState(null, '', `${window.location.pathname}${window.location.hash}`)
+		}
+		if (sessionID === 'failed') {
+			oauthFlowActive.current = false
+			sessionStorage.removeItem(cloudflareOAuthSessionStorageKey)
+			const errorTimer = window.setTimeout(() => setSyncError('Cloudflare sign-in was cancelled or could not be completed'), 0)
+			return () => window.clearTimeout(errorTimer)
+		}
+		let cancelled = false
+		void apiRequest<CloudflareOAuthSession>(token, `/api/v1/system/remote-access/cloudflare/oauth/session?id=${encodeURIComponent(sessionID)}`, { cache: 'no-store' })
+			.then((session) => {
+				if (cancelled) return
+				setOAuthSession(session)
+				modeDirty.current = true
+				setMode('managed_cloudflare')
+				setEditing(true)
+				const accountID = session.accounts[0]?.id || ''
+				setOAuthAccountID(accountID)
+				setOAuthZoneID(session.zones.find((zone) => zone.account_id === accountID)?.id || '')
+				setSyncError('')
+			})
+			.catch((requestError) => {
+				if (!cancelled) {
+					oauthFlowActive.current = false
+					sessionStorage.removeItem(cloudflareOAuthSessionStorageKey)
+					setSyncError(requestError instanceof Error ? requestError.message : 'Cloudflare authorization could not be loaded')
+				}
+			})
+		return () => { cancelled = true }
+	}, [token])
 	useEffect(() => {
 		if (!remote?.configured || !['pending', 'syncing'].includes(remote.state)) return
 		const timer = window.setInterval(() => void Promise.all([reload(), loadConfiguration()]), 2000)
@@ -4322,6 +4928,68 @@ function RemoteAccessPanel({ token, info, loading, reload }: { token: string; in
 			return <div className="remote-summary-field"><div className="messaging-secret-summary"><div><span>Public hostname</span><code aria-label="Saved public hostname">{storedHostname}</code><small>Active admin route · Saved by Fleet</small></div><button type="button" className="secondary-button" onClick={() => setEditingAdminHostname(true)} disabled={syncing}>Change hostname</button></div></div>
 		}
 		return <div className="remote-token-editor"><label>Public hostname<input required placeholder="admin.example.com" value={form.admin_hostname} onChange={(event) => updateField('admin_hostname', event.target.value)} /><span>The hostname configured in the Cloudflare published application route.</span></label>{storedHostname && <button type="button" className="text-button" onClick={() => { updateField('admin_hostname', storedHostname); setEditingAdminHostname(false) }} disabled={syncing}>Cancel hostname change</button>}</div>
+	}
+	const startCloudflareOAuth = async () => {
+		setSyncing(true)
+		setSavingTarget('oauth')
+		setSyncError('')
+		try {
+			const result = await apiRequest<{ authorization_url: string }>(token, '/api/v1/system/remote-access/cloudflare/oauth/start', { method: 'POST' })
+			window.location.assign(result.authorization_url)
+		} catch (requestError) {
+			setSyncError(requestError instanceof Error ? requestError.message : 'Cloudflare sign-in could not be started')
+			setSyncing(false)
+			setSavingTarget('')
+		}
+	}
+	const copyOAuthValue = async (label: string, value: string) => {
+		await navigator.clipboard.writeText(value)
+		setOAuthCopied(label)
+		window.setTimeout(() => setOAuthCopied((current) => current === label ? '' : current), 1200)
+	}
+	const saveCloudflareOAuthClient = async (event: FormEvent) => {
+		event.preventDefault()
+		setSyncing(true)
+		setSavingTarget('oauth-client')
+		setSyncError('')
+		try {
+			await apiRequest(token, '/api/v1/system/remote-access/cloudflare/oauth/client', {
+				method: 'PUT',
+				body: JSON.stringify({ client_id: oauthClientID.trim() }),
+			})
+			oauthClientDirty.current = false
+			await loadConfiguration()
+		} catch (requestError) {
+			setSyncError(requestError instanceof Error ? requestError.message : 'Cloudflare OAuth client could not be saved')
+		} finally {
+			setSyncing(false)
+			setSavingTarget('')
+		}
+	}
+	const finishCloudflareOAuth = async (event: FormEvent) => {
+		event.preventDefault()
+		if (!oauthSession) return
+		setSyncing(true)
+		setSavingTarget('oauth')
+		setSyncError('')
+		try {
+			let operation = await apiRequest<Operation>(token, '/api/v1/system/remote-access/cloudflare/oauth/complete', {
+				method: 'POST',
+				body: JSON.stringify({ session_id: oauthSession.id, account_id: oauthAccountID, zone_id: oauthZoneID, fleet_namespace: form.route_fleet_namespace }),
+			})
+			operation = await waitForOperationResult(token, operation.id, new AbortController().signal)
+			if (operation.status === 'FAILED') throw new Error(operation.progress?.detail || operation.error || 'Cloudflare provisioning failed')
+			setOAuthSession(null)
+			oauthFlowActive.current = false
+			sessionStorage.removeItem(cloudflareOAuthSessionStorageKey)
+			await Promise.all([reload(), loadConfiguration()])
+			setEditing(false)
+		} catch (requestError) {
+			setSyncError(requestError instanceof Error ? requestError.message : 'Cloudflare could not be connected')
+		} finally {
+			setSyncing(false)
+			setSavingTarget('')
+		}
 	}
 	const saveAdminBoundary = async (event: FormEvent) => {
 		event.preventDefault()
@@ -4461,13 +5129,14 @@ function RemoteAccessPanel({ token, info, loading, reload }: { token: string; in
 	)
 	const showPublishingWorkflow = syncing || remote?.state === 'syncing' || routeHasIssue
 	const publishingWorkflow = <ol className="remote-route-workflow" aria-label="Cloudflare route publication workflow"><li>Validate hostname</li><li>Create or update DNS</li><li>Create or update tunnel ingress</li><li>Verify Cloudflare configuration</li><li>Check public endpoint</li></ol>
+	const oauthZones = oauthSession?.zones.filter((zone) => zone.account_id === oauthAccountID) ?? []
 	const routeInventory = <div className="remote-route-inventory">
 		<div className="remote-origin-row"><div><strong>Instance publishing inventory</strong><span>Fleet generates each hostname from its namespace and instance name.</span></div><strong className="remote-origin-value">{instanceRoutes.length} managed {plural(instanceRoutes.length, 'instance')}</strong></div>
 		{showPublishingWorkflow ? <div className="remote-route-workflow-active"><strong>{routeHasIssue ? 'Publishing workflow needs attention' : 'Publishing workflow in progress'}</strong>{publishingWorkflow}</div> : <details className="remote-route-workflow-details"><summary>How publishing works</summary>{publishingWorkflow}</details>}
 		{instanceRoutes.length === 0 ? <div className="empty-state compact-empty"><strong>No managed instances</strong><span>Create an instance before publishing a dashboard.</span></div> : <div className="table-wrap"><table className="provider-table remote-route-table"><thead><tr><th>Instance</th><th>Public hostname</th><th>DNS</th><th>Route</th><th>Endpoint</th></tr></thead><tbody>{instanceRoutes.map((route) => <tr key={route.instance_id}><td data-label="Instance"><strong>{route.instance_name}</strong></td><td data-label="Public hostname"><code>{route.hostname || 'Not configured'}</code></td><td data-label="DNS" title={route.dns_detail || undefined} aria-label={route.dns_detail ? `${remoteResourceStateLabel(route.dns_state)}. ${route.dns_detail}` : undefined}><Status value={route.dns_state === 'ready' ? 'READY' : route.dns_state === 'failed' || route.dns_state === 'conflict' ? 'FAILED' : 'UNKNOWN'} label={route.hostname ? remoteResourceStateLabel(route.dns_state) : '—'} />{route.dns_detail && route.dns_state !== 'ready' && <span className="secondary-text">{route.dns_detail}</span>}</td><td data-label="Route" title={route.route_detail || undefined} aria-label={route.route_detail ? `${remoteResourceStateLabel(route.route_state)}. ${route.route_detail}` : undefined}><Status value={route.route_state === 'ready' ? 'READY' : route.route_state === 'failed' || route.route_state === 'conflict' ? 'FAILED' : 'UNKNOWN'} label={route.hostname ? remoteResourceStateLabel(route.route_state) : '—'} />{route.route_detail && route.route_state !== 'ready' && <span className="secondary-text">{route.route_detail}</span>}</td><td data-label="Endpoint" title={route.endpoint_detail || undefined} aria-label={route.endpoint_detail ? `${remoteRouteEndpointLabel(route.endpoint_state)}. ${route.endpoint_detail}` : undefined}><Status value={route.endpoint_state === 'reachable' ? 'READY' : route.endpoint_state === 'unavailable' || route.endpoint_state === 'access_protected' ? 'FAILED' : 'UNKNOWN'} label={route.hostname ? remoteRouteEndpointLabel(route.endpoint_state) : '—'} />{route.endpoint_detail && route.endpoint_state !== 'reachable' && <span className="secondary-text">{route.endpoint_detail}</span>}</td></tr>)}</tbody></table></div>}
 	</div>
 	return <section className="section-block first-section">
-		<div className="section-heading"><div><h2>Remote access</h2><p>{!remote?.configured ? 'Choose how Fleet Manager and instance dashboards are published' : existingEndpoints ? 'Public URLs managed by your existing provider' : 'Pre-created Cloudflare tunnels connected by secure tokens'}</p></div><Status value={stateValue} label={stateLabel} /></div>
+		<div className="section-heading"><div><h2>Remote access</h2><p>{!remote?.configured ? 'Choose how Fleet Manager and instance dashboards are published' : existingEndpoints ? 'Public URLs managed by your existing provider' : configuration?.cloudflare_oauth_connected ? 'Cloudflare account connected and managed by Fleet' : 'Cloudflare tunnels connected by secure tokens'}</p></div><Status value={stateValue} label={stateLabel} /></div>
 			{remote?.configured && !showEditor && configuration?.legacy_provider_managed && <div className="remote-access-boundary"><ShieldCheck size={17} /><div><strong>Legacy Cloudflare configuration</strong><span>This release keeps the existing configuration running. Disable it, then re-enable remote access with tunnel tokens to migrate.</span></div></div>}
 			{remote?.configured && !showEditor && (existingEndpoints ? <div className="settings-grid">
 			<div className="settings-row"><div><strong>Fleet Manager public URL</strong><span>Registered in Fleet; routing stays with your provider</span></div><div>{remote.admin.url ? <a href={remote.admin.url} target="_blank" rel="noreferrer"><strong>{remote.admin.url}</strong></a> : <strong>Not registered</strong>}<span>{remote.admin.url ? 'Opens through your existing provider' : 'Fleet Manager remains local-only'}</span></div></div>
@@ -4478,7 +5147,7 @@ function RemoteAccessPanel({ token, info, loading, reload }: { token: string; in
 				<div className="remote-capability-card">
 					<div><strong>Fleet Manager access</strong><Status value={adminStatusValue} label={adminStatusLabel} /></div>
 					{remote.admin.hostname ? <a href={remote.admin.url || `https://${remote.admin.hostname}`} target="_blank" rel="noreferrer">{remote.admin.hostname}</a> : <strong>Not configured</strong>}
-					<span>The admin route remains manually managed in Cloudflare.</span>
+					<span>{configuration?.cloudflare_oauth_connected ? 'Fleet owns and reconciles this Cloudflare route.' : 'The admin route remains manually managed in Cloudflare.'}</span>
 				</div>
 				<div className="remote-capability-card">
 					<div><strong>Instance publishing</strong><Status value={configuration?.instance_publishing_configured ? 'READY' : 'INCOMPLETE'} label={configuration?.instance_publishing_configured ? 'Ready' : 'Incomplete'} /></div>
@@ -4491,7 +5160,7 @@ function RemoteAccessPanel({ token, info, loading, reload }: { token: string; in
 				<div className="settings-grid">
 					<div className="settings-row"><div><strong>Admin public endpoint</strong><span>Actual response from the configured hostname</span></div><div><strong>{remoteRouteEndpointLabel(remote.admin.endpoint_state)}</strong><span>{remote.admin.endpoint_checked_at ? `Checked ${relativeTime(remote.admin.endpoint_checked_at)}` : 'Waiting for the connector'}</span>{remote.admin.endpoint_detail && <span className={adminEndpointFailed ? 'danger-text' : ''}>{remote.admin.endpoint_detail}</span>}</div></div>
 					<div className="settings-row"><div><strong>Connector runtime</strong><span>Actual cloudflared process readiness</span></div><div><strong>Admin {remote.admin.connector_state || 'not checked'} · Instances {remote.instances.connector_state || 'not checked'}</strong><span>{remote.admin.connector_checked_at || remote.instances.connector_checked_at ? `Checked ${relativeTime(remote.admin.connector_checked_at || remote.instances.connector_checked_at || '')}` : 'Waiting for connector health checks'}</span>{(remote.admin.connector_error || remote.instances.connector_error) && <span className="danger-text">{remote.admin.connector_error || remote.instances.connector_error}</span>}</div></div>
-					<div className="settings-row"><div><strong>Connector configuration</strong><span>Tokens are encrypted and written only to connector token files</span></div><div><strong>{remote.last_sync_at ? `Applied ${relativeTime(remote.last_sync_at)}` : 'Not applied'}</strong><span>Admin tunnel {remote.admin.tunnel_id || 'not reported'} · Instance tunnel {configuration?.instance_publishing_tunnel_id || 'not verified'}</span>{remote.last_error && <span className="danger-text">{remote.last_error}</span>}</div></div>
+					<div className="settings-row"><div><strong>Connector configuration</strong><span>Credentials are encrypted and written only to connector token files</span></div><div><strong>{remote.last_sync_at ? `Applied ${relativeTime(remote.last_sync_at)}` : 'Not applied'}</strong><span>Admin tunnel {remote.admin.tunnel_id || 'not reported'} · Instance tunnel {configuration?.instance_publishing_tunnel_id || 'not verified'}</span>{remote.last_error && <span className="danger-text">{remote.last_error}</span>}</div></div>
 				</div>
 				{routeInventory}
 			</details>
@@ -4499,13 +5168,66 @@ function RemoteAccessPanel({ token, info, loading, reload }: { token: string; in
 		{showEditor && <div className="remote-access-editor">
 			<div className="form-section-heading"><div><h3>Connection mode</h3><p>Choose who owns the public routing configuration.</p></div></div>
 			<div className="remote-access-mode-picker">
-				<label className={mode === 'managed_cloudflare' ? 'selected' : ''}><input type="radio" name="remote-access-mode" value="managed_cloudflare" checked={mode === 'managed_cloudflare'} disabled={remote?.configured} onChange={() => setMode('managed_cloudflare')} /><span><strong>Cloudflare tunnels</strong><small>Fleet runs one admin connector and one shared instance connector. Instance publishing includes route automation.</small></span></label>
-				<label className={mode === 'existing_endpoints' ? 'selected' : ''}><input type="radio" name="remote-access-mode" value="existing_endpoints" checked={mode === 'existing_endpoints'} disabled={remote?.configured} onChange={() => setMode('existing_endpoints')} /><span><strong>Existing public endpoints</strong><small>Register URLs already served by Cloudflare, ngrok, Railway, or another provider. Fleet does not change or secure those routes.</small></span></label>
+				<label className={mode === 'managed_cloudflare' ? 'selected' : ''}><input type="radio" name="remote-access-mode" value="managed_cloudflare" checked={mode === 'managed_cloudflare'} disabled={remote?.configured} onChange={() => { modeDirty.current = true; setMode('managed_cloudflare') }} /><span><strong>Cloudflare</strong><small>Sign in once. Fleet prepares one admin tunnel and one shared instance tunnel automatically.</small></span></label>
+				<label className={mode === 'existing_endpoints' ? 'selected' : ''}><input type="radio" name="remote-access-mode" value="existing_endpoints" checked={mode === 'existing_endpoints'} disabled={remote?.configured} onChange={() => { modeDirty.current = true; setMode('existing_endpoints') }} /><span><strong>Existing public endpoints</strong><small>Register URLs already served by Cloudflare, ngrok, Railway, or another provider. Fleet does not change or secure those routes.</small></span></label>
 			</div>
 			{remote?.configured && <div className="remote-access-boundary"><ShieldCheck size={17} /><div><strong>Mode is locked while active</strong><span>Disable remote access before changing ownership mode.</span></div></div>}
-			{mode === '' ? <div className="remote-access-boundary"><ShieldCheck size={17} /><div><strong>No mode selected</strong><span>Choose existing Cloudflare tunnels or register endpoints that are already published by another provider.</span></div></div> : mode === 'managed_cloudflare' ? <>
-				<div className="remote-access-boundary"><ShieldCheck size={17} /><div><strong>Tokens stay private</strong><span>Fleet encrypts tunnel and API tokens at rest and never returns them through the API.</span></div></div>
-				{configuration?.legacy_provider_managed && <div className="remote-access-boundary"><ShieldCheck size={17} /><div><strong>Legacy configuration is active</strong><span>Disable remote access before migrating this configuration to tunnel tokens.</span></div></div>}
+			{mode === '' ? <div className="remote-access-boundary"><ShieldCheck size={17} /><div><strong>No mode selected</strong><span>Choose Cloudflare sign-in or register endpoints that are already published by another provider.</span></div></div> : mode === 'managed_cloudflare' ? <>
+				<div className="form-section-heading remote-access-subsection-heading"><div><h3>Remote Access settings</h3><p>Shared routing configuration used by both Cloudflare OAuth and manual credentials.</p></div></div>
+				<div className="remote-shared-settings-card">
+					<div className="form-grid">
+						<label>Fleet namespace<input required readOnly={namespaceLocked} placeholder="fleet" pattern="[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?" maxLength={32} value={form.route_fleet_namespace} onChange={(event) => updateField('route_fleet_namespace', event.target.value.toLowerCase())} /><span>{namespaceLocked ? 'Locked while any instance dashboard is published.' : 'Lowercase letters, numbers, and hyphens. Fleet uses this prefix for the admin and instance hostnames.'}</span></label>
+					</div>
+					<div className="remote-origin-row"><div><strong>Hostname format</strong><span>Generated by Fleet and read-only on each instance.</span></div><code>{form.route_fleet_namespace && (configuration?.instance_publishing_zone || oauthZones.find((zone) => zone.id === oauthZoneID)?.name) ? `${form.route_fleet_namespace}-<instance>.${configuration?.instance_publishing_zone || oauthZones.find((zone) => zone.id === oauthZoneID)?.name}` : 'Available after a domain is selected'}</code></div>
+				</div>
+				<div className="form-section-heading remote-access-subsection-heading"><div><h3>Cloudflare authorization</h3><p>Use OAuth when available. Manual credentials remain an advanced fallback.</p></div></div>
+				<div className="remote-oauth-card">
+					<div className="remote-access-card-heading"><div><h3>Connect Cloudflare</h3><p>Sign in once. Fleet selects your authorized account, creates two Fleet-owned tunnels, and configures DNS automatically.</p></div><Status value={configuration?.cloudflare_oauth_connected ? 'READY' : 'STOPPED'} label={configuration?.cloudflare_oauth_connected ? 'Connected' : 'Not connected'} /></div>
+					{configuration?.cloudflare_oauth_connected ? <div className="settings-grid">
+						<div className="settings-row"><div><strong>Authorized zone</strong><span>Account and zone selected during Cloudflare sign-in</span></div><div><strong>{configuration.instance_publishing_zone || 'Not reported'}</strong><span>{configuration.instance_publishing_fleet_namespace ? `Namespace ${configuration.instance_publishing_fleet_namespace}` : 'Namespace not reported'}</span></div></div>
+						<div className="settings-row"><div><strong>Authorization</strong><span>Access tokens refresh automatically and remain encrypted by Fleet</span></div><div><Status value="READY" label="OAuth connected" /><span>{configuration.cloudflare_oauth_scope || 'Permissions defined by the registered Fleet OAuth client'}</span></div></div>
+					</div> : oauthSession ? <form className="remote-oauth-selection" onSubmit={(event) => void finishCloudflareOAuth(event)}>
+						<div className="form-grid">
+							<label>Cloudflare account<select required value={oauthAccountID} onChange={(event) => { const accountID = event.target.value; setOAuthAccountID(accountID); setOAuthZoneID(oauthSession.zones.find((zone) => zone.account_id === accountID)?.id || '') }}>{oauthSession.accounts.map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}</select></label>
+							<label>Domain<select required value={oauthZoneID} onChange={(event) => setOAuthZoneID(event.target.value)}>{oauthZones.map((zone) => <option key={zone.id} value={zone.id}>{zone.name}</option>)}</select></label>
+							<div className="remote-oauth-hostname-preview"><strong>Selected hostname plan</strong><span>Fleet Manager becomes {form.route_fleet_namespace || 'fleet'}.{oauthZones.find((zone) => zone.id === oauthZoneID)?.name || 'example.com'}; instance dashboards use {form.route_fleet_namespace || 'fleet'}-&lt;instance&gt;.</span></div>
+						</div>
+						<div className="remote-access-card-footer"><span>Only the selected account and domain are used.</span><button className="primary-button" disabled={syncing || !oauthAccountID || !oauthZoneID || !form.route_fleet_namespace}>{savingTarget === 'oauth' ? <RefreshCw className="spin" size={16} /> : <ShieldCheck size={16} />}{savingTarget === 'oauth' ? 'Preparing Cloudflare' : 'Use this domain'}</button></div>
+					</form> : configuration?.cloudflare_oauth_available ? <div className="remote-oauth-connect">
+						<div className="remote-access-boundary"><ShieldCheck size={17} /><div><strong>No token copying</strong><span>Cloudflare shows the permissions before approval. Fleet stores renewable authorization only in its encrypted control-plane state.</span></div></div>
+						<button type="button" className="primary-button remote-oauth-button" onClick={() => void startCloudflareOAuth()} disabled={syncing}>{savingTarget === 'oauth' ? <RefreshCw className="spin" size={16} /> : <ExternalLink size={16} />}{savingTarget === 'oauth' ? 'Opening Cloudflare' : 'Sign in with Cloudflare'}</button>
+						<span className="secondary-text">OAuth client {configuration.cloudflare_oauth_setup?.client_id || 'configured'} · Authorization Code with PKCE S256</span>
+					</div> : <div className="remote-oauth-setup">
+						<div className="remote-access-boundary"><ShieldCheck size={17} /><div><strong>OAuth client setup required</strong><span>Create one private Cloudflare OAuth client, then save its public Client ID in Fleet. No Client Secret is used.</span></div></div>
+						<div className="remote-oauth-setup-actions">
+							<a className="secondary-button" href={configuration?.cloudflare_oauth_setup?.oauth_clients_url || 'https://dash.cloudflare.com/?to=/:account/oauth-clients'} target="_blank" rel="noreferrer"><ExternalLink size={16} />Open Cloudflare OAuth clients</a>
+							<a className="text-button" href={configuration?.cloudflare_oauth_setup?.documentation_url || 'https://developers.cloudflare.com/fundamentals/oauth/create-an-oauth-client/'} target="_blank" rel="noreferrer">Read Cloudflare setup documentation</a>
+						</div>
+						<div className="remote-oauth-guide" aria-label="Cloudflare OAuth client fields">
+							<div><span>Client name</span><strong>Hermes Fleet</strong></div>
+							<div><span>Response type</span><strong>Code</strong></div>
+							<div><span>Grant type</span><strong>Authorization Code</strong></div>
+							<div><span>Token authentication</span><strong>None</strong></div>
+							<div><span>PKCE</span><strong>Required · S256</strong></div>
+							<div><span>Visibility</span><strong>Private</strong></div>
+							<div className="remote-oauth-guide-wide"><span>Redirect URL</span><code>{configuration?.cloudflare_oauth_setup?.redirect_url || 'Unavailable'}</code><button type="button" className="icon-button" title="Copy redirect URL" aria-label="Copy redirect URL" disabled={!configuration?.cloudflare_oauth_setup?.redirect_url} onClick={() => void copyOAuthValue('redirect', configuration?.cloudflare_oauth_setup?.redirect_url || '')}>{oauthCopied === 'redirect' ? <Check size={15} /> : <Copy size={15} />}</button></div>
+					</div>
+					<div className="remote-oauth-scopes">
+						<div className="remote-oauth-scopes-heading"><div><strong>Required scopes</strong><span>Use these exact scope IDs in the Cloudflare client.</span></div><button type="button" className="text-button" disabled={!configuration?.cloudflare_oauth_setup?.scopes?.length} onClick={() => void copyOAuthValue('scopes', (configuration?.cloudflare_oauth_setup?.scopes || []).map((scope) => scope.id).join(' '))}>{oauthCopied === 'scopes' ? 'Copied' : 'Copy all scope IDs'}</button></div>
+						{(configuration?.cloudflare_oauth_setup?.scopes || []).map((scope) => <div className="remote-oauth-scope-row" key={scope.id}><code>{scope.id}</code><div><strong>{scope.name}</strong><span>{scope.purpose}</span></div></div>)}
+					</div>
+					<form className="remote-oauth-client-form" onSubmit={(event) => void saveCloudflareOAuthClient(event)}>
+						<label>Cloudflare Client ID<input required minLength={8} maxLength={256} autoComplete="off" autoCapitalize="none" spellCheck={false} value={oauthClientID} onChange={(event) => { oauthClientDirty.current = true; setOAuthClientID(event.target.value) }} /><span>Paste the Client ID shown after Cloudflare creates the OAuth client.</span></label>
+						<button className="primary-button" disabled={syncing || oauthClientID.trim().length < 8}>{savingTarget === 'oauth-client' ? <RefreshCw className="spin" size={16} /> : <ShieldCheck size={16} />}{savingTarget === 'oauth-client' ? 'Validating configuration' : 'Save and validate'}</button>
+					</form>
+					<span className="secondary-text">Fleet validates the Client ID format and local OAuth request configuration. Cloudflare validates the client, redirect URL, and scopes when you sign in.</span>
+				</div>}
+				</div>
+				<details className="diagnostics-details remote-advanced-details">
+					<summary>Advanced manual setup</summary>
+					<div className="remote-advanced-content">
+					<div className="remote-access-boundary"><ShieldCheck size={17} /><div><strong>Manual credentials</strong><span>Use this fallback only for pre-created tunnels or installations without Cloudflare OAuth.</span></div></div>
+					{configuration?.legacy_provider_managed && <div className="remote-access-boundary"><ShieldCheck size={17} /><div><strong>Legacy configuration is active</strong><span>Disable remote access before migrating this configuration to tunnel tokens.</span></div></div>}
 				<form className="remote-access-boundary-card" onSubmit={(event) => void saveAdminBoundary(event)}>
 					<div className="remote-access-card-heading"><div><h3>Fleet Manager admin tunnel</h3><p>Publishes only the Fleet Manager admin surface.</p></div><Status value={adminStatusValue} label={adminStatusLabel} /></div>
 					<div className="form-grid">
@@ -4517,21 +5239,26 @@ function RemoteAccessPanel({ token, info, loading, reload }: { token: string; in
 					<div className="remote-access-card-footer"><span>Saving this card does not change the instance tunnel.</span><button className="primary-button" disabled={syncing || Boolean(configuration?.legacy_provider_managed)}>{savingTarget === 'admin' ? <RefreshCw className="spin" size={16} /> : <ShieldCheck size={16} />}{savingTarget === 'admin' ? 'Saving admin tunnel' : 'Save admin tunnel'}</button></div>
 				</form>
 				<form className="remote-access-boundary-card" onSubmit={(event) => void saveInstancePublishing(event)}>
-					<div className="remote-access-card-heading"><div><h3>Instance publishing</h3><p>One shared instance connector plus Cloudflare automation for Fleet-generated hostnames.</p></div><Status value={configuration?.instance_publishing_configured ? 'READY' : 'STOPPED'} label={configuration?.instance_publishing_configured ? 'Connected' : 'Not configured'} /></div>
+					<div className="remote-access-card-heading"><div><h3>Manual instance credentials</h3><p>Fallback credentials for the shared instance connector and Cloudflare API.</p></div><Status value={configuration?.instance_publishing_configured ? 'READY' : 'STOPPED'} label={configuration?.instance_publishing_configured ? 'Connected' : 'Not configured'} /></div>
 					<div className="remote-access-boundary"><ShieldCheck size={17} /><div><strong>Fleet-owned resources only</strong><span>Fleet reconciles only DNS and ingress resources it recorded as owned, and preserves unrelated Cloudflare configuration.</span></div></div>
 					<div className="form-grid remote-automation-grid">
 						{tunnelTokenField('instances', configuration?.instances_tunnel_token_configured)}
 						<label>Cloudflare Account ID<input required value={form.route_account_id} onChange={(event) => updateField('route_account_id', event.target.value)} /></label>
 						<label>Zone ID<input required value={form.route_zone_id} onChange={(event) => updateField('route_zone_id', event.target.value)} /></label>
 						{publishingAPITokenField()}
-						<label>Fleet namespace<input required readOnly={namespaceLocked} placeholder="andes" pattern="[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?" maxLength={32} value={form.route_fleet_namespace} onChange={(event) => updateField('route_fleet_namespace', event.target.value.toLowerCase())} /><span>{namespaceLocked ? 'Locked while any instance dashboard is published.' : 'Lowercase letters, numbers, and hyphens. Used as the prefix for every generated hostname.'}</span></label>
 					</div>
-					<div className="remote-origin-row"><div><strong>Hostname format</strong><span>Generated by Fleet and read-only on each instance.</span></div><code>{form.route_fleet_namespace && (configuration?.instance_publishing_zone || 'example.com') ? `${form.route_fleet_namespace}-<instance>.${configuration?.instance_publishing_zone || 'example.com'}` : 'Available after namespace and zone are configured'}</code></div>
-					<div className="remote-origin-row"><div><strong>Publishing zone</strong><span>Resolved and verified from the Cloudflare Zone ID.</span></div><code>{configuration?.instance_publishing_zone || 'Available after verification'}</code></div>
-					<div className="remote-origin-row"><div><strong>Tunnel ID</strong><span>Extracted and validated from the shared instance tunnel token.</span></div><code>{configuration?.instance_publishing_tunnel_id || 'Available after verification'}</code></div>
-					{routeInventory}
-					<div className="remote-access-card-footer"><span>Connect verifies the token, API permissions, shared connector, and current Cloudflare configuration.</span><button className="primary-button" disabled={syncing || Boolean(configuration?.legacy_provider_managed)}>{savingTarget === 'publishing' ? <RefreshCw className="spin" size={16} /> : <ShieldCheck size={16} />}{savingTarget === 'publishing' ? 'Connecting and verifying' : 'Connect and verify'}</button></div>
+					<div className="remote-access-card-footer"><span>These fields are used only by the manual fallback.</span><button className="primary-button" disabled={syncing || !form.route_fleet_namespace || Boolean(configuration?.legacy_provider_managed)}>{savingTarget === 'publishing' ? <RefreshCw className="spin" size={16} /> : <ShieldCheck size={16} />}{savingTarget === 'publishing' ? 'Connecting manually' : 'Connect manual setup'}</button></div>
 				</form>
+					</div>
+				</details>
+				<div className="form-section-heading remote-access-subsection-heading"><div><h3>Publishing status</h3><p>Shared result of the selected Cloudflare authorization method.</p></div></div>
+				<div className="remote-publishing-status-card">
+					<div className="remote-access-card-heading"><div><h3>Instance publishing</h3><p>Verified Cloudflare zone, connector, and Fleet-generated routes.</p></div><Status value={configuration?.instance_publishing_configured ? 'READY' : 'STOPPED'} label={configuration?.instance_publishing_configured ? 'Connected' : 'Not configured'} /></div>
+					<div className="remote-origin-row"><div><strong>Publishing zone</strong><span>Selected by OAuth or resolved from the manual Zone ID.</span></div><code>{configuration?.instance_publishing_zone || oauthZones.find((zone) => zone.id === oauthZoneID)?.name || 'Available after authorization'}</code></div>
+					<div className="remote-origin-row"><div><strong>Tunnel ID</strong><span>Created by OAuth or validated from the manual shared tunnel token.</span></div><code>{configuration?.instance_publishing_tunnel_id || 'Available after authorization'}</code></div>
+					{routeInventory}
+					<div className="remote-access-card-footer"><span>Fleet reports the authoritative publishing result here, regardless of whether OAuth or manual credentials were used.</span>{remote?.configured && <button type="button" className="secondary-button" onClick={() => void reconcile()} disabled={loading || syncing || remote.state === 'syncing'}><RefreshCw size={16} className={syncing || remote.state === 'syncing' ? 'spin' : ''} />{syncing ? 'Checking' : 'Check publishing'}</button>}</div>
+				</div>
 			</> : <>
 				<form className="remote-access-boundary-card" onSubmit={(event) => void saveEndpoints(event)}>
 					<div className="remote-access-card-heading"><div><h3>Public URLs</h3><p>Fleet stores these mappings only. Your provider remains authoritative.</p></div></div>
@@ -4740,12 +5467,14 @@ function BackupsPanel({ token, refreshSignal, info, systemLoading, reloadSystemI
     </section>
 }
 
-function CreateInstanceDialog({ hosts, token, onClose, onCreated, onOperation }: {
+function CreateInstanceDialog({ hosts, token, onClose, onCreated, onOperation, onOpenInstance, onStartChat }: {
   hosts: Host[]
   token: string
   onClose: () => void
   onCreated: () => void
   onOperation: (operation: Operation) => void
+	onOpenInstance: (instanceID: string) => void
+	onStartChat: (sessionID: string) => void
 }) {
   const onlineHosts = hosts.filter((host) => host.status === 'ONLINE')
   const initialHostID = onlineHosts[0]?.id ?? ''
@@ -4754,6 +5483,11 @@ function CreateInstanceDialog({ hosts, token, onClose, onCreated, onOperation }:
 	const [releaseError, setReleaseError] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
+	const [phase, setPhase] = useState<'form' | 'provisioning' | 'ready' | 'failed'>('form')
+	const [created, setCreated] = useState<Instance | null>(null)
+	const [provisionOperation, setProvisionOperation] = useState<Operation | null>(null)
+	const [startingChat, setStartingChat] = useState(false)
+	const pollController = useRef<AbortController | null>(null)
 	useEffect(() => {
 		const controller = new AbortController()
 		void apiRequest<HermesReleaseCatalog>(token, '/api/v1/hermes-releases', { signal: controller.signal }).then((catalog) => {
@@ -4768,23 +5502,97 @@ function CreateInstanceDialog({ hosts, token, onClose, onCreated, onOperation }:
 		})
 		return () => controller.abort()
 	}, [token])
+	useEffect(() => () => pollController.current?.abort(), [])
   const submit = async (event: FormEvent) => {
     event.preventDefault()
     setSubmitting(true)
     setError('')
+		let watching = false
     try {
-      const operation = await apiRequest<Operation>(token, '/api/v1/instances', { method: 'POST', body: JSON.stringify(form) })
-      if (operation?.id && operation.created_at) onOperation(operation)
-      onCreated()
+      const instance = await apiRequest<Instance>(token, '/api/v1/instances', { method: 'POST', body: JSON.stringify(form) })
+			setCreated(instance)
+			onCreated()
+			if (['RUNNING', 'STOPPED', 'FAILED'].includes(instance.status)) {
+				setPhase(instance.status === 'FAILED' ? 'failed' : 'ready')
+				if (instance.last_error) setError(instance.last_error)
+				return
+			}
+			watching = true
+			setPhase('provisioning')
+			pollController.current?.abort()
+			const controller = new AbortController()
+			pollController.current = controller
+			const deadline = Date.now() + 20 * 60 * 1000
+			while (Date.now() < deadline) {
+				const overview = await getOverview(token, { cache: 'no-store', signal: controller.signal })
+				const live = overview.instances?.find((item) => item.id === instance.id) ?? instance
+				const operation = overview.operations?.find((item) => item.instance_id === instance.id && ['PROVISION', 'RETRY'].includes(item.type))
+				if (operation) {
+					setProvisionOperation(operation)
+					onOperation(operation)
+				}
+				setCreated(live)
+				if (['RUNNING', 'STOPPED', 'FAILED'].includes(live.status)) {
+					setPhase(live.status === 'FAILED' ? 'failed' : 'ready')
+					if (live.status === 'FAILED') setError(live.last_error || operation?.error || 'Provisioning failed')
+					return
+				}
+				await sleep(1000, controller.signal)
+			}
+			throw new Error('Provisioning did not finish before the timeout')
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : 'Instance could not be created')
+			if (requestError instanceof DOMException && requestError.name === 'AbortError') return
+			const message = requestError instanceof Error ? requestError.message : 'Instance could not be created'
+			setError(message)
+			if (watching) setPhase('failed')
     } finally {
       setSubmitting(false)
     }
   }
-	const close = () => { if (!submitting) onClose() }
-	const { dialogRef, onKeyDown } = useDialogAccessibility(close, !submitting)
-			return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) close() }}><div ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="create-title" aria-busy={submitting} tabIndex={-1} onKeyDown={onKeyDown}><div className="modal-header"><div><h2 id="create-title">Create instance</h2><p>Choose a Hermes release and the initial active OAuth provider. Additional Hermes OAuth logins can be added after the instance is running.</p></div><button className="icon-button" onClick={close} title="Close" disabled={submitting}><X size={18} /></button></div><form onSubmit={submit}><div className="form-grid"><label>Instance name<input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value.toLowerCase() })} pattern="[a-z](?:[a-z0-9]|-){2,31}" placeholder="fleet-test-01" required disabled={submitting} /></label><label>Host<select value={form.host_id} onChange={(event) => setForm({ ...form, host_id: event.target.value })} required disabled={submitting}>{onlineHosts.map((host) => <option key={host.id} value={host.id}>{host.name}</option>)}</select></label><label>Provider<select value={form.provider} onChange={(event) => setForm({ ...form, provider: event.target.value })} required disabled={submitting}>{instanceOAuthProviders.map((entry) => <option key={entry.slug} value={entry.slug}>{entry.label}</option>)}</select></label><label>Hermes version<select value={form.hermes_version} onChange={(event) => setForm({ ...form, hermes_version: event.target.value })} required disabled={submitting || !releaseCatalog}>{!releaseCatalog && <option value="">Loading versions</option>}{releaseCatalog?.releases.map((release, index) => <option key={release.version} value={release.version}>{release.version}{index === 0 ? ' · latest' : ''}</option>)}</select></label></div>{form.provider === 'xai-oauth' && <div className="inline-notice">{providerCopy('xai-oauth').authNote}</div>}{releaseCatalog?.stale && <div className="inline-notice">GitHub release check is unavailable. Fleet is using the last verified catalog from {relativeTime(releaseCatalog.checked_at)}.</div>}{releaseError && <div className="inline-error">{releaseError}</div>}{error && <div className="inline-error">{error}</div>}<div className="modal-actions"><button type="button" className="secondary-button" onClick={close} disabled={submitting}>Cancel</button><button type="submit" className="primary-button" disabled={submitting || !form.host_id || !form.hermes_version}>{submitting ? 'Creating' : 'Create instance'}<Plus size={17} /></button></div></form></div></div>
+	const closeEnabled = (phase === 'form' && !submitting) || phase === 'ready' || phase === 'failed'
+	const close = () => { if (closeEnabled) onClose() }
+	const startChat = async () => {
+		if (!created || startingChat) return
+		setStartingChat(true)
+		setError('')
+		try {
+			const session = await apiRequest<ChatSession>(token, '/api/v1/chats', {
+				method: 'POST', body: JSON.stringify({ instance_id: created.id, title: '' }),
+			})
+			onStartChat(session.id)
+		} catch (requestError) {
+			setError(requestError instanceof Error ? requestError.message : 'Chat session could not be created')
+		} finally {
+			setStartingChat(false)
+		}
+	}
+	const { dialogRef, onKeyDown } = useDialogAccessibility(close, closeEnabled)
+	const subtitle = phase === 'provisioning'
+		? 'Fleet is provisioning the isolated runtime. This dialog stays open until the instance is ready.'
+		: phase === 'ready'
+			? 'The instance is ready. Open it to finish provider sign-in, or start a chat.'
+			: phase === 'failed'
+				? 'Provisioning stopped before the managed runtime was ready.'
+				: 'Choose a Hermes release and the initial active OAuth provider. Additional Hermes OAuth logins can be added after the instance is running.'
+	return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) close() }}><div ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="create-title" aria-busy={submitting || phase === 'provisioning'} tabIndex={-1} onKeyDown={onKeyDown}><div className="modal-header"><div><h2 id="create-title">Create instance</h2><p>{subtitle}</p></div><button className="icon-button" onClick={close} title="Close" disabled={!closeEnabled}><X size={18} /></button></div>
+		{phase === 'form' ? <form onSubmit={submit}><div className="form-grid"><label>Instance name<input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value.toLowerCase() })} pattern="[a-z](?:[a-z0-9]|-){2,31}" placeholder="fleet-test-01" required disabled={submitting} /></label><label>Host<select value={form.host_id} onChange={(event) => setForm({ ...form, host_id: event.target.value })} required disabled={submitting}>{onlineHosts.map((host) => <option key={host.id} value={host.id}>{host.name}</option>)}</select></label><label>Provider<select value={form.provider} onChange={(event) => setForm({ ...form, provider: event.target.value })} required disabled={submitting}>{instanceOAuthProviders.map((entry) => <option key={entry.slug} value={entry.slug}>{entry.label}</option>)}</select></label><label>Hermes version<select value={form.hermes_version} onChange={(event) => setForm({ ...form, hermes_version: event.target.value })} required disabled={submitting || !releaseCatalog}>{!releaseCatalog && <option value="">Loading versions</option>}{releaseCatalog?.releases.map((release, index) => <option key={release.version} value={release.version}>{release.version}{index === 0 ? ' · latest' : ''}</option>)}</select></label></div>{form.provider === 'xai-oauth' && <div className="inline-notice">{providerCopy('xai-oauth').authNote}</div>}{releaseCatalog?.stale && <div className="inline-notice">GitHub release check is unavailable. Fleet is using the last verified catalog from {relativeTime(releaseCatalog.checked_at)}.</div>}{releaseError && <div className="inline-error">{releaseError}</div>}{error && <div className="inline-error">{error}</div>}<div className="modal-actions"><button type="button" className="secondary-button" onClick={close} disabled={submitting}>Cancel</button><button type="submit" className="primary-button" disabled={submitting || !form.host_id || !form.hermes_version}>{submitting ? 'Creating' : 'Create instance'}<Plus size={17} /></button></div></form>
+			: <div className="create-runway">
+				<div className="create-runway-status">
+					{phase === 'provisioning' ? <RefreshCw className="spin" size={18} /> : phase === 'ready' ? <Check size={18} /> : <X size={18} />}
+					<div>
+						<strong>{created?.name || form.name}</strong>
+						<span>{phase === 'provisioning' ? provisionOperation?.progress?.detail || provisionOperation?.summary || 'The Host Agent is creating the managed runtime.' : phase === 'ready' ? created?.status === 'RUNNING' ? 'The managed runtime is running. Sign in from the instance if this provider still needs authentication.' : 'The instance was provisioned and remains stopped.' : error || 'Provisioning failed'}</span>
+					</div>
+				</div>
+				{created && <Status value={created.status} label={runtimeStatusLabel(created.status)} />}
+				{phase === 'ready' && error && <div className="inline-error">{error}</div>}
+				<div className="modal-actions">
+					<button type="button" className="secondary-button" onClick={close} disabled={!closeEnabled}>{phase === 'provisioning' ? 'Provisioning' : 'Close'}</button>
+					{phase === 'ready' && created && <button type="button" className="secondary-button" onClick={() => onOpenInstance(created.id)}>Open instance</button>}
+					{phase === 'ready' && created?.status === 'RUNNING' && <button type="button" className="primary-button" onClick={() => void startChat()} disabled={startingChat}><MessageCircle size={16} />{startingChat ? 'Opening chat' : 'Start chat'}</button>}
+				</div>
+			</div>}
+	</div></div>
 }
 
 function Status({ value, label = value }: { value: string; label?: string }) {
@@ -4943,10 +5751,11 @@ function EmptyState({ icon: Icon, title, detail }: { icon: typeof Boxes; title: 
 }
 
 function viewSubtitle(view: View) {
+	if (view === 'dashboard') return 'Fleet health and activity overview'
   if (view === 'hosts') return 'Machines running Hermes instances'
+	if (view === 'catalog') return 'Shared skills and cross-instance capability inventory'
   if (view === 'chat') return 'Independent conversations across Hermes instances'
 	if (view === 'outputs') return 'Hermes-generated files retained and governed by Fleet'
-  if (view === 'alerts') return 'Actionable Fleet health and incident history'
   if (view === 'operations') return 'Lifecycle and audit history'
   if (view === 'system') return 'Fleet Manager configuration and maintenance'
   return 'Create and manage Hermes instances'
@@ -5002,83 +5811,17 @@ function providerSetupDiagnostic(
 	return { name: provider === 'openai-codex' ? 'codex_setup' : 'provider_setup', status, detail }
 }
 
-function buildFleetAlertRecords(hosts: Host[], instances: Instance[], operations: Operation[], health: RuntimeHealth | null, info: SystemInfo | null, backups: Backup[]) {
-	const records: FleetAlertRecord[] = []
-	const expectedAgentVersion = health?.compatibility.host_agent_version ?? info?.capabilities?.host_agent_version ?? ''
-	for (const host of hosts) {
-		if (host.status !== 'ONLINE') {
-			records.push({ id: `host-offline:${host.id}`, state: 'ACTIVE', severity: 'CRITICAL', title: `${host.name} is offline`, detail: 'Fleet is no longer receiving the Host Agent heartbeat.', source: 'Host Agent', detectedAt: host.last_seen_at, evidence: [`Last heartbeat ${relativeTime(host.last_seen_at)}`, `${host.hostname} · ${host.os}/${host.arch}`, `Host ID ${host.id}`], action: { label: 'Open host', view: 'hosts' } })
-		} else if (expectedAgentVersion && host.agent_version !== expectedAgentVersion) {
-			records.push({ id: `host-agent:${host.id}`, state: 'ACTIVE', severity: 'WARNING', title: `${host.name} Host Agent is outdated`, detail: `Host Agent ${host.agent_version} does not match the Fleet compatibility contract.`, source: 'Compatibility', detectedAt: host.last_seen_at, evidence: [`Installed ${host.agent_version}`, `Expected ${expectedAgentVersion}`, `Host ID ${host.id}`], action: { label: 'Open host', view: 'hosts' } })
-		}
-	}
-	for (const instance of instances) {
-		const operationalStatus = instanceOperationalHealthStatus(instance)
-		if (instance.status !== 'FAILED' && !['DEGRADED', 'MISSING'].includes(operationalStatus)) continue
-		const critical = instance.status === 'FAILED' || operationalStatus === 'MISSING'
-		records.push({ id: `instance:${instance.id}`, state: 'ACTIVE', severity: critical ? 'CRITICAL' : 'WARNING', title: `${instance.name} needs attention`, detail: instance.last_error || instance.observation?.summary || 'The managed runtime did not pass its latest authoritative check.', source: 'Instance health', detectedAt: instance.observation?.received_at || instance.updated_at, evidence: [`Runtime ${runtimeStatusLabel(instance.status)}`, `Health ${healthStatusLabel(operationalStatus)}`, `Host ${instance.host_name || instance.host_id}`], action: { label: 'Open instance diagnostics', view: 'fleet', instanceID: instance.id } })
-	}
-	for (const component of health?.components ?? []) {
-		if (component.status !== 'degraded') continue
-		if (component.component === 'remote_access' && ['pending', 'syncing'].includes(component.detail.toLowerCase())) continue
-		records.push({ id: `component:${component.component}`, state: 'ACTIVE', severity: component.component === 'control_plane' ? 'CRITICAL' : 'WARNING', title: `${fleetComponentLabel(component.component)} is degraded`, detail: component.detail || 'The component is not passing its current health check.', source: 'Runtime health', detectedAt: component.updated_at, evidence: [component.detail, component.last_success_at ? `Last healthy ${relativeTime(component.last_success_at)}` : 'No successful check recorded'], action: { label: 'Open runtime health', view: 'system', systemSection: 'runtime-health' } })
-	}
-	if (info?.backup_retention && backups.length > info.backup_retention) {
-		records.push({ id: 'backup-retention', state: 'ACTIVE', severity: 'WARNING', title: 'Backup rotation needs attention', detail: `Control-plane backups exceeded the rolling retention limit (${backups.length}/${info.backup_retention}). Automatic pruning did not complete.`, source: 'Control-plane backups', detectedAt: backups[0]?.created_at || info.readiness?.last_checked || new Date().toISOString(), evidence: [`${backups.length} retained backups`, `Retention limit ${info.backup_retention}`, 'Automatic pruning did not restore the configured limit'], action: { label: 'Open backups', view: 'system', systemSection: 'backups' } })
-	}
-	const recoveredByComponent = new Map<string, NonNullable<RuntimeHealth['recent_incidents']>>()
-	for (const incident of (health?.recent_incidents ?? []).filter((item) => item.status === 'healthy')) {
-		recoveredByComponent.set(incident.component, [...(recoveredByComponent.get(incident.component) ?? []), incident])
-	}
-	for (const incidents of [...recoveredByComponent.values()].slice(0, 5)) {
-		const ordered = [...incidents].sort((left, right) => new Date(right.occurred_at).getTime() - new Date(left.occurred_at).getTime())
-		const incident = ordered[0]
-		const count = ordered.length
-		records.push({ id: `recovered:${incident.component}:${incident.id}`, state: 'RECOVERED', resolution: 'RECOVERED', severity: 'WARNING', title: `${fleetComponentLabel(incident.component)} recovered`, detail: `${incident.detail || 'The component returned to a healthy state.'}${count > 1 ? ` · Occurred ${count} times` : ''}`, source: 'Runtime health', detectedAt: incident.occurred_at, evidence: [`Previous state ${incident.previous_status || 'degraded'}`, 'Current state healthy', ...(count > 1 ? [`${count} matching recoveries in recent history`] : [])], action: { label: 'Open runtime health', view: 'system', systemSection: 'runtime-health' } })
-	}
-	const operationGroups = groupOperations(operations)
-	const successfulGroups = operationGroups.filter((group) => group.status === 'SUCCEEDED')
-	const failedBuckets = new Map<string, OperationGroup[]>()
-	for (const group of operationGroups.filter((item) => item.status === 'FAILED')) {
-		const operation = latestOperation(group.operations)
-		const failure = (operation.error || operation.progress?.detail || 'The recorded operation did not complete.').trim().toLowerCase().replace(/\s+/g, ' ')
-		const key = `${operation.instance_id || 'fleet-manager'}:${group.type}:${failure}`
-		failedBuckets.set(key, [...(failedBuckets.get(key) ?? []), group])
-	}
-	const failedHistory = [...failedBuckets.values()].map((groups) => [...groups].sort((left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime())).sort((left, right) => new Date(right[0].updatedAt).getTime() - new Date(left[0].updatedAt).getTime()).slice(0, 8)
-	for (const groups of failedHistory) {
-		const group = groups[0]
+function unresolvedOperationWarnings(operations: Operation[]) {
+	const latestByScope = new Map<string, OperationGroup>()
+	for (const group of groupOperations(operations)) {
 		const operation = latestOperation(group.operations)
 		const scope = `${operation.instance_id || 'fleet-manager'}:${group.type}`
-		const supersedingGroup = successfulGroups.filter((candidate) => {
-			const candidateOperation = latestOperation(candidate.operations)
-			return `${candidateOperation.instance_id || 'fleet-manager'}:${candidate.type}` === scope && new Date(candidate.updatedAt).getTime() > new Date(group.updatedAt).getTime()
-		}).sort((left, right) => new Date(left.updatedAt).getTime() - new Date(right.updatedAt).getTime())[0]
-		const occurrenceCount = groups.length
-		const failureDetail = operation.error || operation.progress?.detail || 'The recorded operation did not complete.'
-		const superseded = Boolean(supersedingGroup)
-		records.push({
-			id: `operation:${group.id}`,
-			state: superseded ? 'RECOVERED' : 'FAILED',
-			...(superseded ? { resolution: 'SUPERSEDED' as const } : {}),
-			severity: 'WARNING',
-			title: group.summary,
-			detail: superseded ? `Previous failure was superseded by a later successful operation.${occurrenceCount > 1 ? ` ${occurrenceCount} matching failures were grouped.` : ''}` : `${failureDetail}${occurrenceCount > 1 ? ` · Occurred ${occurrenceCount} times` : ''}`,
-			source: 'Operations',
-			detectedAt: group.updatedAt,
-			evidence: [`Type ${operationStageLabel(group.type)}`, `Actor ${operationActorLabel(group.actor)}`, `Last failure ${operation.id}`, ...(occurrenceCount > 1 ? [`${occurrenceCount} matching failed operations`] : []), ...(supersedingGroup ? [`Superseded by successful operation ${latestOperation(supersedingGroup.operations).id}`] : operation.progress?.action_code ? [`Action code ${operation.progress.action_code}`] : [])],
-			action: { label: 'Open operations', view: 'operations' },
-		})
+		const current = latestByScope.get(scope)
+		if (!current || new Date(group.updatedAt).getTime() > new Date(current.updatedAt).getTime()) {
+			latestByScope.set(scope, group)
+		}
 	}
-	return records.sort((left, right) => {
-		if ((left.state === 'ACTIVE') !== (right.state === 'ACTIVE')) return left.state === 'ACTIVE' ? -1 : 1
-		if (left.state === 'ACTIVE' && left.severity !== right.severity) return left.severity === 'CRITICAL' ? -1 : 1
-		return new Date(right.detectedAt).getTime() - new Date(left.detectedAt).getTime()
-	})
-}
-
-function fleetComponentLabel(component: string) {
-	return ({ control_plane: 'Control plane', host_queue: 'Host work queue', remote_access: 'Remote access' } as Record<string, string>)[component] ?? sentenceCase(component)
+	return [...latestByScope.values()].filter((group) => group.status === 'FAILED')
 }
 
 function requestErrorMessage(value: unknown) {
@@ -5224,6 +5967,8 @@ function operationTypeLabel(value: string) {
 		HERMES_RUNTIME_REFRESH_WORKFLOW: 'Managed runtime maintenance',
 		ROLLOUT_POLICY: 'Roll out policy',
 		REFRESH_DIAGNOSTICS_CAMPAIGN: 'Refresh diagnostics campaign',
+		SYNC_HERMES_SKILL: 'Install Fleet skill',
+		REMOVE_HERMES_SKILL: 'Remove Fleet skill',
   }
   return labels[value] ?? sentenceCase(value)
 }

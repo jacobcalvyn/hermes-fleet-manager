@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -50,6 +51,9 @@ func TestRecoveryKitExportsVerifiedControlPlaneBackup(t *testing.T) {
 	if manifest.FleetVersion != "0.10.0" || manifest.BuildID != "build-123" {
 		t.Fatalf("unexpected manifest identity: %+v", manifest)
 	}
+	if manifest.FormatVersion != 2 || len(manifest.AuthenticationTag) != 64 {
+		t.Fatalf("recovery kit manifest is not authenticated: %+v", manifest)
+	}
 	wanted := map[string]bool{"manifest.json": false, "hermes-releases.json": false}
 	wanted[filepath.ToSlash(filepath.Join("control-plane", manifest.ControlPlaneBackup.Filename))] = false
 	reader := tar.NewReader(bytes.NewReader(output.Bytes()))
@@ -70,6 +74,155 @@ func TestRecoveryKitExportsVerifiedControlPlaneBackup(t *testing.T) {
 			t.Fatalf("recovery kit is missing %s", name)
 		}
 	}
+}
+
+func TestImportCleanHostRejectsTamperedManifest(t *testing.T) {
+	archiveData, key, _ := createEmptyRecoveryKitArchive(t)
+	tampered := rewriteRecoveryKitManifest(t, archiveData, func(manifest *KitManifest) {
+		manifest.BuildID = "forged-build"
+	}, nil)
+	err := importRecoveryKitBytes(t, tampered, key)
+	if err == nil || !strings.Contains(err.Error(), "authentication failed") {
+		t.Fatalf("ImportCleanHost() error = %v, want authentication failure", err)
+	}
+}
+
+func TestImportCleanHostRejectsSignedTraversalMetadataBeforeExtraction(t *testing.T) {
+	archiveData, key, recoveryPoints := createEmptyRecoveryKitArchive(t)
+	forged := rewriteRecoveryKitManifest(t, archiveData, func(manifest *KitManifest) {
+		manifest.ControlPlaneBackup.ID = "../outside"
+	}, func(manifest *KitManifest) {
+		payload, err := authenticatedManifestBytes(*manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		manifest.AuthenticationTag = recoveryPoints.AuthenticateRecoveryKitManifest(payload)
+	})
+	err := importRecoveryKitBytes(t, forged, key)
+	if err == nil || !strings.Contains(err.Error(), "invalid control-plane backup metadata") {
+		t.Fatalf("ImportCleanHost() error = %v, want invalid metadata", err)
+	}
+}
+
+func TestWriteImportedFileRejectsDestinationOutsideStage(t *testing.T) {
+	parent := t.TempDir()
+	stage := filepath.Join(parent, "stage")
+	if err := os.Mkdir(stage, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(parent, "outside")
+	err := writeImportedFile(context.Background(), stage, destination, strings.NewReader("forged"), 6, os.Getuid(), os.Getgid())
+	if err == nil || !strings.Contains(err.Error(), "escapes") {
+		t.Fatalf("writeImportedFile() error = %v", err)
+	}
+	if _, statErr := os.Stat(destination); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("outside destination was created: %v", statErr)
+	}
+}
+
+func createEmptyRecoveryKitArchive(t *testing.T) ([]byte, string, *recovery.Manager) {
+	t.Helper()
+	root := t.TempDir()
+	dataStore, err := store.Open(filepath.Join(root, "fleet.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	backups, err := backup.New(filepath.Join(root, "backups"), dataStore, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backups.Create(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	key := strings.Repeat("01", 32)
+	recoveryPoints, err := recovery.New(filepath.Join(root, "recovery"), key, 5, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kit, err := NewRecoveryKit(backups, recoveryPoints, func(context.Context) ([]domain.Instance, error) { return nil, nil }, "0.10.0", "build-test", releases.Catalog{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if _, err := kit.Export(context.Background(), &output); err != nil {
+		t.Fatal(err)
+	}
+	if err := dataStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return output.Bytes(), key, recoveryPoints
+}
+
+func rewriteRecoveryKitManifest(t *testing.T, source []byte, mutate func(*KitManifest), authenticate func(*KitManifest)) []byte {
+	t.Helper()
+	type entry struct {
+		header tar.Header
+		data   []byte
+	}
+	var entries []entry
+	reader := tar.NewReader(bytes.NewReader(source))
+	for {
+		header, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := io.ReadAll(reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		copied := *header
+		if header.Name == "manifest.json" {
+			var manifest KitManifest
+			if err := json.Unmarshal(data, &manifest); err != nil {
+				t.Fatal(err)
+			}
+			mutate(&manifest)
+			if authenticate != nil {
+				authenticate(&manifest)
+			}
+			data, err = json.MarshalIndent(manifest, "", "  ")
+			if err != nil {
+				t.Fatal(err)
+			}
+			data = append(data, '\n')
+			copied.Size = int64(len(data))
+		}
+		entries = append(entries, entry{header: copied, data: data})
+	}
+	var output bytes.Buffer
+	writer := tar.NewWriter(&output)
+	for _, item := range entries {
+		if err := writer.WriteHeader(&item.header); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.Write(item.data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return output.Bytes()
+}
+
+func importRecoveryKitBytes(t *testing.T, data []byte, key string) error {
+	t.Helper()
+	root := t.TempDir()
+	kitPath := filepath.Join(root, "kit.tar")
+	if err := os.WriteFile(kitPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_, err := ImportCleanHost(context.Background(), CleanHostImportOptions{
+		KitPath: kitPath, DataRoot: target, Confirmation: target, RecoveryKey: key, MaximumPointBytes: 1 << 20,
+	})
+	return err
 }
 
 func TestRecoveryKitFailsClosedWithoutCompleteBackupSet(t *testing.T) {

@@ -495,6 +495,11 @@ CREATE TABLE IF NOT EXISTS system_remote_access_config (
   ciphertext TEXT NOT NULL,
   updated_at DATETIME NOT NULL
 );
+CREATE TABLE IF NOT EXISTS system_cloudflare_oauth_client (
+  id INTEGER PRIMARY KEY CHECK(id = 1),
+  client_id TEXT NOT NULL,
+  updated_at DATETIME NOT NULL
+);
 CREATE TABLE IF NOT EXISTS remote_access_resources (
   instance_id TEXT NOT NULL REFERENCES instances(id),
   kind TEXT NOT NULL CHECK(kind IN ('dns', 'ingress')),
@@ -615,6 +620,37 @@ CREATE TABLE IF NOT EXISTS hermes_profile_inventories (
   profiles BLOB NOT NULL DEFAULT '[]',
   observed_at DATETIME NOT NULL
 );
+CREATE TABLE IF NOT EXISTS hermes_capability_inventories (
+  instance_id TEXT PRIMARY KEY REFERENCES instances(id) ON DELETE CASCADE,
+  inventory BLOB NOT NULL DEFAULT '{}',
+  observed_at DATETIME NOT NULL
+);
+CREATE TABLE IF NOT EXISTS hermes_skill_content_snapshots (
+  instance_id TEXT NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+  profile TEXT NOT NULL,
+  skill_name TEXT NOT NULL,
+  provenance TEXT NOT NULL DEFAULT '',
+  content BLOB NOT NULL,
+  revision TEXT NOT NULL,
+  observed_at DATETIME NOT NULL,
+  PRIMARY KEY(instance_id, profile, skill_name)
+);
+CREATE TABLE IF NOT EXISTS fleet_skill_catalog (
+  name TEXT PRIMARY KEY,
+  description TEXT NOT NULL DEFAULT '',
+  category TEXT NOT NULL DEFAULT '',
+  content BLOB NOT NULL,
+  revision TEXT NOT NULL,
+  origin_type TEXT NOT NULL DEFAULT 'fleet_created',
+  source_instance_id TEXT NOT NULL DEFAULT '',
+  source_instance_name TEXT NOT NULL DEFAULT '',
+  source_profile TEXT NOT NULL DEFAULT '',
+  source_revision TEXT NOT NULL DEFAULT '',
+  source_provenance TEXT NOT NULL DEFAULT '',
+  source_observed_at DATETIME NOT NULL DEFAULT '0001-01-01T00:00:00Z',
+  created_at DATETIME NOT NULL,
+  updated_at DATETIME NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_fleet_health_incidents_occurred
   ON fleet_health_incidents(occurred_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_instance_observations_host ON instance_observations(host_id, received_at DESC);
@@ -622,6 +658,22 @@ CREATE INDEX IF NOT EXISTS idx_observation_requests_host ON observation_requests
 `
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("migrate sqlite: %w", err)
+	}
+	for _, column := range []struct {
+		name       string
+		definition string
+	}{
+		{"origin_type", "TEXT NOT NULL DEFAULT 'fleet_created'"},
+		{"source_instance_id", "TEXT NOT NULL DEFAULT ''"},
+		{"source_instance_name", "TEXT NOT NULL DEFAULT ''"},
+		{"source_profile", "TEXT NOT NULL DEFAULT ''"},
+		{"source_revision", "TEXT NOT NULL DEFAULT ''"},
+		{"source_provenance", "TEXT NOT NULL DEFAULT ''"},
+		{"source_observed_at", "DATETIME NOT NULL DEFAULT '0001-01-01T00:00:00Z'"},
+	} {
+		if err := s.ensureColumn("fleet_skill_catalog", column.name, column.definition); err != nil {
+			return err
+		}
 	}
 	if err := s.ensureColumn("jobs", "lease_token", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
@@ -1430,6 +1482,31 @@ type MCPConfigRecord struct {
 type RemoteAccessConfigRecord struct {
 	Ciphertext string
 	UpdatedAt  time.Time
+}
+
+type CloudflareOAuthClientRecord struct {
+	ClientID  string
+	UpdatedAt time.Time
+}
+
+func (s *Store) GetCloudflareOAuthClient(ctx context.Context) (CloudflareOAuthClientRecord, error) {
+	var record CloudflareOAuthClientRecord
+	err := s.db.QueryRowContext(ctx, `
+SELECT client_id, updated_at FROM system_cloudflare_oauth_client WHERE id=1`).
+		Scan(&record.ClientID, &record.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return record, ErrNotFound
+	}
+	return record, err
+}
+
+func (s *Store) PutCloudflareOAuthClient(ctx context.Context, record CloudflareOAuthClientRecord) error {
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO system_cloudflare_oauth_client (id, client_id, updated_at)
+VALUES (1, ?, ?)
+ON CONFLICT(id) DO UPDATE SET client_id=excluded.client_id, updated_at=excluded.updated_at`,
+		record.ClientID, record.UpdatedAt)
+	return err
 }
 
 func (s *Store) GetRemoteAccessConfig(ctx context.Context) (RemoteAccessConfigRecord, error) {
@@ -3502,6 +3579,12 @@ WHERE j.id=? AND j.host_id=? AND j.lease_token=?
 	if !domain.IsHermesProfileJob(jobType) && result.HermesProfiles != nil {
 		return invalidJobResult("Hermes profile result does not match the active job")
 	}
+	if jobType != domain.JobInspectHermesCapabilities && result.HermesCapabilities != nil {
+		return invalidJobResult("Hermes capability result does not match the active job")
+	}
+	if jobType != domain.JobInspectHermesSkillContent && result.HermesSkillContent != nil {
+		return invalidJobResult("Hermes skill content result does not match the active job")
+	}
 	jobStatus, operationStatus, instanceStatus := domain.JobSucceeded, domain.OperationSucceeded, statusAfterSuccess(jobType)
 	errText := ""
 	if !result.Success {
@@ -3541,6 +3624,8 @@ WHERE j.id=? AND j.host_id=? AND j.lease_token=?
 	var upgradePayload *domain.HermesUpgradePayload
 	var updatePayload *domain.HermesUpdatePayload
 	var hermesProfileInventory *domain.HermesProfileInventory
+	var hermesCapabilityInventory *domain.HermesCapabilityInventory
+	var hermesSkillContentSnapshot *domain.HermesSkillContentSnapshot
 	switch jobType {
 	case domain.JobInspectHermesProfiles, domain.JobCreateHermesProfile, domain.JobRepairHermesProfiles,
 		domain.JobActivateHermesProfile, domain.JobDeleteHermesProfile:
@@ -3566,6 +3651,95 @@ WHERE j.id=? AND j.host_id=? AND j.lease_token=?
 			hermesProfileInventory = &copy
 		} else if result.HermesProfiles != nil {
 			return invalidJobResult("failed Hermes profile result returned an inventory")
+		}
+	case domain.JobInspectHermesCapabilities:
+		instanceStatus = ""
+		if result.ProjectName != "" || result.DataVolume != "" || result.ManagedPath != "" || result.ImageID != "" ||
+			result.InstanceStatus != "" || result.Credentials != nil || result.ChatMessage != "" ||
+			result.ChatCiphertext != "" || len(result.ChatArtifacts) != 0 || result.HermesProfiles != nil || reveal != nil {
+			return invalidJobResult("Hermes capability result returned unrelated metadata")
+		}
+		var payload domain.HermesCapabilityInspectPayload
+		if err := json.Unmarshal(jobPayload, &payload); err != nil || payload.InstanceID != instanceID ||
+			payload.Name == "" || payload.ProjectName == "" || payload.ManagedPath == "" ||
+			payload.APIPort < 1 || payload.APIPort > 65535 {
+			return errors.New("Hermes capability job payload is invalid")
+		}
+		if result.Success {
+			if result.HermesCapabilities == nil || result.HermesCapabilities.InstanceID != payload.InstanceID ||
+				!result.HermesCapabilities.ObservedAt.IsZero() ||
+				domain.ValidateHermesCapabilityInventory(result.HermesCapabilities) != nil {
+				return invalidJobResult("successful Hermes capability result is incomplete or mismatched")
+			}
+			copy := *result.HermesCapabilities
+			copy.ObservedAt = now
+			hermesCapabilityInventory = &copy
+		} else if result.HermesCapabilities != nil {
+			return invalidJobResult("failed Hermes capability result returned an inventory")
+		}
+	case domain.JobInspectHermesSkillContent:
+		instanceStatus = ""
+		if result.ProjectName != "" || result.DataVolume != "" || result.ManagedPath != "" || result.ImageID != "" ||
+			result.InstanceStatus != "" || result.Credentials != nil || result.ChatMessage != "" ||
+			result.ChatCiphertext != "" || len(result.ChatArtifacts) != 0 || result.HermesProfiles != nil ||
+			result.HermesCapabilities != nil || reveal != nil {
+			return invalidJobResult("Hermes skill content result returned unrelated metadata")
+		}
+		var payload domain.HermesSkillContentInspectPayload
+		if err := json.Unmarshal(jobPayload, &payload); err != nil || payload.InstanceID != instanceID ||
+			domain.ValidateHermesSkillContentInspectPayload(&payload) != nil {
+			return errors.New("Hermes skill content inspection job payload is invalid")
+		}
+		if result.Success {
+			if result.HermesSkillContent == nil || result.HermesSkillContent.InstanceID != payload.InstanceID ||
+				result.HermesSkillContent.SkillName != payload.SkillName || result.HermesSkillContent.Profile != payload.Profile ||
+				!result.HermesSkillContent.ObservedAt.IsZero() || domain.ValidateHermesSkillContentSnapshot(result.HermesSkillContent) != nil {
+				return invalidJobResult("successful Hermes skill content result is incomplete or mismatched")
+			}
+			copy := *result.HermesSkillContent
+			copy.ObservedAt = now
+			hermesSkillContentSnapshot = &copy
+		} else if result.HermesSkillContent != nil {
+			return invalidJobResult("failed Hermes skill content result returned a snapshot")
+		}
+	case domain.JobSyncHermesSkill:
+		instanceStatus = ""
+		if result.ProjectName != "" || result.DataVolume != "" || result.ManagedPath != "" || result.ImageID != "" ||
+			result.InstanceStatus != "" || result.Credentials != nil || result.ChatMessage != "" ||
+			result.ChatCiphertext != "" || len(result.ChatArtifacts) != 0 || result.HermesProfiles != nil ||
+			result.HermesCapabilities != nil || reveal != nil {
+			return invalidJobResult("Hermes skill synchronization result returned unrelated metadata")
+		}
+		var payload domain.HermesSkillSyncPayload
+		if err := json.Unmarshal(jobPayload, &payload); err != nil || payload.InstanceID != instanceID ||
+			domain.ValidateHermesSkillSyncPayload(&payload) != nil {
+			return errors.New("Hermes skill synchronization job payload is invalid")
+		}
+	case domain.JobRemoveHermesSkill:
+		instanceStatus = ""
+		if result.ProjectName != "" || result.DataVolume != "" || result.ManagedPath != "" || result.ImageID != "" ||
+			result.InstanceStatus != "" || result.Credentials != nil || result.ChatMessage != "" ||
+			result.ChatCiphertext != "" || len(result.ChatArtifacts) != 0 || result.HermesProfiles != nil ||
+			result.HermesCapabilities != nil || result.HermesSkillContent != nil || reveal != nil {
+			return invalidJobResult("Hermes skill removal result returned unrelated metadata")
+		}
+		var payload domain.HermesSkillRemovePayload
+		if err := json.Unmarshal(jobPayload, &payload); err != nil || payload.InstanceID != instanceID ||
+			domain.ValidateHermesSkillRemovePayload(&payload) != nil {
+			return errors.New("Hermes skill removal job payload is invalid")
+		}
+	case domain.JobSetHermesToolset:
+		instanceStatus = ""
+		if result.ProjectName != "" || result.DataVolume != "" || result.ManagedPath != "" || result.ImageID != "" ||
+			result.InstanceStatus != "" || result.Credentials != nil || result.ChatMessage != "" ||
+			result.ChatCiphertext != "" || len(result.ChatArtifacts) != 0 || result.HermesProfiles != nil ||
+			result.HermesCapabilities != nil || reveal != nil {
+			return invalidJobResult("Hermes toolset mutation result returned unrelated metadata")
+		}
+		var payload domain.HermesToolsetMutationPayload
+		if err := json.Unmarshal(jobPayload, &payload); err != nil || payload.InstanceID != instanceID ||
+			domain.ValidateHermesToolsetMutationPayload(&payload) != nil {
+			return errors.New("Hermes toolset mutation job payload is invalid")
 		}
 	case "instance.chat.send":
 		if result.ProjectName != "" || result.DataVolume != "" || result.ManagedPath != "" || result.ImageID != "" ||
@@ -3843,6 +4017,39 @@ WHERE id=? AND host_id=? AND status=? AND lease_token=? AND lease_expires_at>?`,
 			return ErrStateChanged
 		}
 	}
+	if hermesCapabilityInventory != nil {
+		encodedInventory, err := json.Marshal(hermesCapabilityInventory)
+		if err != nil {
+			return fmt.Errorf("encode Hermes capability inventory: %w", err)
+		}
+		inventoryUpdate, err := tx.ExecContext(ctx, `
+	INSERT INTO hermes_capability_inventories (instance_id, inventory, observed_at)
+	SELECT id, ?, ? FROM instances WHERE id=?
+	ON CONFLICT(instance_id) DO UPDATE SET inventory=excluded.inventory, observed_at=excluded.observed_at`,
+			encodedInventory, hermesCapabilityInventory.ObservedAt, hermesCapabilityInventory.InstanceID)
+		if err != nil {
+			return fmt.Errorf("record Hermes capability inventory: %w", err)
+		}
+		if count, _ := inventoryUpdate.RowsAffected(); count != 1 {
+			return ErrStateChanged
+		}
+	}
+	if hermesSkillContentSnapshot != nil {
+		snapshotUpdate, err := tx.ExecContext(ctx, `
+	INSERT INTO hermes_skill_content_snapshots (instance_id, profile, skill_name, provenance, content, revision, observed_at)
+	SELECT id, ?, ?, ?, ?, ?, ? FROM instances WHERE id=?
+	ON CONFLICT(instance_id, profile, skill_name) DO UPDATE SET
+	  provenance=excluded.provenance, content=excluded.content, revision=excluded.revision, observed_at=excluded.observed_at`,
+			hermesSkillContentSnapshot.Profile, hermesSkillContentSnapshot.SkillName, hermesSkillContentSnapshot.Provenance,
+			[]byte(hermesSkillContentSnapshot.Content), hermesSkillContentSnapshot.Revision,
+			hermesSkillContentSnapshot.ObservedAt, hermesSkillContentSnapshot.InstanceID)
+		if err != nil {
+			return fmt.Errorf("record Hermes skill content snapshot: %w", err)
+		}
+		if count, _ := snapshotUpdate.RowsAffected(); count != 1 {
+			return ErrStateChanged
+		}
+	}
 	metadata := make(map[string]any)
 	if len(storedOperationMetadata) > 0 {
 		_ = json.Unmarshal(storedOperationMetadata, &metadata)
@@ -3859,6 +4066,11 @@ WHERE id=? AND host_id=? AND status=? AND lease_token=? AND lease_expires_at>?`,
 	}
 	if hermesProfileInventory != nil {
 		metadata["profile_count"] = len(hermesProfileInventory.Profiles)
+	}
+	if hermesCapabilityInventory != nil {
+		metadata["skill_count"] = len(hermesCapabilityInventory.Skills)
+		metadata["toolset_count"] = len(hermesCapabilityInventory.Toolsets)
+		metadata["browser_available"] = hermesCapabilityInventory.Browser.Available
 	}
 	encodedMetadata, err := json.Marshal(metadata)
 	if err != nil {

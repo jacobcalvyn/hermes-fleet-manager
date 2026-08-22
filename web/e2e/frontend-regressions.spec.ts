@@ -156,6 +156,36 @@ function codexInstance(recommendedModel?: string, modelCatalog = ['model-alpha',
   }
 }
 
+test('Dashboard is the default Fleet overview and navigation follows operational ownership', async ({ page }) => {
+  const instance = codexInstance('model-alpha')
+  const operations = [operation(1, { instance_id: instance.id, status: 'RUNNING', summary: 'Inspecting managed runtime' })]
+  await page.addInitScript(() => window.localStorage.setItem('fleet-navigation-state', JSON.stringify({ view: 'chat', selectedInstanceID: '' })))
+  await installBaseRoutes(page, { operations })
+  await page.route('**/api/v1/overview', async (route) => {
+    await route.fulfill({ json: { hosts: [host], instances: [instance], operations } })
+  })
+
+  await page.goto('/')
+
+  await expect(page.getByRole('heading', { name: 'Dashboard', level: 1 })).toBeVisible()
+  await expect(page.getByLabel('Fleet overview')).toContainText('Hosts online1/1')
+  await expect(page.getByLabel('Fleet overview')).toContainText('Instances running1/1')
+  await expect(page.getByRole('heading', { name: 'Fleet status' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Recent activity' })).toBeVisible()
+  await expect(page.getByText('Inspecting managed runtime', { exact: true })).toBeVisible()
+
+  const workspaceNavigation = page.getByRole('group', { name: 'Workspace' })
+  await expect(workspaceNavigation.getByRole('button').allTextContents()).resolves.toEqual(['Chat', 'Outputs'])
+  const fleetNavigation = page.getByRole('group', { name: 'Fleet' })
+  await expect(fleetNavigation.getByRole('button').allTextContents()).resolves.toEqual(['Instances', 'Capabilities'])
+  const administrationNavigation = page.getByRole('group', { name: 'Administration' })
+  await expect(administrationNavigation.getByRole('button').allTextContents()).resolves.toEqual(['Hosts', 'Operations', 'System'])
+
+  await page.getByRole('button', { name: 'Instances', exact: true }).click()
+  await page.reload()
+  await expect(page.getByRole('heading', { name: 'Instances', level: 1 })).toBeVisible()
+})
+
 test('Chat renders an optimistic message before queue admission and keeps transport details out of the UI', async ({ page }) => {
   const qaScreenshotPath = process.env.FLEET_CHAT_QA_SCREENSHOT
   const consoleErrors: string[] = []
@@ -649,7 +679,7 @@ test('Operations loads the dedicated history instead of the truncated overview',
   await expect(page.getByText('Operation 25', { exact: true })).toBeVisible()
 })
 
-test('Operations centralizes filters, active status, and staged audit details', async ({ page }) => {
+test('Operations defaults to all statuses and only badges unresolved warnings', async ({ page }) => {
 	const instance = codexInstance('model-alpha')
 	const operations = [
 		operation(1, {
@@ -667,9 +697,9 @@ test('Operations centralizes filters, active status, and staged audit details', 
 	await page.route(`**/api/v1/instances/${instance.id}/recovery-points`, async (route) => route.fulfill({ json: [] }))
 	await openFleet(page, { hosts: [host], instances: [instance], operations }, { operations })
 
-	await expect(page.locator('.nav-count')).toHaveText('1')
+	await expect(page.getByRole('button', { name: 'Operations', exact: true }).locator('.nav-count')).toHaveCount(0)
 	await page.getByLabel('Primary navigation').getByRole('button', { name: 'Operations', exact: true }).click()
-	await expect(page.getByLabel('Filter operations by status')).toHaveValue('ACTIVE')
+	await expect(page.getByLabel('Filter operations by status')).toHaveValue('ALL')
 	const summary = page.getByLabel('Operation status summary')
 	await expect(summary).toContainText('Active1')
 	await expect(summary).toContainText('Failed1')
@@ -746,68 +776,37 @@ test('Operations can stop an active chat response from its detail panel', async 
 	await expect.poll(() => cancelRequests).toBe(1)
 })
 
-test('Alerts derives active backup risk and incident history from authoritative sources', async ({ page }) => {
+test('Resolved operation failures do not create navigation warnings', async ({ page }) => {
 	const failedOperation = operation(2, { type: 'REPAIR_RUNTIME', status: 'FAILED', summary: 'Restart managed runtime', error: 'Runtime health check failed' })
 	const successfulOperation = operation(1, { type: 'REPAIR_RUNTIME', status: 'SUCCEEDED', summary: 'Restart managed runtime' })
-  await page.route('**/api/v1/system/runtime-health', async (route) => route.fulfill({ json: {
-    status: 'healthy', stream_id: 'alerts-stream', state_revision: 4, event_subscribers: 1,
-    compatibility: { control_plane_version: '0.11.0', host_agent_version: host.agent_version, runtime_config_schemas: [1], default_job_concurrency: 1, maximum_job_concurrency: 4, features: [] },
-    queue: { pending: 0, active: 0, expired_leases: 0, admission_rejected: false, max_per_host: 4, hosts: [{ host_id: host.id, host_name: host.name, pending: 0, active: 0, expired_leases: 0, admission_open: true }] },
-    metrics: { started_at: now, uptime_seconds: 60, http_requests: 10, http_failures: 0, http_in_flight: 0, duration_samples: 10, average_http_ms: 1, p95_http_ms: 2, p99_http_ms: 3, max_http_ms: 4, mutations: 1, queue_rejected: 0, jobs_reconciled: 0 },
-    components: [{ component: 'control_plane', status: 'healthy', detail: 'ready', updated_at: now, last_success_at: now }],
-		recent_incidents: [
-			{ id: 9, component: 'remote_access', previous_status: 'degraded', status: 'healthy', detail: 'synced', occurred_at: now },
-			{ id: 8, component: 'remote_access', previous_status: 'degraded', status: 'healthy', detail: 'synced', occurred_at: '2026-07-26T23:55:00Z' },
-			{ id: 7, component: 'remote_access', previous_status: 'degraded', status: 'healthy', detail: 'synced', occurred_at: '2026-07-26T23:50:00Z' },
-		],
-  } }))
-  await page.route('**/api/v1/system', async (route) => route.fulfill({ json: {
-    fleet_version: '0.11.0', build_id: 'alerts-build', operator_url: 'http://127.0.0.1:9180', database_path: '/var/lib/hermes-fleet/fleet.db', backup_retention: 2,
-    readiness: { ready: true, database: 'ready', storage: 'ready', release_catalog: 'ready', capacity: { free_bytes: 10, total_bytes: 20, free_percent: 50, free_inodes: 10, minimum_free_bytes: 1, minimum_free_percent: 5, minimum_free_inodes: 1, operations_safe: true }, last_checked: now },
-    capacity: { free_bytes: 10, total_bytes: 20, free_percent: 50, free_inodes: 10, minimum_free_bytes: 1, minimum_free_percent: 5, minimum_free_inodes: 1, operations_safe: true },
-    capabilities: { control_plane_version: '0.11.0', host_agent_version: host.agent_version, runtime_config_schemas: [1], default_job_concurrency: 1, maximum_job_concurrency: 4, features: [] },
-    recovery_drill: { status: 'NEVER_RUN', control_plane_backup_checked: false, instance_backups_checked: 0, instances_without_backup: 0 },
-    remote_access: { configured: true, state: 'synced', admin: { routes: 1, synced: true }, instances: { routes: 1, synced: true } },
-  } }))
-  await page.route('**/api/v1/backups', async (route) => route.fulfill({ json: [
-    { id: 'backup-2', filename: 'backup-2.sqlite', size_bytes: 100, sha256: 'b'.repeat(64), created_at: now, verified_at: now },
-    { id: 'backup-1', filename: 'backup-1.sqlite', size_bytes: 100, sha256: 'a'.repeat(64), created_at: now, verified_at: now },
-  ] }))
 	await openFleet(page, { hosts: [host], instances: [], operations: [successfulOperation, failedOperation] }, { operations: [successfulOperation, failedOperation] })
 
-  const alertsNav = page.getByRole('button', { name: 'Alerts', exact: true })
-  await alertsNav.click()
-	await expect(alertsNav.locator('.alert-nav-count')).toHaveCount(0)
-  const summary = page.getByLabel('Alert summary')
-	await expect(summary).toContainText('Active0')
-	await expect(summary).toContainText('Warning0')
-	await expect(summary).toContainText('Recent incidents2')
-	await expect(page.getByRole('button', { name: 'Open alert: Remote access recovered' })).toHaveCount(1)
-	await expect(page.getByRole('button', { name: 'Open alert: Remote access recovered' })).toContainText('Occurred 3 times')
-	await expect(page.getByRole('button', { name: 'Open alert: Restart managed runtime' })).toContainText('Superseded')
-	await expect(page.getByRole('button', { name: 'Open alert: Backup retention is full' })).toHaveCount(0)
+	await expect(page.getByRole('button', { name: 'Alerts', exact: true })).toHaveCount(0)
+	await expect(page.getByRole('button', { name: 'Operations', exact: true }).locator('.nav-count')).toHaveCount(0)
 })
 
-test('Alerts preserves available evidence when one source is unavailable', async ({ page }) => {
+test('Operation warning badges clear when read and return for new failures', async ({ page }) => {
   const failedOperation = operation(1, { status: 'FAILED', summary: 'Repair instance runtime', error: 'Container health check failed' })
-  await page.route('**/api/v1/system/runtime-health', async (route) => route.fulfill({ json: {
-    status: 'healthy', stream_id: 'partial-alert-stream', state_revision: 2, event_subscribers: 1,
-    compatibility: { control_plane_version: '0.11.0', host_agent_version: host.agent_version, runtime_config_schemas: [1], default_job_concurrency: 1, maximum_job_concurrency: 4, features: [] },
-    queue: { pending: 0, active: 0, expired_leases: 0, admission_rejected: false, max_per_host: 4, hosts: [] },
-    metrics: { started_at: now, uptime_seconds: 60, http_requests: 10, http_failures: 0, http_in_flight: 0, duration_samples: 10, average_http_ms: 1, p95_http_ms: 2, p99_http_ms: 3, max_http_ms: 4, mutations: 1, queue_rejected: 0, jobs_reconciled: 0 },
-    components: [], recent_incidents: [],
-  } }))
-  await page.route('**/api/v1/system', async (route) => route.fulfill({ json: {
-    fleet_version: '0.11.0', build_id: 'partial-alert-build', operator_url: 'http://127.0.0.1:9180', database_path: '/var/lib/hermes-fleet/fleet.db', backup_retention: 20,
-  } }))
-  await page.route('**/api/v1/backups', async (route) => route.fulfill({ status: 503, json: { error: 'backup storage unavailable' } }))
-  await openFleet(page, { hosts: [host], instances: [], operations: [failedOperation] }, { operations: [failedOperation] })
+  const operations = [failedOperation]
+  const overview = { hosts: [host], instances: [], operations }
+  await openFleet(page, overview, { operations })
 
-  await page.getByRole('button', { name: 'Alerts', exact: true }).click()
-  await expect(page.getByText('Some alert sources are unavailable')).toBeVisible()
-  await expect(page.getByText(/Control-plane backups:/)).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Open alert: Repair instance runtime' })).toBeVisible()
-  await expect(page.getByLabel('Loading alert sources')).toHaveCount(0)
+	await expect(page.getByRole('button', { name: 'Alerts', exact: true })).toHaveCount(0)
+	const operationsNav = page.getByRole('button', { name: /Operations/ })
+	await expect(operationsNav.locator('.nav-count')).toHaveText('1')
+	await expect(operationsNav.locator('.nav-count')).toHaveAttribute('title', '1 unread operation warning')
+	await operationsNav.click()
+	await expect(operationsNav.locator('.nav-count')).toHaveCount(0)
+
+	await page.reload()
+	await expect(page.getByRole('heading', { name: 'Operations', level: 1 })).toBeVisible()
+	await expect(page.getByRole('button', { name: 'Operations', exact: true }).locator('.nav-count')).toHaveCount(0)
+
+	await page.getByRole('button', { name: 'Instances', exact: true }).click()
+	operations.unshift(operation(0, { status: 'FAILED', summary: 'Repair instance runtime again', error: 'Container health check failed again' }))
+	await page.reload()
+	await expect(page.getByRole('heading', { name: 'Instances', level: 1 })).toBeVisible()
+	await expect(page.getByRole('button', { name: /Operations/ }).locator('.nav-count')).toHaveText('1')
 })
 
 test('a recovered workflow reports the latest terminal attempt', async ({ page }) => {
@@ -1084,7 +1083,11 @@ test('Cloudflare remote access is configured only through the Fleet web flow', a
 	const editor = page.locator('.remote-access-editor')
 	await expect(editor).toBeVisible()
 	await expect(page.getByText(/FLEET_CLOUDFLARE|setup-cloudflare/)).toHaveCount(0)
-	await editor.getByLabel('Cloudflare tunnels').check()
+	await editor.getByRole('radio', { name: /^Cloudflare/ }).check()
+	await expect(editor.getByRole('heading', { name: 'Remote Access settings' })).toBeVisible()
+	await expect(editor.getByRole('heading', { name: 'Cloudflare authorization' })).toBeVisible()
+	await expect(editor.getByRole('heading', { name: 'Publishing status' })).toBeVisible()
+	await editor.getByText('Advanced manual setup', { exact: true }).click()
 	const adminConnectorToken = `eyJ${'A'.repeat(256)}`
 	const instancesConnectorToken = `eyJ${'B'.repeat(256)}`
 	const cards = editor.locator('.remote-access-boundary-card')
@@ -1116,25 +1119,147 @@ test('Cloudflare remote access is configured only through the Fleet web flow', a
 	await instancesCard.getByLabel('Cloudflare Account ID').fill('account-id')
 	await instancesCard.getByLabel('Zone ID').fill('zone-id')
 	await instancesCard.getByLabel('Cloudflare API token').fill('api-token-secret')
-	await instancesCard.getByLabel('Fleet namespace').fill('fleet')
+	await editor.getByLabel('Fleet namespace').fill('fleet')
 	// Pending remote-access polling must refresh server status without replacing unsaved form drafts.
 	await page.waitForTimeout(2200)
 	await expect(instancesCard.getByLabel('Tunnel token')).toHaveValue(instancesConnectorToken)
 	await expect(instancesCard.getByLabel('Cloudflare Account ID')).toHaveValue('account-id')
 	await expect(instancesCard.getByLabel('Zone ID')).toHaveValue('zone-id')
 	await expect(instancesCard.getByLabel('Cloudflare API token')).toHaveValue('api-token-secret')
-	await expect(instancesCard.getByLabel('Fleet namespace')).toHaveValue('fleet')
-	await expect(instancesCard.getByText('Instance publishing inventory', { exact: true })).toBeVisible()
-	await instancesCard.getByRole('button', { name: 'Connect and verify' }).click()
+	await expect(editor.getByLabel('Fleet namespace')).toHaveValue('fleet')
+	await expect(instancesCard.getByLabel('Fleet namespace')).toHaveCount(0)
+	await expect(editor.locator('.remote-publishing-status-card').getByText('Instance publishing inventory', { exact: true })).toBeVisible()
+	await instancesCard.getByRole('button', { name: 'Connect manual setup' }).click()
 	await expect.poll(() => savedPublishing).toMatchObject({ tunnel_token: instancesConnectorToken, account_id: 'account-id', zone_id: 'zone-id', api_token: 'api-token-secret', fleet_namespace: 'fleet' })
 	await expect(page.getByText('Connectors ready', { exact: true })).toBeVisible()
 	await expect(page.getByText('Tunnel tokens are encrypted by Fleet and never returned through the API.')).toBeVisible()
 	await page.getByRole('button', { name: 'Edit configuration' }).click()
+	await page.getByText('Advanced manual setup', { exact: true }).click()
 	const reopenedInstancesCard = page.locator('.remote-access-editor').locator('.remote-access-boundary-card').nth(1)
 	await expect(reopenedInstancesCard.getByText('ID F6E7D8C9B0')).toBeVisible()
 	await expect(reopenedInstancesCard.getByText('ID 1122334455')).toBeVisible()
-	await expect(reopenedInstancesCard.getByText(instancesTunnelID, { exact: true })).toBeVisible()
-	await expect(reopenedInstancesCard.getByText('example.com', { exact: true })).toBeVisible()
+	const publishingStatus = page.locator('.remote-publishing-status-card')
+	await expect(publishingStatus.getByText(instancesTunnelID, { exact: true })).toBeVisible()
+	await expect(publishingStatus.getByText('example.com', { exact: true })).toBeVisible()
+})
+
+test('Cloudflare OAuth client setup shows exact values before enabling sign-in', async ({ page }) => {
+	const instance = codexInstance()
+	let clientConfigured = false
+	let savedClientID = ''
+	const scopes = [
+		{ id: 'account-settings.read', name: 'Account Settings Read', purpose: 'List accounts.' },
+		{ id: 'zone.read', name: 'Zone Read', purpose: 'List zones.' },
+		{ id: 'dns.write', name: 'DNS Write', purpose: 'Manage DNS.' },
+		{ id: 'argotunnel.write', name: 'Cloudflare Tunnel Write', purpose: 'Manage tunnels.' },
+		{ id: 'offline_access', name: 'Offline access', purpose: 'Renew access.' },
+	]
+	await page.route('**/api/v1/instances', async (route) => route.fulfill({ json: [instance] }))
+	await page.route('**/api/v1/system/remote-access/configuration', async (route) => route.fulfill({ json: {
+		mode: '', cloudflare_oauth_available: clientConfigured, cloudflare_oauth_connected: false,
+		cloudflare_oauth_setup: {
+			client_configured: clientConfigured, client_id: savedClientID, managed_externally: false,
+			redirect_url: 'http://127.0.0.1:9180/api/v1/system/remote-access/cloudflare/oauth/callback',
+			oauth_clients_url: 'https://dash.cloudflare.com/?to=/:account/oauth-clients',
+			documentation_url: 'https://developers.cloudflare.com/fundamentals/oauth/create-an-oauth-client/', scopes,
+		},
+		admin_hostname: '', admin_tunnel_token_configured: false, instances_tunnel_token_configured: false,
+		legacy_provider_managed: false, admin_url: '', instance_endpoints: [], admin_origin_service: 'http://control-plane:9180', instance_routes: [],
+	} }))
+	await page.route('**/api/v1/system/remote-access/cloudflare/oauth/client', async (route) => {
+		const payload = route.request().postDataJSON() as { client_id: string }
+		savedClientID = payload.client_id
+		clientConfigured = true
+		await route.fulfill({ json: { client_configured: true, client_id: savedClientID } })
+	})
+	await page.route('**/api/v1/system', async (route) => route.fulfill({ json: {
+		fleet_version: '0.12.1', build_id: 'oauth-client-setup-test', operator_url: 'http://127.0.0.1:9180',
+		database_path: '/var/lib/hermes-fleet/fleet.db', backup_retention: 20,
+		remote_access: { configured: false, state: 'disabled', admin: { routes: 0, synced: false }, instances: { routes: 0, synced: false } },
+	} }))
+	await openFleet(page, { hosts: [host], instances: [instance], operations: [] })
+	await page.getByRole('button', { name: 'System' }).click()
+	await page.getByRole('button', { name: 'Remote access' }).click()
+	await page.getByRole('radio', { name: /^Cloudflare/ }).check()
+
+	const setup = page.locator('.remote-oauth-setup')
+	await expect(setup.getByText('OAuth client setup required', { exact: true })).toBeVisible()
+	await expect(setup.getByRole('link', { name: 'Open Cloudflare OAuth clients' })).toHaveAttribute('href', 'https://dash.cloudflare.com/?to=/:account/oauth-clients')
+	for (const value of ['Hermes Fleet', 'Code', 'Authorization Code', 'None', 'Required · S256', 'Private']) {
+		await expect(setup.getByText(value, { exact: true })).toBeVisible()
+	}
+	await expect(setup.getByText('http://127.0.0.1:9180/api/v1/system/remote-access/cloudflare/oauth/callback', { exact: true })).toBeVisible()
+	for (const scope of scopes) await expect(setup.getByText(scope.id, { exact: true })).toBeVisible()
+	await expect(page.getByText('No token copying', { exact: true })).toHaveCount(0)
+
+	await setup.getByLabel('Cloudflare Client ID').fill('cloudflare-oauth-client-id')
+	await setup.getByRole('button', { name: 'Save and validate' }).click()
+	await expect.poll(() => savedClientID).toBe('cloudflare-oauth-client-id')
+	await expect(page.getByText('No token copying', { exact: true })).toBeVisible()
+	await expect(page.getByRole('button', { name: 'Sign in with Cloudflare' })).toBeEnabled()
+})
+
+test('Cloudflare OAuth callback selects an authorized domain and prepares Fleet resources', async ({ page }) => {
+	const instance = codexInstance()
+	let connected = false
+	let submitted: Record<string, string> | null = null
+	await page.route('**/api/v1/instances', async (route) => route.fulfill({ json: [instance] }))
+	await page.route('**/api/v1/system/remote-access/configuration', async (route) => {
+		await route.fulfill({ json: {
+			mode: connected ? 'managed_cloudflare' : '',
+			cloudflare_oauth_available: true,
+			cloudflare_oauth_connected: connected,
+			cloudflare_oauth_scope: connected ? 'tunnel.write dns.write' : '',
+			admin_hostname: connected ? 'fleet.example.com' : '',
+			instance_publishing_configured: connected,
+			instance_publishing_zone: connected ? 'example.com' : '',
+			instance_publishing_fleet_namespace: connected ? 'fleet' : '',
+			legacy_provider_managed: false,
+			instance_routes: [],
+		} })
+	})
+	await page.route('**/api/v1/system/remote-access/cloudflare/oauth/session*', async (route) => {
+		await route.fulfill({ json: {
+			id: 'oauth-session',
+			accounts: [{ id: 'account-a', name: 'Primary account' }],
+			zones: [{ id: 'zone-a', name: 'example.com', account_id: 'account-a' }],
+			expires_at: '2026-07-27T00:10:00Z',
+		} })
+	})
+	await page.route('**/api/v1/system/remote-access/cloudflare/oauth/complete', async (route) => {
+		submitted = route.request().postDataJSON()
+		connected = true
+		await route.fulfill({ status: 202, json: operation(903, {
+			id: 'operation-cloudflare-oauth', instance_id: '', type: 'CONNECT_CLOUDFLARE_OAUTH', status: 'PENDING',
+			summary: 'Connect Cloudflare remote access',
+		}) })
+	})
+	await page.route('**/api/v1/operations/operation-cloudflare-oauth', async (route) => {
+		await route.fulfill({ json: operation(903, {
+			id: 'operation-cloudflare-oauth', instance_id: '', type: 'CONNECT_CLOUDFLARE_OAUTH', status: 'SUCCEEDED',
+			summary: 'Connect Cloudflare remote access',
+		}) })
+	})
+	await page.route('**/api/v1/system', async (route) => {
+		await route.fulfill({ json: {
+			fleet_version: '0.10.0', build_id: 'remote-oauth-test', operator_url: 'http://127.0.0.1:9180',
+			database_path: '/var/lib/hermes-fleet/fleet.db', backup_retention: 20,
+			remote_access: connected
+				? { configured: true, mode: 'managed_cloudflare', state: 'synced', admin: { hostname: 'fleet.example.com', routes: 1, synced: true }, instances: { routes: 0, synced: true } }
+				: { configured: false, state: 'disabled', admin: { routes: 0, synced: false }, instances: { routes: 0, synced: false } },
+		} })
+	})
+	await openFleet(page, { hosts: [host], instances: [instance], operations: [] })
+	await page.goto('/?cloudflare_oauth=oauth-session#system/remote-access')
+
+	await expect(page.getByRole('heading', { name: 'Connect Cloudflare' })).toBeVisible()
+	await expect(page.getByRole('combobox', { name: /^Cloudflare account/ })).toHaveValue('account-a')
+	await expect(page.getByRole('combobox', { name: /^Domain/ })).toHaveValue('zone-a')
+	await page.getByRole('button', { name: 'Use this domain' }).click()
+	await expect.poll(() => submitted).toMatchObject({
+		session_id: 'oauth-session', account_id: 'account-a', zone_id: 'zone-a', fleet_namespace: 'fleet',
+	})
+	await expect(page.getByText('OAuth connected', { exact: true })).toBeVisible()
 })
 
 test('instance publishing shows staged failure and never claims Published early', async ({ page }) => {
@@ -1863,6 +1988,7 @@ test('failed Hermes version update does not offer provisioning retry', async ({ 
   await page.getByRole('button', { name: instance.name }).click()
   await expect(page.getByRole('button', { name: 'Retry provisioning' })).toHaveCount(0)
   await expect(page.getByText('Hermes update stopped before the instance was restored')).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Open backups' })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Review failed operation' })).toBeVisible()
 })
 
@@ -2378,6 +2504,210 @@ test('long pages scroll inside the application main region while the header stay
   await main.evaluate((element) => element.scrollTo({ top: element.scrollHeight, behavior: 'instant' }))
   await expect.poll(() => main.evaluate((element) => element.scrollTop)).toBeGreaterThan(0)
   await expect(page.locator('.topbar')).toBeInViewport()
+})
+
+test('Capabilities keeps inventories in one viewport and refreshes stale snapshots automatically', async ({ page }) => {
+	const instance = {
+		...codexInstance('model-alpha'),
+		observation: {
+			instance_id: 'instance-codex-sync', hermes_version: '0.20.0', status: 'IN_SYNC', summary: 'Healthy', received_at: now, checks: [],
+		},
+	}
+	let refreshes = 0
+	let refreshed = false
+	const toolsets = Array.from({ length: 12 }, (_, index) => ({
+		name: `toolset-${index}`, label: `Toolset ${index}`, description: `Toolset ${index} description`,
+		enabled: index % 2 === 0, configured: true,
+		tools: Array.from({ length: 4 }, (__, toolIndex) => `tool_${index}_${toolIndex}`),
+	}))
+	const skills = Array.from({ length: 18 }, (_, index) => ({
+		name: `skill-${index}`, category: 'operations', description: `Skill ${index} description`,
+	}))
+	const features = Object.fromEntries(Array.from({ length: 18 }, (_, index) => [`feature_${index}`, index % 2 === 0]))
+	await page.route('**/api/v1/skills/catalog', async (route) => route.fulfill({ json: [] }))
+	await page.route('**/api/v1/instances/instance-codex-sync/capabilities', async (route) => {
+		await route.fulfill({ json: {
+			instance_id: instance.id, platform: 'linux', runtime_mode: 'api-server', tool_execution: 'instance', split_runtime: true,
+			features, skills, toolsets, browser: { available: true, implementation: 'chromium' },
+			observed_at: refreshed ? new Date().toISOString() : '2020-01-01T00:00:00Z',
+		} })
+	})
+	await page.route('**/api/v1/instances/instance-codex-sync/capabilities/refresh', async (route) => {
+		refreshes++
+		refreshed = true
+		await route.fulfill({ status: 202, json: operation(990, {
+			id: 'operation-capabilities-auto', instance_id: instance.id, type: 'REFRESH_HERMES_CAPABILITIES', status: 'SUCCEEDED',
+			summary: `Refresh Hermes capabilities for ${instance.name}`,
+		}) })
+	})
+	await openFleet(page, { hosts: [host], instances: [instance], operations: [] })
+	await page.getByRole('button', { name: instance.name }).click()
+	await page.getByRole('button', { name: 'Capabilities' }).click()
+
+	await expect.poll(() => refreshes).toBe(1)
+	await expect(page.getByText('Auto · 5 min')).toBeVisible()
+	await expect(page.locator('.capability-data-panel')).toHaveCount(1)
+	await expect(page.getByRole('heading', { name: 'Toolsets & tools' })).toBeVisible()
+	await expect(page.getByRole('heading', { name: 'Skills', exact: true })).toHaveCount(0)
+	await page.getByRole('tab', { name: /Skills/ }).click()
+	await expect(page.getByRole('heading', { name: 'Skills', exact: true })).toBeVisible()
+	await expect(page.getByRole('heading', { name: 'Toolsets & tools' })).toHaveCount(0)
+	await page.getByRole('tab', { name: /API Features/ }).click()
+	await expect(page.getByRole('heading', { name: 'API features' })).toBeVisible()
+	await expect(page.locator('.capability-data-panel')).toHaveCount(1)
+	await expect.poll(async () => page.locator('.capability-table-scroll').evaluate((element) => element.scrollHeight > element.clientHeight)).toBe(true)
+	const sectionBox = await page.locator('.hermes-capabilities-section').boundingBox()
+	expect(sectionBox).not.toBeNull()
+	expect((sectionBox?.y ?? 0) + (sectionBox?.height ?? 0)).toBeLessThanOrEqual(await page.evaluate(() => window.innerHeight))
+})
+
+test('Catalog separates shared skill distribution from per-instance capability inventory', async ({ page }) => {
+	const instance = { ...codexInstance('model-alpha'), name: 'nara' }
+	const target = { ...codexInstance('model-alpha'), id: 'instance-target', name: 'aksa', dashboard_port: 19082, api_port: 19182 }
+	await page.route('**/api/v1/skills/catalog', async (route) => route.fulfill({ json: [{
+		name: 'browser-report', description: 'Create a verified browser report', category: 'research',
+		content: '---\nname: browser-report\n---', revision: 'a'.repeat(64), origin_type: 'copied_from_instance',
+		source_instance_id: instance.id, source_instance_name: instance.name, source_profile: 'default', source_revision: 'a'.repeat(64), source_provenance: 'agent',
+		created_at: now, updated_at: now,
+	}] }))
+	await page.route('**/api/v1/instances/*/capabilities', async (route) => {
+		const source = route.request().url().includes(instance.id)
+		await route.fulfill({ json: {
+		instance_id: source ? instance.id : target.id, platform: 'linux', runtime_mode: 'api-server', tool_execution: 'instance', split_runtime: true,
+		features: { responses_api: true, audio_api: false },
+		skills: source ? [{ name: 'browser-report', category: 'research' }] : [],
+		toolsets: [{ name: 'browser', enabled: true, configured: true, tools: ['browser_exec'] }],
+		browser: { available: true, implementation: 'chromium' }, observed_at: now,
+	} })
+	})
+	await openFleet(page, { hosts: [host], instances: [instance, target], operations: [] })
+	await page.getByRole('button', { name: 'Capabilities', exact: true }).click()
+
+	await expect(page.getByRole('heading', { name: 'Capabilities', level: 1 })).toBeVisible()
+	await expect(page.getByRole('heading', { name: 'Fleet capabilities' })).toBeVisible()
+	await expect(page.getByText(`Source instance: ${instance.name} / default · revision aaaaaaaaaa`)).toBeVisible()
+	await expect(page.getByText(instance.name, { exact: true })).toBeVisible()
+	await expect(page.getByText('Source instance', { exact: true })).toBeVisible()
+	await expect(page.getByText('Original', { exact: true })).toBeVisible()
+	await expect(page.getByText(target.name, { exact: true })).toBeVisible()
+	await expect(page.getByText('Copy target', { exact: true })).toBeVisible()
+	await expect(page.getByRole('button', { name: 'Add', exact: true })).toBeVisible()
+
+	await page.getByRole('tab', { name: 'Instance Inventory' }).click()
+	await expect(page.getByRole('heading', { name: 'Instance capability matrix' })).toBeVisible()
+	await expect(page.getByText('1/1')).toHaveCount(2)
+	await expect(page.getByRole('button', { name: 'Open local capabilities' })).toHaveCount(2)
+
+	await page.reload()
+	await expect(page.getByRole('heading', { name: 'Fleet capabilities' })).toBeVisible()
+	await expect(page.getByRole('tab', { name: 'Instance Inventory' })).toHaveAttribute('aria-selected', 'true')
+	await expect(page.getByRole('heading', { name: 'Instance capability matrix' })).toBeVisible()
+})
+
+test('Catalog verifies refreshed capability inventory after installing and removing a skill', async ({ page }) => {
+	const source = { ...codexInstance('model-alpha'), name: 'nara' }
+	const target = { ...codexInstance('model-alpha'), id: 'instance-target', name: 'aksa', dashboard_port: 19082, api_port: 19182 }
+	let capabilityState: 'absent' | 'installing' | 'installed' | 'removing' = 'absent'
+	let verificationReads = 0
+	let refreshes = 0
+
+	await page.route('**/api/v1/skills/catalog', async (route) => route.fulfill({ json: [{
+		name: 'browser-report', description: 'Create a verified browser report', category: 'research',
+		content: '---\nname: browser-report\n---', revision: 'a'.repeat(64), origin_type: 'copied_from_instance',
+		source_instance_id: source.id, source_instance_name: source.name, source_profile: 'default', source_revision: 'a'.repeat(64), source_provenance: 'agent',
+		created_at: now, updated_at: now,
+	}] }))
+	await page.route(new RegExp(`/api/v1/instances/${target.id}/skills/browser-report(?:/sync|\\?profile=default)$`), async (route) => {
+		capabilityState = route.request().method() === 'DELETE' ? 'removing' : 'installing'
+		await route.fulfill({ status: 202, json: operation(capabilityState === 'installing' ? 910 : 920, {
+			instance_id: target.id,
+			type: capabilityState === 'installing' ? 'SYNC_HERMES_SKILL' : 'REMOVE_HERMES_SKILL',
+			status: 'SUCCEEDED',
+			summary: `${capabilityState === 'installing' ? 'Install' : 'Remove'} browser-report`,
+		}) })
+	})
+	await page.route(`**/api/v1/instances/${target.id}/capabilities/refresh`, async (route) => {
+		refreshes++
+		verificationReads = 0
+		await route.fulfill({ status: 202, json: operation(930 + refreshes, {
+			instance_id: target.id, type: 'REFRESH_HERMES_CAPABILITIES', status: 'SUCCEEDED', summary: `Refresh capabilities for ${target.name}`,
+		}) })
+	})
+	await page.route('**/api/v1/instances/*/capabilities', async (route) => {
+		const isSource = route.request().url().includes(source.id)
+		if (!isSource && (capabilityState === 'installing' || capabilityState === 'removing')) {
+			verificationReads++
+			if (verificationReads >= 2) capabilityState = capabilityState === 'installing' ? 'installed' : 'absent'
+		}
+		await route.fulfill({ json: {
+			instance_id: isSource ? source.id : target.id, platform: 'linux', runtime_mode: 'api-server', tool_execution: 'instance', split_runtime: true,
+			features: {}, skills: isSource || capabilityState === 'installed' || capabilityState === 'removing' ? [{ name: 'browser-report', category: 'research' }] : [],
+			toolsets: [], browser: { available: true, implementation: 'chromium' }, observed_at: now,
+		} })
+	})
+
+	await openFleet(page, { hosts: [host], instances: [source, target], operations: [] })
+	await page.getByRole('button', { name: 'Capabilities', exact: true }).click()
+	await page.getByRole('button', { name: 'Add', exact: true }).click()
+
+	await expect(page.locator('.fleet-skill-sync-result')).toHaveText('browser-report was installed and verified on aksa.')
+	await expect(page.getByText('Installed copy', { exact: true })).toBeVisible()
+	await expect(page.getByRole('button', { name: 'Remove', exact: true })).toBeVisible()
+	expect(refreshes).toBe(1)
+	expect(verificationReads).toBe(2)
+
+	page.once('dialog', (dialog) => void dialog.accept())
+	await page.getByRole('button', { name: 'Remove', exact: true }).click()
+	await expect(page.locator('.fleet-skill-sync-result')).toHaveText('browser-report was removed and verified on aksa.')
+	await expect(page.getByText('Copy target', { exact: true })).toBeVisible()
+	await expect(page.getByRole('button', { name: 'Add', exact: true })).toBeVisible()
+	expect(refreshes).toBe(2)
+	expect(verificationReads).toBe(2)
+})
+
+test('every instance module uses the bounded internal viewport', async ({ page }) => {
+	const instance = {
+		...codexInstance('model-alpha'),
+		model: 'model-alpha', reasoning: 'medium', service_tier: 'normal', codex_configured: true,
+		observation: {
+			instance_id: 'instance-codex-sync', hermes_version: '0.20.0', status: 'IN_SYNC', summary: 'Healthy', received_at: now,
+			checks: [{ name: 'codex_auth', status: 'OK', detail: 'Connected' }],
+		},
+	}
+	await page.route('**/api/v1/instances/instance-codex-sync/recovery-points', async (route) => route.fulfill({ json: [] }))
+	await page.route('**/api/v1/system/remote-access/configuration', async (route) => route.fulfill({ json: {
+		mode: 'local_only', admin_hostname: '', admin_tunnel_token_configured: false, instances_tunnel_token_configured: false,
+		legacy_provider_managed: false, admin_url: '', instance_endpoints: [], admin_origin_service: '', instance_routes: [],
+	} }))
+	await page.route('**/api/v1/instances/instance-codex-sync/capabilities', async (route) => route.fulfill({ json: {
+		instance_id: instance.id, platform: 'linux', runtime_mode: 'api-server', tool_execution: 'instance', split_runtime: true,
+		features: {}, skills: [], toolsets: [], browser: { available: true, implementation: 'chromium' }, observed_at: new Date().toISOString(),
+	} }))
+	await page.route('**/api/v1/skills/catalog', async (route) => route.fulfill({ json: [] }))
+	await page.route('**/api/v1/instances/instance-codex-sync/profiles', async (route) => route.fulfill({ json: {
+		instance_id: instance.id, profiles: [{ name: 'default', active: true, default: true, gateway_running: false }], observed_at: new Date().toISOString(),
+	} }))
+	await page.route('**/api/v1/instances/instance-codex-sync/messaging', async (route) => route.fulfill({ json: {
+		status: 'APPLIED', desired_revision: 'messaging-revision', applied_revision: 'messaging-revision',
+		telegram: { enabled: false, token_configured: false, allowed_users: [], group_allowed_users: [], group_allowed_chats: [], require_mention: true, proxy_url: '' },
+		whatsapp: { enabled: false, mode: 'bot', allowed_users: [], unauthorized_dm_behavior: 'ignore', reply_prefix: 'Hermes' },
+	} }))
+	await page.route('**/api/v1/instances/instance-codex-sync/mcp', async (route) => route.fulfill({ json: {
+		status: 'APPLIED', desired_revision: 'mcp-revision', applied_revision: 'mcp-revision', servers: [],
+	} }))
+	await openFleet(page, { hosts: [host], instances: [instance], operations: [] })
+	await page.getByRole('button', { name: instance.name }).click()
+	const instanceModules = page.getByRole('navigation', { name: 'Instance modules' })
+
+	for (const tab of ['Overview', 'Access', 'Provider', 'Capabilities', 'Profiles', 'Messaging', 'MCP', 'Backups', 'Diagnostics', 'Operations']) {
+		await instanceModules.getByRole('button', { name: tab, exact: true }).click()
+		const viewport = page.locator('.profile-layout > .profile-tab-content')
+		await expect(viewport).toHaveCount(1)
+		await expect.poll(() => viewport.evaluate((element) => getComputedStyle(element).overflowY)).toBe('auto')
+		const box = await viewport.boundingBox()
+		expect(box).not.toBeNull()
+		expect((box?.y ?? 0) + (box?.height ?? 0)).toBeLessThanOrEqual((await page.evaluate(() => window.innerHeight)) + 1)
+	}
 })
 
 test('buffered downloads accept an unknown length safely and reject invalid declared sizes', async ({ page }) => {
