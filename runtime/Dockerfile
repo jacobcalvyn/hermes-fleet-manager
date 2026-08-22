@@ -1,6 +1,6 @@
 # Pin by digest so Hermes version bumps reuse the apt/uv layers. Bump this
 # digest only when the OS/toolchain base must change.
-FROM node:22-bookworm-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436
+FROM node:26-bookworm-slim@sha256:cd565714d4da3e84bfd341e31448f81d47c6362198f152345297c9c1154e6341
 
 ARG HERMES_REPO=https://github.com/NousResearch/hermes-agent.git
 ARG HERMES_REF=f80f453ae0679347e38abc917c7f94f717bf96c5
